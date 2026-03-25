@@ -34,12 +34,26 @@ class RLInstance:
 
 
 @dataclass
+class RLResource:
+    type: str
+    name: str
+    content: str | None = None
+    video: str | None = None
+    slides: str | None = None
+
+
+@dataclass
 class RLChallenge:
     id: str
     name: str
     description: str
     module_id: str | None = None
+    module_name: str | None = None
+    module_description: str | None = None
     dojo_id: str | None = None
+    dojo_name: str | None = None
+    dojo_description: str | None = None
+    resources: list[RLResource] = field(default_factory=list)
 
     @property
     def challenge_key(self) -> str | None:
@@ -136,12 +150,27 @@ class DojoRLClient:
 
     @staticmethod
     def _parse_challenge(data: dict[str, Any]) -> RLChallenge:
+        resources = [
+            RLResource(
+                type=r["type"],
+                name=r["name"],
+                content=r.get("content"),
+                video=r.get("video"),
+                slides=r.get("slides"),
+            )
+            for r in data.get("resources", [])
+        ]
         return RLChallenge(
             id=data["id"],
             name=data["name"],
             description=data["description"],
             module_id=data.get("module_id"),
+            module_name=data.get("module_name"),
+            module_description=data.get("module_description"),
             dojo_id=data.get("dojo_id"),
+            dojo_name=data.get("dojo_name"),
+            dojo_description=data.get("dojo_description"),
+            resources=resources,
         )
 
     # ── RL Instance Lifecycle ─────────────────────────────────────────────────

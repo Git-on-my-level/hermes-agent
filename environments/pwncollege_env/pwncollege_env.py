@@ -16,10 +16,12 @@ Usage:
         --config environments/pwncollege_env/default.yaml
 """
 
+import atexit
 import json
 import logging
 import os
 import re
+import signal
 import sys
 import uuid
 from pathlib import Path
@@ -95,13 +97,17 @@ class PwnCollegeEnvConfig(HermesAgentEnvConfig):
     )
 
     # Eval settings
-    eval_dojo: str = Field(
-        default="linux-luminarium",
-        description="Dojo to evaluate on",
+    eval_dojo: Optional[str] = Field(
+        default=None,
+        description="Dojo to evaluate on (None = all dojos)",
+    )
+    eval_exclude_dojos: List[str] = Field(
+        default_factory=list,
+        description="Dojos to exclude from evaluation",
     )
     eval_module: Optional[str] = Field(
-        default="hello",
-        description="Module to evaluate on (None = all modules in eval_dojo)",
+        default=None,
+        description="Module to evaluate on (None = all modules)",
     )
     eval_concurrency: int = Field(
         default=4,
@@ -131,12 +137,26 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
         slurm: bool = False,
         testing: bool = False,
     ):
+        # Set global SSH env vars before super().__init__ triggers terminal validation.
+        # Per-task overrides (ssh_user) are registered before each rollout.
+        os.environ.setdefault("TERMINAL_SSH_HOST", config.ssh_host)
+        os.environ.setdefault("TERMINAL_SSH_USER", "rl_0")
+        os.environ.setdefault("TERMINAL_SSH_KEY", config.ssh_key)
+
+        # Patch api_key from env var before super().__init__ bakes it into openai.AsyncClient
+        api_key = os.getenv("OPENROUTER_API_KEY", "")
+        if api_key:
+            for sc in server_configs:
+                if not sc.api_key:
+                    sc.api_key = api_key
+
         super().__init__(config, server_configs, slurm, testing)
         self.config: PwnCollegeEnvConfig = config
 
         self.train: list[RLChallenge] = []
         self.iter = 0
         self.solve_rate_buffer: list[float] = []
+        self._active_slots: set[int] = set()
 
         # SDK clients — async for setup/lifecycle, sync for submit_flag handler
         self.client: Optional[DojoRLClient] = None
@@ -166,10 +186,32 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
         ]
         return env_config, server_configs
 
+    def _cleanup_instances(self):
+        """Destroy all running dojo instances. Called on exit/signal."""
+        if not self.sync_client:
+            return
+        try:
+            n = self.sync_client.destroy_all()
+            if n:
+                logger.info("Cleaned up %d dojo instance(s)", n)
+        except Exception as e:
+            logger.warning("Instance cleanup failed: %s", e)
+
+    def _signal_handler(self, signum, frame):
+        """Handle SIGINT/SIGTERM: clean up instances, then re-raise."""
+        logger.info("Signal %d received, cleaning up dojo instances...", signum)
+        self._cleanup_instances()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
     async def setup(self):
         """Load challenges from dojo and initialize SDK clients."""
         self.client = DojoRLClient(self.config.base_url)
         self.sync_client = DojoRLSyncClient(self.config.base_url)
+
+        atexit.register(self._cleanup_instances)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
         # Fetch challenges
         challenges = await self.client.list_challenges()
@@ -245,6 +287,7 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
             return None, []
 
         slot = inst.slot
+        self._active_slots.add(slot)
         register_task_env_overrides(
             task_id,
             {
@@ -330,6 +373,7 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
                 await self.client.destroy_instance(slot)
             except Exception as e:
                 logger.warning("Failed to destroy instance slot %d: %s", slot, e)
+            self._active_slots.discard(slot)
 
     async def compute_reward(
         self, item: Item, result: AgentResult, ctx: ToolContext
@@ -385,8 +429,9 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
         all_challenges = await self.client.list_challenges()
         eval_challenges = [
             c for c in all_challenges
-            if c.dojo_id == self.config.eval_dojo
+            if (self.config.eval_dojo is None or c.dojo_id == self.config.eval_dojo)
             and (self.config.eval_module is None or c.module_id == self.config.eval_module)
+            and c.dojo_id not in self.config.eval_exclude_dojos
         ]
 
         if not eval_challenges:
@@ -396,29 +441,44 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
             )
             return
 
-        logger.info(
-            "Evaluating %d challenges from %s/%s (concurrency=%d)",
-            len(eval_challenges), self.config.eval_dojo,
-            self.config.eval_module or "*", self.config.eval_concurrency,
+        print(
+            f"Evaluating {len(eval_challenges)} challenges from "
+            f"{self.config.eval_dojo or '*'}/{self.config.eval_module or '*'} "
+            f"(concurrency={self.config.eval_concurrency})",
+            flush=True,
         )
 
         semaphore = asyncio.Semaphore(self.config.eval_concurrency)
-        results: list[dict] = []
+        completed = 0
+        total = len(eval_challenges)
 
         async def eval_one(challenge: RLChallenge) -> dict:
+            nonlocal completed
             challenge_key = self._get_challenge_key(challenge)
             async with semaphore:
                 try:
                     scored, _ = await self.collect_trajectory(challenge)
                     solved = scored is not None and scored.get("scores", 0.0) >= 1.0
+                    completed += 1
+                    status = "PASS" if solved else "FAIL"
+                    reward = scored.get("scores", 0.0) if scored else 0.0
+                    print(
+                        f"  [{completed}/{total}] [{status}] {challenge_key} "
+                        f"(reward={reward:.1f})",
+                        flush=True,
+                    )
                     return {
                         "challenge": challenge_key,
                         "name": challenge.name,
                         "solved": solved,
-                        "reward": scored.get("scores", 0.0) if scored else 0.0,
+                        "reward": reward,
                     }
                 except Exception as e:
-                    logger.error("Eval failed for %s: %s", challenge_key, e)
+                    completed += 1
+                    print(
+                        f"  [{completed}/{total}] [ERR ] {challenge_key}: {e}",
+                        flush=True,
+                    )
                     return {
                         "challenge": challenge_key,
                         "name": challenge.name,
@@ -437,15 +497,13 @@ class PwnCollegeEnv(HermesAgentBaseEnv):
         solved = sum(1 for r in results if r["solved"])
         solve_rate = solved / n if n else 0.0
 
-        logger.info("=" * 60)
-        for r in results:
-            status = "PASS" if r["solved"] else "FAIL"
-            logger.info("  [%s] %s (%s)", status, r["challenge"], r["name"])
-        logger.info("=" * 60)
-        logger.info(
-            "Eval: %d/%d solved (%.1f%%) in %.1fs",
-            solved, n, solve_rate * 100, end_time - start_time,
+        print("=" * 60, flush=True)
+        print(
+            f"Eval: {solved}/{n} solved ({solve_rate * 100:.1f}%) "
+            f"in {end_time - start_time:.1f}s",
+            flush=True,
         )
+        print("=" * 60, flush=True)
 
         eval_metrics = {
             "eval/solve_rate": solve_rate,

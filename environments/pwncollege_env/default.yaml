@@ -19,14 +19,21 @@ env:
   base_url: "http://100.120.55.25:8080"
   ssh_host: "100.120.55.25"
   ssh_port: 2222
-  ssh_key: "" # Set to path of RL agent private key
+  ssh_key: "environments/pwncollege_env/keys/rl_agent_00"
 
-  # Challenge selection
-  challenge: "hello/hello"
-  # dojo_filter: "linux-luminarium"
-  # module_filter: "hello"
+  # Training: challenge selection
+  # challenge: "hello/hello"        # Single challenge (training fallback)
+  # dojo_filter: "linux-luminarium" # Filter training set by dojo
+  # module_filter: "hello"          # Filter training set by module
+
+  # Eval settings (null = all)
+  eval_dojo: null
+  eval_module: null
+  eval_exclude_dojos: ["archive"]
+  eval_concurrency: 16
 
   # Atropos settings
+  data_dir_to_save_evals: "eval_output/pwncollege"
   use_wandb: false
   wandb_name: "pwncollege"
   ensure_scores_are_not_same: false
@@ -37,4 +44,4 @@ openai:
   model_name: "anthropic/claude-sonnet-4.5"
   server_type: "openai"
   health_check: false
-  # api_key loaded from OPENROUTER_API_KEY in .env
+  # api_key: set OPENROUTER_API_KEY in .env or shell
