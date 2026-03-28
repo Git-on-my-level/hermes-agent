@@ -165,6 +165,42 @@ Hermes Agent works in Telegram group chats with a few considerations:
 - When privacy mode is off (or bot is admin), the bot sees all messages and can participate naturally
 - `TELEGRAM_ALLOWED_USERS` still applies — only authorized users can trigger the bot, even in groups
 
+## Inbound Topic Allowlists
+
+If you run multiple Hermes bots in the same Telegram supergroup, privacy-off mode means every bot can see every topic it has access to. To pin a bot to just one topic (or a small set of topics), add an inbound allowlist under `platforms.telegram.extra.allowed_inbound_targets`:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      allowed_inbound_targets:
+        - chat_id: -1003502111905
+          thread_id: 2
+        - chat_id: -1003502111905
+          thread_id: 7
+```
+
+You can also use compact strings:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      allowed_inbound_targets:
+        - "-1003502111905:2"
+        - "telegram:-1003502111905:7"
+```
+
+Behavior:
+
+- If `allowed_inbound_targets` is empty or omitted, Hermes accepts inbound messages from any Telegram chat/topic it can see
+- A `chat_id` + `thread_id` entry allows exactly one forum topic
+- A `chat_id` entry with no `thread_id` allows the whole chat
+- Direct messages remain allowed even when a group/topic allowlist is configured
+- This only filters inbound message handling — explicit outbound delivery targets like `telegram:-1003502111905:2` still work as usual
+
+This is useful for "bot swarm" setups where, for example, `m2` should only answer in topic 2 while `m4` should only answer in topic 7.
+
 ## Private Chat Topics (Bot API 9.4)
 
 Telegram Bot API 9.4 (February 2026) introduced **Private Chat Topics** — bots can create forum-style topic threads directly in 1-on-1 DM chats, no supergroup needed. This lets you run multiple isolated workspaces within your existing DM with Hermes.
