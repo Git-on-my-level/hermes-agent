@@ -9,7 +9,7 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
-def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
+def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0", remotes=("origin", "fork")):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
     def side_effect(cmd, **kwargs):
@@ -19,12 +19,15 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
 
-        # git rev-parse --verify origin/{branch}  (check remote branch exists)
+        # git rev-parse --verify origin/{branch}  (legacy tests)
         if "rev-parse" in joined and "--verify" in joined:
             rc = 0 if verify_ok else 128
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
-        # git rev-list HEAD..origin/{branch} --count
+        if joined.endswith(" remote"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(remotes) + "\n", stderr="")
+
+        # git rev-list HEAD..<remote>/<branch> --count
         if "rev-list" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
 
@@ -68,7 +71,7 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_uses_current_branch_when_on_remote(
+    def test_update_uses_origin_main_on_main_branch(
         self, mock_run, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
@@ -85,7 +88,31 @@ class TestCmdUpdateBranchFallback:
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert "origin main" in pull_cmds[0]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_uses_fork_prod_on_prod_branch(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        mock_run.side_effect = _make_run_side_effect(
+            branch="prod", verify_ok=True, commit_count="2", remotes=("origin", "fork")
+        )
+
+        cmd_update(mock_args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+
+        fetch_cmds = [c for c in commands if "fetch" in c]
+        assert any("fetch fork" in c for c in fetch_cmds)
+
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        assert len(rev_list_cmds) == 1
+        assert "fork/prod" in rev_list_cmds[0]
+
+        pull_cmds = [c for c in commands if "pull" in c]
+        assert len(pull_cmds) == 1
+        assert "fork prod" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

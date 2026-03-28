@@ -16,7 +16,7 @@ def test_version_string_no_v_prefix():
 
 
 def test_check_for_updates_uses_cache(tmp_path):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+    """When cache is fresh, check_for_updates should return cached value without calling git fetch/rev-list."""
     from hermes_cli.banner import check_for_updates
 
     # Create a fake git repo and fresh cache
@@ -25,14 +25,22 @@ def test_check_for_updates_uses_cache(tmp_path):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "target": "origin/main"}))
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return MagicMock(returncode=0, stdout="main\n")
+        if joined.endswith(" remote"):
+            return MagicMock(returncode=0, stdout="origin\nfork\n")
+        raise AssertionError(f"Unexpected git command when cache should be used: {joined}")
 
     with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
-        with patch("hermes_cli.banner.subprocess.run") as mock_run:
+        with patch("hermes_cli.banner.subprocess.run", side_effect=side_effect) as mock_run:
             result = check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    assert mock_run.call_count == 2  # branch + remotes only
 
 
 def test_check_for_updates_expired_cache(tmp_path):
@@ -47,14 +55,20 @@ def test_check_for_updates_expired_cache(tmp_path):
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return MagicMock(returncode=0, stdout="main\n")
+        if joined.endswith(" remote"):
+            return MagicMock(returncode=0, stdout="origin\nfork\n")
+        return MagicMock(returncode=0, stdout="5\n")
 
     with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
-        with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("hermes_cli.banner.subprocess.run", side_effect=side_effect) as mock_run:
             result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 2  # git fetch + git rev-list
+    assert mock_run.call_count == 4  # branch + remotes + git fetch + git rev-list
 
 
 def test_check_for_updates_no_git_dir(tmp_path):

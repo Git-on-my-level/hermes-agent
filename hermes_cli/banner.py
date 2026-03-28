@@ -6,13 +6,14 @@ Pure display functions with no HermesCLI state dependency.
 import json
 import logging
 import os
-import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Dict, List, Optional
+
+from hermes_cli.config import get_hermes_home
+from hermes_cli.update_policy import format_update_target, resolve_update_target
 
 from rich.console import Console
 from rich.panel import Panel
@@ -131,11 +132,10 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 
 
 def check_for_updates() -> Optional[int]:
-    """Check how many commits behind origin/main the local repo is.
+    """Check how many commits behind the active update target the local repo is.
 
-    Does a ``git fetch`` at most once every 6 hours (cached to
-    ``~/.hermes/.update_check``).  Returns the number of commits behind,
-    or ``None`` if the check fails or isn't applicable.
+    Default target is origin/main. On the personal prod branch, if a ``fork``
+    remote exists, the target becomes fork/prod.
     """
     hermes_home = get_hermes_home()
     repo_dir = hermes_home / "hermes-agent"
@@ -147,12 +147,45 @@ def check_for_updates() -> Optional[int]:
     if not (repo_dir / ".git").exists():
         return None
 
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "main"
+    except Exception:
+        current_branch = "main"
+
+    try:
+        remotes_result = subprocess.run(
+            ["git", "remote"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        remote_names = {
+            line.strip() for line in remotes_result.stdout.splitlines() if line.strip()
+        } if remotes_result.returncode == 0 else {"origin"}
+    except Exception:
+        remote_names = {"origin"}
+
+    target_remote, target_branch = resolve_update_target(current_branch, remote_names)
+    target_ref = format_update_target(target_remote, target_branch)
+
     # Read cache
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+            cached_target = cached.get("target")
+            cache_valid_for_target = cached_target == target_ref or (
+                cached_target is None and target_ref == "origin/main"
+            )
+            if cache_valid_for_target and now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
                 return cached.get("behind")
     except Exception:
         pass
@@ -160,7 +193,7 @@ def check_for_updates() -> Optional[int]:
     # Fetch latest refs (fast — only downloads ref metadata, no files)
     try:
         subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+            ["git", "fetch", target_remote, "--quiet"],
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
@@ -170,7 +203,7 @@ def check_for_updates() -> Optional[int]:
     # Count commits behind
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -183,7 +216,7 @@ def check_for_updates() -> Optional[int]:
 
     # Write cache
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
+        cache_file.write_text(json.dumps({"ts": now, "behind": behind, "target": target_ref}))
     except Exception:
         pass
 
