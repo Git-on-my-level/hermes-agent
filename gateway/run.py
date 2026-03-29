@@ -1995,7 +1995,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(session_entry)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -2776,7 +2776,7 @@ class GatewayRunner:
             # Clear session env
             self._clear_session_env()
     
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, session_entry: Optional[Any] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -2785,10 +2785,14 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        session_model = getattr(session_entry, "model", None) if session_entry else None
+        session_provider = getattr(session_entry, "provider", None) if session_entry else None
+        session_base_url = getattr(session_entry, "base_url", None) if session_entry else None
+
+        model = session_model or _resolve_gateway_model()
         config_context_length = None
-        provider = None
-        base_url = None
+        provider = session_provider
+        base_url = session_base_url
         api_key = None
 
         try:
@@ -2805,8 +2809,8 @@ class GatewayRunner:
                             config_context_length = int(raw_ctx)
                         except (TypeError, ValueError):
                             pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
+                    provider = provider or model_cfg.get("provider") or None
+                    base_url = base_url or model_cfg.get("base_url") or None
         except Exception:
             pass
 
@@ -2897,7 +2901,7 @@ class GatewayRunner:
         
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(session_entry)
         except Exception:
             session_info = ""
 
@@ -2934,7 +2938,14 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
-        
+
+        try:
+            session_info = self._format_session_info(session_entry)
+        except Exception:
+            session_info = ""
+        if session_info:
+            lines.extend(["", session_info])
+
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:

@@ -21,7 +21,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 
 | Command | Description |
 |---------|-------------|
-| `/new` (alias: `/reset`) | Start a new session (fresh session ID + history) |
+| `/new` (alias: `/reset`) | Start a new session (fresh session ID + history; keeps the current session model/provider/base URL) |
 | `/clear` | Clear screen and start a new session |
 | `/history` | Show conversation history |
 | `/save` | Save the current conversation |

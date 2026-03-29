@@ -345,6 +345,12 @@ class SessionEntry:
     display_name: Optional[str] = None
     platform: Optional[Platform] = None
     chat_type: str = "dm"
+
+    # Session-scoped model selection. These persist across /new so a topic
+    # or session keeps the model/provider/base_url it last used.
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
     
     # Token tracking
     input_tokens: int = 0
@@ -373,6 +379,9 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
+            "model": self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -408,6 +417,9 @@ class SessionEntry:
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
+            model=data.get("model"),
+            provider=data.get("provider"),
+            base_url=data.get("base_url"),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
@@ -490,6 +502,39 @@ class SessionStore:
             self._db = SessionDB()
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+
+    def _resolve_session_model_state(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve the current default model/provider/base_url for a fresh session."""
+        model = None
+        provider = None
+        base_url = None
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            cfg = load_config()
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, str):
+                model = model_cfg.strip() or None
+            elif isinstance(model_cfg, dict):
+                raw_model = model_cfg.get("default") or model_cfg.get("model")
+                if raw_model:
+                    model = str(raw_model).strip() or None
+                raw_provider = model_cfg.get("provider")
+                if raw_provider:
+                    provider = str(raw_provider).strip() or None
+                raw_base_url = model_cfg.get("base_url")
+                if raw_base_url:
+                    base_url = str(raw_base_url).strip() or None
+
+            runtime = resolve_runtime_provider(requested=provider)
+            provider = runtime.get("provider") or provider
+            base_url = runtime.get("base_url") or base_url
+        except Exception:
+            logger.debug("Session default model resolution failed; using unset values", exc_info=True)
+
+        return model, provider, base_url
     
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
@@ -700,6 +745,11 @@ class SessionStore:
 
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            model, provider, base_url = self._resolve_session_model_state()
+            if was_auto_reset and 'old_entry' in locals():
+                model = old_entry.model or model
+                provider = old_entry.provider or provider
+                base_url = old_entry.base_url or base_url
 
             entry = SessionEntry(
                 session_key=session_key,
@@ -710,6 +760,9 @@ class SessionStore:
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
+                model=model,
+                provider=provider,
+                base_url=base_url,
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
@@ -762,6 +815,12 @@ class SessionStore:
             if session_key in self._entries:
                 entry = self._entries[session_key]
                 entry.updated_at = _now()
+                if model is not None:
+                    entry.model = model
+                if provider is not None:
+                    entry.provider = provider
+                if base_url is not None:
+                    entry.base_url = base_url
                 # Direct assignment — the gateway receives cumulative totals
                 # from the cached agent, not per-call deltas.
                 entry.input_tokens = input_tokens
@@ -829,6 +888,9 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                model=old_entry.model,
+                provider=old_entry.provider,
+                base_url=old_entry.base_url,
             )
 
             self._entries[session_key] = new_entry
@@ -878,6 +940,19 @@ class SessionStore:
 
             db_end_session_id = old_entry.session_id
 
+            restored_model = old_entry.model
+            restored_provider = old_entry.provider
+            restored_base_url = old_entry.base_url
+            if self._db:
+                try:
+                    target_row = self._db.get_session(target_session_id)
+                    if target_row:
+                        restored_model = target_row.get("model") or restored_model
+                        restored_provider = target_row.get("billing_provider") or restored_provider
+                        restored_base_url = target_row.get("billing_base_url") or restored_base_url
+                except Exception as e:
+                    logger.debug("Session DB metadata lookup failed during session switch: %s", e)
+
             now = _now()
             new_entry = SessionEntry(
                 session_key=session_key,
@@ -888,6 +963,9 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                model=restored_model,
+                provider=restored_provider,
+                base_url=restored_base_url,
             )
 
             self._entries[session_key] = new_entry
