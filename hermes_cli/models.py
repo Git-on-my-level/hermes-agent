@@ -40,6 +40,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("stepfun/step-3.5-flash",          ""),
     ("minimax/minimax-m2.7",            ""),
     ("minimax/minimax-m2.5",            ""),
+    ("z-ai/glm-5.1",                    ""),
     ("z-ai/glm-5",                      ""),
     ("z-ai/glm-5-turbo",                ""),
     ("moonshotai/kimi-k2.5",            ""),
@@ -67,6 +68,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "stepfun/step-3.5-flash",
         "minimax/minimax-m2.7",
         "minimax/minimax-m2.5",
+        "z-ai/glm-5.1",
         "z-ai/glm-5",
         "z-ai/glm-5-turbo",
         "moonshotai/kimi-k2.5",
@@ -103,6 +105,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "grok-code-fast-1",
     ],
     "zai": [
+        "glm-5.1",
         "glm-5",
         "glm-5-turbo",
         "glm-4.7",
