@@ -1136,6 +1136,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
 
+        setup_note = None
         if setup_needed:
             missing_items = [
                 f"env ${env_name}" for env_name in remaining_missing_required_envs
@@ -1145,10 +1146,18 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                 missing_items,
                 setup_help,
             )
-            if backend in _REMOTE_ENV_BACKENDS and setup_note:
-                setup_note = f"{setup_note} {backend.upper()}-backed skills need these requirements available inside the remote environment as well."
+
+        if backend in _REMOTE_ENV_BACKENDS and required_env_vars:
+            remote_note = (
+                f"{backend.upper()}-backed skills need these requirements available inside the remote environment as well."
+            )
             if setup_note:
-                result["setup_note"] = setup_note
+                setup_note = f"{setup_note} {remote_note}"
+            else:
+                setup_note = remote_note
+
+        if setup_note:
+            result["setup_note"] = setup_note
 
         # Surface agentskills.io optional fields when present
         if frontmatter.get("compatibility"):
