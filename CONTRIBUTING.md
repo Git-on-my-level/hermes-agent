@@ -109,6 +109,22 @@ hermes chat -q "Hello"
 pytest tests/ -v
 ```
 
+### Install repo hooks
+
+```bash
+./scripts/install-githooks.sh
+```
+
+This installs the versioned `.githooks/pre-push` hook for the repo. On pushes to
+`main`, `prod`, or `release*`, it runs the fast CLI/banner regression checks:
+
+```bash
+python -m pytest tests/hermes_cli/test_banner.py tests/hermes_cli/test_update_check.py -q
+```
+
+Use this to catch branch-sensitive production regressions before the push leaves
+your machine.
+
 ---
 
 ## Project Structure

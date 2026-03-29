@@ -1,5 +1,6 @@
 """Tests for banner toolset name normalization and skin color usage."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rich.console import Console
@@ -68,3 +69,35 @@ def test_build_welcome_banner_uses_normalized_toolset_names():
     assert "homeassistant_tools:" not in output
     assert "honcho_tools:" not in output
     assert "web_tools:" not in output
+
+
+def test_build_welcome_banner_uses_terminal_width_without_crashing():
+    """The banner should read terminal width via shutil without raising NameError."""
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=(["web"], []),
+        ),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+        patch.object(
+            banner.shutil,
+            "get_terminal_size",
+            return_value=SimpleNamespace(columns=120),
+        ),
+    ):
+        console = Console(
+            record=True, force_terminal=False, color_system=None, width=160
+        )
+        banner.build_welcome_banner(
+            console=console,
+            model="anthropic/test-model",
+            cwd="/tmp/project",
+            tools=[],
+            get_toolset_for_tool=lambda _name: None,
+        )
+
+    output = console.export_text()
+    assert "Hermes Agent v" in output
