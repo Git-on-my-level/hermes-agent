@@ -3069,7 +3069,7 @@ class GatewayRunner:
         session_key = session_entry.session_key
         args = event.get_command_args().strip()
 
-        current_model = session_entry.model or self._resolve_gateway_model()
+        current_model = session_entry.model or _resolve_gateway_model()
         current_provider = session_entry.provider
         current_base_url = session_entry.base_url or ""
         current_api_key = ""

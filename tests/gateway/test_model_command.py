@@ -128,6 +128,46 @@ async def test_model_command_lists_current_and_configured_models():
 
 
 @pytest.mark.asyncio
+async def test_model_command_falls_back_to_gateway_default_model_when_session_has_none():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        model=None,
+        provider="zai",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+    )
+    runner = _make_runner(session_entry)
+
+    with patch(
+        "gateway.run._resolve_gateway_model",
+        return_value="glm-5.1",
+    ), patch(
+        "hermes_cli.models.list_available_providers",
+        return_value=[
+            {"id": "zai", "label": "Z.AI", "authenticated": True, "aliases": []},
+        ],
+    ), patch(
+        "hermes_cli.models.curated_models_for_provider",
+        return_value=[("glm-5.1", "latest")],
+    ), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value={
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "***",
+        },
+    ):
+        result = await runner._handle_model_command(_make_event("/model"))
+
+    assert "Current model" in result
+    assert "glm-5.1" in result
+
+
+@pytest.mark.asyncio
 async def test_model_command_preserves_existing_token_totals_when_switching():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
