@@ -92,6 +92,17 @@ class TestSlashCommandPrefixMatching:
             cli_obj.process_command("/help")
         mock_help.assert_called_once()
 
+    def test_model_command_dispatches_exact_branch(self):
+        """/model should hit the CLI model branch instead of falling through as unknown."""
+        cli_obj = _make_cli()
+        with patch.object(cli_obj, "_show_model_and_providers") as mock_show, \
+             patch("cli._cprint") as mock_cprint:
+            cli_obj.process_command("/model")
+
+        mock_show.assert_called_once()
+        printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        assert "Unknown command" not in printed
+
     def test_skill_command_prefix_matches(self):
         """A prefix that uniquely matches a skill command should dispatch it."""
         cli_obj = _make_cli()
