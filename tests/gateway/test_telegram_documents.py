@@ -10,8 +10,10 @@ We mock the telegram module at import time to avoid collection errors.
 
 import asyncio
 import importlib
+import io
 import os
 import sys
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,6 +67,15 @@ def _make_file_obj(data: bytes = b"hello"):
     f.download_as_bytearray = AsyncMock(return_value=bytearray(data))
     f.file_path = "documents/file.pdf"
     return f
+
+
+def _make_openxml_bytes(folder_name: str) -> bytes:
+    """Build a tiny OOXML-like zip payload with a distinguishing top-level folder."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(f"{folder_name}/document.xml", "<xml/>")
+    return buf.getvalue()
 
 
 def _make_document(
@@ -283,6 +294,60 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert len(event.media_urls) == 1
         assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_missing_filename_and_generic_mime_pdf_is_inferred_from_bytes(self, adapter):
+        content = b"%PDF-1.7 inferred"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=None,
+            mime_type="application/octet-stream",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert len(event.media_urls) == 1
+        assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_missing_filename_and_generic_mime_docx_is_inferred_from_bytes(self, adapter):
+        content = _make_openxml_bytes("word")
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=None,
+            mime_type="application/octet-stream",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert len(event.media_urls) == 1
+        assert event.media_types == [SUPPORTED_DOCUMENT_TYPES[".docx"]]
+
+    @pytest.mark.asyncio
+    async def test_markdown_alias_mime_is_supported(self, adapter):
+        content = b"# Alias markdown"
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=None,
+            mime_type="text/x-markdown",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert "# Alias markdown" in event.text
+        assert event.media_types == [SUPPORTED_DOCUMENT_TYPES[".md"]]
 
     @pytest.mark.asyncio
     async def test_missing_filename_and_mime_rejected(self, adapter):

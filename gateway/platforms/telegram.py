@@ -59,6 +59,8 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    infer_supported_document_extension,
+    should_infer_document_extension_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
 from gateway.platforms.telegram_network import (
@@ -1671,26 +1673,32 @@ class TelegramAdapter(BasePlatformAdapter):
         elif msg.document:
             doc = msg.document
             try:
-                # Determine file extension
-                ext = ""
                 original_filename = doc.file_name or ""
+                original_ext = ""
                 if original_filename:
-                    _, ext = os.path.splitext(original_filename)
-                    ext = ext.lower()
+                    _, original_ext = os.path.splitext(original_filename)
+                    original_ext = original_ext.lower()
+                ext = infer_supported_document_extension(
+                    filename=original_filename,
+                    mime_type=doc.mime_type,
+                )
 
-                # If no extension from filename, reverse-lookup from MIME type
-                if not ext and doc.mime_type:
-                    mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
-                    ext = mime_to_ext.get(doc.mime_type, "")
-
-                # Check if supported
-                if ext not in SUPPORTED_DOCUMENT_TYPES:
+                if ext not in SUPPORTED_DOCUMENT_TYPES and not should_infer_document_extension_from_bytes(
+                    filename=original_filename,
+                    mime_type=doc.mime_type,
+                ):
+                    unsupported_label = original_ext or ext or "unknown"
                     supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
                     event.text = (
-                        f"Unsupported document type '{ext or 'unknown'}'. "
+                        f"Unsupported document type '{unsupported_label}'. "
                         f"Supported types: {supported_list}"
                     )
-                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                    logger.info(
+                        "[Telegram] Unsupported document type: %s (mime=%s, filename=%s)",
+                        unsupported_label,
+                        doc.mime_type,
+                        original_filename or "<none>",
+                    )
                     await self.handle_message(event)
                     return
 
@@ -1705,10 +1713,34 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self.handle_message(event)
                     return
 
-                # Download and cache
+                # Download and cache. If filename/MIME are inconclusive, inspect bytes.
                 file_obj = await doc.get_file()
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
+
+                if ext not in SUPPORTED_DOCUMENT_TYPES:
+                    ext = infer_supported_document_extension(
+                        filename=original_filename,
+                        mime_type=doc.mime_type,
+                        data=raw_bytes,
+                    )
+
+                if ext not in SUPPORTED_DOCUMENT_TYPES:
+                    unsupported_label = original_ext or ext or "unknown"
+                    supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
+                    event.text = (
+                        f"Unsupported document type '{unsupported_label}'. "
+                        f"Supported types: {supported_list}"
+                    )
+                    logger.info(
+                        "[Telegram] Unsupported document type: %s (mime=%s, filename=%s)",
+                        unsupported_label,
+                        doc.mime_type,
+                        original_filename or "<none>",
+                    )
+                    await self.handle_message(event)
+                    return
+
                 cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
                 mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
                 event.media_urls = [cached_path]

@@ -37,6 +37,8 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
+    infer_supported_document_extension,
+    should_infer_document_extension_from_bytes,
 )
 
 
@@ -700,18 +702,25 @@ class SlackAdapter(BasePlatformAdapter):
                 # Try to handle as a document attachment
                 try:
                     original_filename = f.get("name", "")
-                    ext = ""
+                    original_ext = ""
                     if original_filename:
-                        _, ext = os.path.splitext(original_filename)
-                        ext = ext.lower()
+                        _, original_ext = os.path.splitext(original_filename)
+                        original_ext = original_ext.lower()
+                    ext = infer_supported_document_extension(
+                        filename=original_filename,
+                        mime_type=mimetype,
+                    )
 
-                    # Fallback: reverse-lookup from MIME type
-                    if not ext and mimetype:
-                        mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
-                        ext = mime_to_ext.get(mimetype, "")
-
-                    if ext not in SUPPORTED_DOCUMENT_TYPES:
-                        continue  # Skip unsupported file types silently
+                    if ext not in SUPPORTED_DOCUMENT_TYPES and not should_infer_document_extension_from_bytes(
+                        filename=original_filename,
+                        mime_type=mimetype,
+                    ):
+                        logger.debug(
+                            "[Slack] Unsupported document type '%s' (%s), skipping",
+                            original_ext or ext or "unknown",
+                            mimetype,
+                        )
+                        continue
 
                     # Check file size (Slack limit: 20 MB for bots)
                     file_size = f.get("size", 0)
@@ -722,6 +731,19 @@ class SlackAdapter(BasePlatformAdapter):
 
                     # Download and cache
                     raw_bytes = await self._download_slack_file_bytes(url)
+                    if ext not in SUPPORTED_DOCUMENT_TYPES:
+                        ext = infer_supported_document_extension(
+                            filename=original_filename,
+                            mime_type=mimetype,
+                            data=raw_bytes,
+                        )
+                    if ext not in SUPPORTED_DOCUMENT_TYPES:
+                        logger.debug(
+                            "[Slack] Unsupported document type '%s' after download (%s), skipping",
+                            original_ext or ext or "unknown",
+                            mimetype,
+                        )
+                        continue
                     cached_path = cache_document_from_bytes(
                         raw_bytes, original_filename or f"document{ext}"
                     )

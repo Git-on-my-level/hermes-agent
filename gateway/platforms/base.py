@@ -6,11 +6,13 @@ and implement the required methods.
 """
 
 import asyncio
+import io
 import logging
 import os
 import random
 import re
 import uuid
+import zipfile
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
@@ -216,6 +218,104 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
+
+DOCUMENT_MIME_ALIASES = {
+    "text/x-markdown": ".md",
+    "application/x-markdown": ".md",
+}
+
+DOCUMENT_MIME_TO_EXT = {
+    mime.lower(): ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()
+}
+
+GENERIC_DOCUMENT_MIME_TYPES = {
+    "",
+    "application/octet-stream",
+}
+
+GENERIC_DOCUMENT_EXTENSIONS = {
+    "",
+    ".bin",
+    ".dat",
+}
+
+KNOWN_UNSUPPORTED_DOCUMENT_EXTENSIONS = {
+    ".zip",
+}
+
+KNOWN_UNSUPPORTED_DOCUMENT_MIME_TYPES = {
+    "application/zip",
+    "application/x-zip-compressed",
+}
+
+
+def infer_supported_document_extension(
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    data: Optional[bytes] = None,
+) -> str:
+    """Infer a supported document extension from filename, MIME type, or bytes."""
+    ext = ""
+    if filename:
+        _, ext = os.path.splitext(filename)
+        ext = ext.lower()
+        if ext in SUPPORTED_DOCUMENT_TYPES:
+            return ext
+
+    normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    if normalized_mime:
+        ext = DOCUMENT_MIME_TO_EXT.get(normalized_mime, "") or DOCUMENT_MIME_ALIASES.get(normalized_mime, "")
+        if ext in SUPPORTED_DOCUMENT_TYPES:
+            return ext
+
+    if not data:
+        return ""
+
+    if data[:4] == b"%PDF":
+        return ".pdf"
+
+    if data[:2] != b"PK":
+        return ""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = {name.lower() for name in archive.namelist()}
+    except zipfile.BadZipFile:
+        return ""
+
+    if any(name.startswith("word/") for name in names):
+        return ".docx"
+    if any(name.startswith("xl/") for name in names):
+        return ".xlsx"
+    if any(name.startswith("ppt/") for name in names):
+        return ".pptx"
+    return ""
+
+
+def should_infer_document_extension_from_bytes(
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+) -> bool:
+    """Return whether document bytes are worth inspecting for type inference."""
+    if infer_supported_document_extension(filename=filename, mime_type=mime_type):
+        return False
+
+    original_ext = ""
+    if filename:
+        _, original_ext = os.path.splitext(filename)
+        original_ext = original_ext.lower()
+
+    normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+
+    if original_ext in KNOWN_UNSUPPORTED_DOCUMENT_EXTENSIONS:
+        return False
+    if normalized_mime in KNOWN_UNSUPPORTED_DOCUMENT_MIME_TYPES:
+        return False
+
+    return (
+        original_ext in GENERIC_DOCUMENT_EXTENSIONS
+        and normalized_mime in GENERIC_DOCUMENT_MIME_TYPES
+    )
 
 
 def get_document_cache_dir() -> Path:
