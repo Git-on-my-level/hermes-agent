@@ -170,6 +170,41 @@ class TestSessionEntryReason:
 # SessionResetPolicy notify config
 # ---------------------------------------------------------------------------
 
+class TestSessionModelPersistence:
+    def test_session_model_persists_across_reset_and_reload(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="idle", idle_minutes=1),
+            tmp_path,
+        )
+        source = _make_source()
+
+        entry1 = store.get_or_create_session(source)
+        entry1.model = "glm-5"
+        entry1.provider = "zai"
+        entry1.base_url = "https://api.z.ai/api/coding/paas/v4"
+        store._save()
+
+        # Force an auto-reset and verify the new session keeps the same model.
+        entry1.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+        entry2 = store.get_or_create_session(source)
+        assert entry2.session_id != entry1.session_id
+        assert entry2.model == "glm-5"
+        assert entry2.provider == "zai"
+        assert entry2.base_url == "https://api.z.ai/api/coding/paas/v4"
+
+        # Re-load from disk to verify persistence across restart.
+        reloaded = _make_store(
+            SessionResetPolicy(mode="idle", idle_minutes=1),
+            tmp_path,
+        )
+        entry3 = reloaded.get_or_create_session(source)
+        assert entry3.session_id == entry2.session_id
+        assert entry3.model == "glm-5"
+        assert entry3.provider == "zai"
+        assert entry3.base_url == "https://api.z.ai/api/coding/paas/v4"
+
+
 class TestResetPolicyNotify:
     def test_notify_defaults_true(self):
         policy = SessionResetPolicy()

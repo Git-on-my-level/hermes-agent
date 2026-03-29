@@ -74,7 +74,10 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="dm",
-        total_tokens=321,
+        model="glm-5",
+        provider="zai",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        total_tokens=321
     )
     runner = _make_runner(session_entry)
     running_agent = MagicMock()
@@ -83,6 +86,9 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Tokens:** 321" in result
+    assert "glm-5" in result
+    assert "zai" in result
+    assert "Endpoint" not in result
     assert "**Agent Running:** Yes ⚡" in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}

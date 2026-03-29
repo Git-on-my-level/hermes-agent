@@ -1995,7 +1995,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(session_entry)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -2776,7 +2776,7 @@ class GatewayRunner:
             # Clear session env
             self._clear_session_env()
     
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, session_entry: Optional[Any] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -2785,10 +2785,14 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        session_model = getattr(session_entry, "model", None) if session_entry else None
+        session_provider = getattr(session_entry, "provider", None) if session_entry else None
+        session_base_url = getattr(session_entry, "base_url", None) if session_entry else None
+
+        model = session_model or _resolve_gateway_model()
         config_context_length = None
-        provider = None
-        base_url = None
+        provider = session_provider
+        base_url = session_base_url
         api_key = None
 
         try:
@@ -2805,8 +2809,8 @@ class GatewayRunner:
                             config_context_length = int(raw_ctx)
                         except (TypeError, ValueError):
                             pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
+                    provider = provider or model_cfg.get("provider") or None
+                    base_url = base_url or model_cfg.get("base_url") or None
         except Exception:
             pass
 
@@ -2897,7 +2901,7 @@ class GatewayRunner:
         
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(session_entry)
         except Exception:
             session_info = ""
 
@@ -2934,7 +2938,14 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
-        
+
+        try:
+            session_info = self._format_session_info(session_entry)
+        except Exception:
+            session_info = ""
+        if session_info:
+            lines.extend(["", session_info])
+
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
@@ -3037,6 +3048,114 @@ class GatewayRunner:
         lines.append("")
         lines.append("Switch: `/model provider:model-name`")
         lines.append("Setup: `hermes setup`")
+        return "\n".join(lines)
+    
+    async def _handle_model_command(self, event: MessageEvent) -> str:
+        """Handle /model command - switch model for this session."""
+        from hermes_cli.model_switch import switch_model
+        from hermes_cli.models import _PROVIDER_LABELS
+        from gateway.session import SessionStore
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        import os
+        
+        args = event.get_command_args().strip()
+        source = self._get_event_source(event)
+        session_key = self._session_key_from_source(source)
+        
+        # No args - show current model
+        if not args:
+            session_entry = self.session_store.get_session(session_key)
+            if not session_entry:
+                return "No active session"
+            
+            # Get current session model info
+            current_model = session_entry.model or self._resolve_gateway_model()
+            current_provider = session_entry.provider
+            current_base_url = session_entry.base_url
+            
+            # Resolve current provider info
+            try:
+                runtime = resolve_runtime_provider(requested=current_provider or "auto")
+                if not current_base_url:
+                    current_base_url = runtime.get("base_url", "")
+            except Exception:
+                pass
+            
+            provider_label = _PROVIDER_LABELS.get(current_provider, current_provider or "auto")
+            
+            lines = [
+                f"**Current model:** `{current_model}`",
+                f"  Provider: {provider_label}",
+            ]
+            if current_base_url and "openrouter" not in current_base_url:
+                lines.append(f"  Base URL: {current_base_url}")
+            lines.append("")
+            lines.append("Switch: `/model provider:model-name` or `/model model-name`")
+            lines.append("Examples: `/model zai:glm-5.1`, `/model claude-sonnet-4`")
+            return "\n".join(lines)
+        
+        # Check for z-ai/glm models special case
+        if args.lower().startswith("z-ai") or args.lower().startswith("zai:"):
+            # List GLM models for Z.AI provider
+            if args.lower() in ("z-ai", "zai"):
+                from hermes_cli.models import _PROVIDER_MODELS
+                glm_models = _PROVIDER_MODELS.get("zai", [])
+                lines = ["**GLM Models (Z.AI)**", ""]
+                for m in glm_models:
+                    if "glm" in m.lower():
+                        lines.append(f"  • {m}")
+                lines.append("")
+                lines.append("Usage: `/model zai:glm-5.1` or `/model z-ai/glm-5.1`")
+                return "\n".join(lines)
+        
+        # Get current session state for switch_model
+        session_entry = self.session_store.get_session(session_key)
+        current_provider = session_entry.provider if session_entry else None
+        current_base_url = session_entry.base_url if session_entry else ""
+        current_api_key = ""
+        
+        # Resolve current credentials
+        try:
+            runtime = resolve_runtime_provider(requested=current_provider or "auto")
+            if not current_base_url:
+                current_base_url = runtime.get("base_url", "")
+            current_api_key = runtime.get("api_key", "")
+        except Exception:
+            pass
+        
+        # Call switch_model
+        result = switch_model(
+            args,
+            current_provider=current_provider or "auto",
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+        )
+        
+        if not result.success:
+            return f"Failed: {result.error_message}"
+        
+        # Update session with new model info
+        self.session_store.update_session(
+            session_key,
+            model=result.new_model,
+            provider=result.target_provider,
+            base_url=result.base_url,
+        )
+        
+        # Evict cached agent so next message uses new model
+        self._evict_cached_agent(session_key)
+        
+        # Build response
+        provider_label = result.provider_label
+        lines = [f"Switched to `{result.new_model}`"]
+        lines.append(f"  Provider: {provider_label}")
+        if result.base_url and "openrouter" not in result.base_url:
+            lines.append(f"  Base URL: {result.base_url}")
+        if result.warning_message:
+            lines.append(f"  Note: {result.warning_message}")
+        lines.append("")
+        lines.append("This change applies to this session only.")
+        lines.append("Use /status to see current model.")
         return "\n".join(lines)
     
     async def _handle_personality_command(self, event: MessageEvent) -> str:
