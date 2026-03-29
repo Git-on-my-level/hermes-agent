@@ -5,8 +5,10 @@ the `else` clause of the attachment content-type loop that was added
 to download, cache, and optionally inject text from non-image/audio files.
 """
 
+import io
 import os
 import sys
+import zipfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import MessageType
+from gateway.platforms.base import MessageType, SUPPORTED_DOCUMENT_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +154,23 @@ def _mock_aiohttp_download(raw_bytes: bytes):
     return patch("aiohttp.ClientSession", return_value=session)
 
 
+def _make_openxml_bytes(folder_name: str) -> bytes:
+    """Build a tiny OOXML-like zip payload with a distinguishing top-level folder."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(f"{folder_name}/document.xml", "<xml/>")
+    return buf.getvalue()
+
+
+def _make_plain_zip_bytes() -> bytes:
+    """Build a generic zip payload that should remain unsupported."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("plain.txt", "not an OOXML document")
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -210,6 +229,58 @@ class TestIncomingDocumentHandling:
         assert "# Title" in event.text
 
     @pytest.mark.asyncio
+    async def test_generic_octet_stream_pdf_inferred_from_bytes(self, adapter):
+        """Generic MIME should fall back to PDF byte sniffing after download."""
+        pdf_bytes = b"%PDF-1.7 inferred"
+
+        with _mock_aiohttp_download(pdf_bytes):
+            msg = make_message(
+                [make_attachment(filename="upload", content_type="application/octet-stream", size=len(pdf_bytes))]
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        assert event.media_types == [SUPPORTED_DOCUMENT_TYPES[".pdf"]]
+
+    @pytest.mark.asyncio
+    async def test_generic_octet_stream_docx_inferred_from_bytes(self, adapter):
+        """Generic MIME should recognize OOXML DOCX payloads after download."""
+        content = _make_openxml_bytes("word")
+
+        with _mock_aiohttp_download(content):
+            msg = make_message(
+                [make_attachment(filename="upload", content_type="application/octet-stream", size=len(content))]
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        assert event.media_types == [SUPPORTED_DOCUMENT_TYPES[".docx"]]
+
+    @pytest.mark.asyncio
+    async def test_markdown_alias_mime_injected(self, adapter):
+        """Markdown MIME aliases should map to the supported .md path."""
+        file_content = b"# Alias markdown"
+
+        with _mock_aiohttp_download(file_content):
+            msg = make_message(
+                attachments=[make_attachment(filename="upload", content_type="text/x-markdown", size=len(file_content))],
+                content="",
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert "[Content of" in event.text
+        assert "# Alias markdown" in event.text
+        assert event.media_types == [SUPPORTED_DOCUMENT_TYPES[".md"]]
+
+    @pytest.mark.asyncio
     async def test_oversized_document_skipped(self, adapter):
         """A document over 20MB should be skipped — media_urls stays empty."""
         msg = make_message([
@@ -233,6 +304,21 @@ class TestIncomingDocumentHandling:
             make_attachment(filename="archive.zip", content_type="application/zip")
         ])
         await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert event.message_type == MessageType.TEXT
+
+    @pytest.mark.asyncio
+    async def test_generic_octet_stream_zip_still_skipped(self, adapter):
+        """A generic zip payload that is not OOXML should still be skipped."""
+        content = _make_plain_zip_bytes()
+
+        with _mock_aiohttp_download(content):
+            msg = make_message([
+                make_attachment(filename="upload", content_type="application/octet-stream", size=len(content))
+            ])
+            await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == []

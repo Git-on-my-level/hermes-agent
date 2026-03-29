@@ -9,8 +9,10 @@ We mock the slack modules at import time to avoid collection errors.
 """
 
 import asyncio
+import io
 import os
 import sys
+import zipfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -60,6 +62,23 @@ import gateway.platforms.slack as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
 from gateway.platforms.slack import SlackAdapter  # noqa: E402
+
+
+def _make_openxml_bytes(folder_name: str) -> bytes:
+    """Build a tiny OOXML-like zip payload with a distinguishing top-level folder."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(f"{folder_name}/document.xml", "<xml/>")
+    return buf.getvalue()
+
+
+def _make_plain_zip_bytes() -> bytes:
+    """Build a generic zip payload that should remain unsupported."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("plain.txt", "not an OOXML document")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +397,68 @@ class TestIncomingDocumentHandling:
         assert "# Title" in msg_event.text
 
     @pytest.mark.asyncio
+    async def test_generic_octet_stream_pdf_inferred_from_bytes(self, adapter):
+        """Generic MIME should fall back to PDF byte sniffing after download."""
+        pdf_bytes = b"%PDF-1.7 inferred"
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = pdf_bytes
+            event = self._make_event(files=[{
+                "mimetype": "application/octet-stream",
+                "name": "upload",
+                "url_private_download": "https://files.slack.com/upload",
+                "size": len(pdf_bytes),
+            }], text="")
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert len(msg_event.media_urls) == 1
+        assert os.path.exists(msg_event.media_urls[0])
+        assert msg_event.media_types == [SUPPORTED_DOCUMENT_TYPES[".pdf"]]
+
+    @pytest.mark.asyncio
+    async def test_generic_octet_stream_docx_inferred_from_bytes(self, adapter):
+        """Generic MIME should recognize OOXML DOCX payloads after download."""
+        content = _make_openxml_bytes("word")
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = content
+            event = self._make_event(files=[{
+                "mimetype": "application/octet-stream",
+                "name": "upload",
+                "url_private_download": "https://files.slack.com/upload",
+                "size": len(content),
+            }], text="")
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert len(msg_event.media_urls) == 1
+        assert os.path.exists(msg_event.media_urls[0])
+        assert msg_event.media_types == [SUPPORTED_DOCUMENT_TYPES[".docx"]]
+
+    @pytest.mark.asyncio
+    async def test_markdown_alias_mime_injected(self, adapter):
+        """Markdown MIME aliases should map to the supported .md path."""
+        content = b"# Alias markdown"
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = content
+            event = self._make_event(files=[{
+                "mimetype": "text/x-markdown",
+                "name": "upload",
+                "url_private_download": "https://files.slack.com/upload",
+                "size": len(content),
+            }], text="")
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert "# Alias markdown" in msg_event.text
+        assert msg_event.media_types == [SUPPORTED_DOCUMENT_TYPES[".md"]]
+
+    @pytest.mark.asyncio
     async def test_large_txt_not_injected(self, adapter):
         """A .txt file over 100KB should be cached but NOT injected."""
         content = b"x" * (200 * 1024)
@@ -406,6 +487,25 @@ class TestIncomingDocumentHandling:
             "size": 1024,
         }])
         await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.TEXT
+        assert len(msg_event.media_urls) == 0
+
+    @pytest.mark.asyncio
+    async def test_generic_octet_stream_zip_still_skipped(self, adapter):
+        """A generic zip payload that is not OOXML should still be skipped."""
+        content = _make_plain_zip_bytes()
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = content
+            event = self._make_event(files=[{
+                "mimetype": "application/octet-stream",
+                "name": "upload",
+                "url_private_download": "https://files.slack.com/upload",
+                "size": len(content),
+            }], text="")
+            await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.message_type == MessageType.TEXT
