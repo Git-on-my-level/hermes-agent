@@ -1,6 +1,7 @@
 """Tests for GatewayRunner._format_session_info — session config surfacing."""
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
@@ -42,6 +43,24 @@ class TestFormatSessionInfo:
         with p1, p2, p3:
             info = runner._format_session_info()
         assert "openrouter" in info
+
+    def test_session_entry_overrides_global_config(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: global-model\n  provider: openrouter\n",
+            "global-model",
+            {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_key": "***"},
+        )
+        session_entry = SimpleNamespace(
+            model="glm-5",
+            provider="zai",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info(session_entry)
+        assert "glm-5" in info
+        assert "zai" in info
+        assert "Endpoint" not in info
 
     def test_config_context_length(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: test-model\n  context_length: 32768\n",
