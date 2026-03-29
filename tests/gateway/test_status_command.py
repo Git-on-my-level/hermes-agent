@@ -88,7 +88,7 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     assert "**Tokens:** 321" in result
     assert "glm-5" in result
     assert "zai" in result
-    assert "api.z.ai" in result
+    assert "Endpoint" not in result
     assert "**Agent Running:** Yes ⚡" in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}

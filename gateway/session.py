@@ -746,10 +746,10 @@ class SessionStore:
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             model, provider, base_url = self._resolve_session_model_state()
-            if was_auto_reset and 'old_entry' in locals():
-                model = old_entry.model or model
-                provider = old_entry.provider or provider
-                base_url = old_entry.base_url or base_url
+            if was_auto_reset:
+                model = entry.model or model
+                provider = entry.provider or provider
+                base_url = entry.base_url or base_url
 
             entry = SessionEntry(
                 session_key=session_key,

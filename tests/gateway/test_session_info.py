@@ -60,7 +60,7 @@ class TestFormatSessionInfo:
             info = runner._format_session_info(session_entry)
         assert "glm-5" in info
         assert "zai" in info
-        assert "api.z.ai" in info
+        assert "Endpoint" not in info
 
     def test_config_context_length(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: test-model\n  context_length: 32768\n",
