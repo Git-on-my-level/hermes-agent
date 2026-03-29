@@ -199,7 +199,7 @@ Behavior:
 - Direct messages remain allowed even when a group/topic allowlist is configured
 - This only filters inbound message handling — explicit outbound delivery targets like `telegram:-1003502111905:2` still work as usual
 
-This is useful for "bot swarm" setups where, for example, `m2` should only answer in topic 2 while `m4` should only answer in topic 7.
+This is useful for "bot swarm" setups where, for example, `hermes2` should only answer in topic 2 while `hermes7` should only answer in topic 7.
 
 ## Private Chat Topics (Bot API 9.4)
 
