@@ -1101,6 +1101,7 @@ class HermesCLI:
 
         self._explicit_api_key = api_key
         self._explicit_base_url = base_url
+        self._session_base_url_override: Optional[str] = None
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
@@ -1885,7 +1886,11 @@ class HermesCLI:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url,
+                explicit_base_url=(
+                    self._session_base_url_override
+                    if self._session_base_url_override is not None
+                    else self._explicit_base_url
+                ),
             )
         except Exception as exc:
             message = format_runtime_provider_error(exc)
@@ -1996,6 +2001,7 @@ class HermesCLI:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
                 _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
                 return False
+            self._restore_session_runtime_settings(session_meta)
             restored = self._session_db.get_messages_as_conversation(self.session_id)
             if restored:
                 self.conversation_history = restored
@@ -2080,6 +2086,7 @@ class HermesCLI:
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )
+            self._persist_session_runtime_settings()
 
             if self._pending_title and self._session_db:
                 try:
@@ -2159,6 +2166,7 @@ class HermesCLI:
             )
             return False
 
+        self._restore_session_runtime_settings(session_meta)
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
             self.conversation_history = restored
@@ -2191,6 +2199,80 @@ class HermesCLI:
             pass
 
         return True
+
+    def _build_session_model_config(self) -> Dict[str, Any]:
+        """Return per-session runtime metadata we want to persist in SessionDB."""
+        return {
+            "max_iterations": self.max_turns,
+            "reasoning_config": self.reasoning_config,
+            "provider": self.requested_provider,
+            "base_url": self._session_base_url_override or self.base_url,
+        }
+
+    def _persist_session_runtime_settings(self) -> None:
+        """Persist the current session-scoped model/provider/base_url to SessionDB."""
+        if not self._session_db or not self.session_id:
+            return
+
+        session_meta = self._session_db.get_session(self.session_id)
+        model_config = self._build_session_model_config()
+        try:
+            if session_meta is None:
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=self.model,
+                    model_config=model_config,
+                    billing_provider=self.requested_provider or self.provider,
+                    billing_base_url=self._session_base_url_override or self.base_url,
+                )
+                return
+
+            self._session_db.update_session_model_state(
+                self.session_id,
+                model=self.model,
+                provider=self.requested_provider or self.provider,
+                base_url=self._session_base_url_override or self.base_url,
+            )
+        except Exception:
+            logger.debug("Failed to persist session-scoped model settings", exc_info=True)
+
+    def _restore_session_runtime_settings(self, session_meta: Optional[Dict[str, Any]]) -> None:
+        """Restore model/provider/base_url from a resumed session's metadata."""
+        if not session_meta:
+            return
+
+        restored_model = session_meta.get("model")
+        if isinstance(restored_model, str) and restored_model.strip():
+            self.model = restored_model.strip()
+
+        raw_model_config = session_meta.get("model_config")
+        model_config = None
+        if isinstance(raw_model_config, str) and raw_model_config.strip():
+            try:
+                model_config = json.loads(raw_model_config)
+            except Exception:
+                logger.debug("Failed to decode session model_config for %s", self.session_id, exc_info=True)
+
+        restored_provider = session_meta.get("billing_provider")
+        if not (isinstance(restored_provider, str) and restored_provider.strip()):
+            restored_provider = model_config.get("provider") if isinstance(model_config, dict) else None
+        if isinstance(restored_provider, str) and restored_provider.strip():
+            restored_provider = restored_provider.strip()
+            self.requested_provider = restored_provider
+            self.provider = restored_provider
+
+        restored_base_url = session_meta.get("billing_base_url")
+        if not (isinstance(restored_base_url, str) and restored_base_url.strip()):
+            restored_base_url = model_config.get("base_url") if isinstance(model_config, dict) else None
+        if isinstance(restored_base_url, str) and restored_base_url.strip():
+            self.base_url = restored_base_url.strip()
+            self._session_base_url_override = self.base_url
+            if not (isinstance(restored_provider, str) and restored_provider.strip()) and "openrouter.ai" not in self.base_url:
+                self.requested_provider = "custom"
+                self.provider = "custom"
+        else:
+            self._session_base_url_override = None
 
     def _display_resumed_history(self):
         """Render a compact recap of previous conversation messages.
@@ -2950,16 +3032,16 @@ class HermesCLI:
                         session_id=self.session_id,
                         source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=self.model,
-                        model_config={
-                            "max_iterations": self.max_turns,
-                            "reasoning_config": self.reasoning_config,
-                        },
+                        model_config=self._build_session_model_config(),
+                        billing_provider=self.requested_provider or self.provider,
+                        billing_base_url=self._session_base_url_override or self.base_url,
                     )
                 except Exception:
                     pass
 
         if not silent:
             print("(^_^)v New session started!")
+            print(f"  Current model: {self.model} [provider: {self.provider or self.requested_provider or 'auto'}]")
 
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
@@ -3000,6 +3082,7 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
+        self._restore_session_runtime_settings(session_meta)
 
         # Load conversation history
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3013,18 +3096,8 @@ class HermesCLI:
 
         # Sync the agent if already initialised
         if self.agent:
-            self.agent.session_id = target_id
-            self.agent.reset_session_state()
-            if hasattr(self.agent, "_last_flushed_db_idx"):
-                self.agent._last_flushed_db_idx = len(self.conversation_history)
-            if hasattr(self.agent, "_todo_store"):
-                try:
-                    from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
-                except Exception:
-                    pass
-            if hasattr(self.agent, "_invalidate_system_prompt"):
-                self.agent._invalidate_system_prompt()
+            self.agent = None
+            self._active_agent_route_signature = None
 
         title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
         msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
@@ -3141,7 +3214,11 @@ class HermesCLI:
                 current = _resolve_provider(
                     self.requested_provider,
                     explicit_api_key=self._explicit_api_key,
-                    explicit_base_url=self._explicit_base_url,
+                    explicit_base_url=(
+                        self._session_base_url_override
+                        if self._session_base_url_override is not None
+                        else self._explicit_base_url
+                    ),
                 )
             except Exception:
                 current = "openrouter"
@@ -3773,13 +3850,13 @@ class HermesCLI:
                         self.provider = "custom"
                         self.api_key = result.api_key
                         self.base_url = result.base_url
+                        self._session_base_url_override = result.base_url
                         self.agent = None
-                        save_config_value("model.default", result.model)
-                        save_config_value("model.provider", "custom")
-                        save_config_value("model.base_url", result.base_url)
-                        print(f"(^_^)b Model changed to: {result.model} [provider: Custom]")
+                        self._persist_session_runtime_settings()
+                        print(f"(^_^) Model changed to: {result.model} [provider: Custom] (this session only)")
                         print(f"  Endpoint: {result.base_url}")
-                        print(f"  Status: connected (model auto-detected)")
+                        print("  Status: connected (model auto-detected)")
+                        print("  Global default unchanged. Use `hermes model` to change it globally.")
                     else:
                         print(f"(>_<) {result.error_message}")
                     return True
@@ -3808,28 +3885,14 @@ class HermesCLI:
                         self.provider = result.target_provider
                         self.api_key = result.api_key
                         self.base_url = result.base_url
+                        self._session_base_url_override = result.base_url or None
 
                     provider_note = f" [provider: {result.provider_label}]" if result.provider_changed else ""
-
-                    if result.persist:
-                        saved_model = save_config_value("model.default", result.new_model)
-                        if result.provider_changed:
-                            save_config_value("model.provider", result.target_provider)
-                            # Persist base_url for custom endpoints; clear
-                            # when switching away from custom.
-                            if result.base_url and "openrouter.ai" not in (result.base_url or ""):
-                                save_config_value("model.base_url", result.base_url)
-                            else:
-                                save_config_value("model.base_url", None)
-                        if saved_model:
-                            print(f"(^_^)b Model changed to: {result.new_model}{provider_note} (saved to config)")
-                        else:
-                            print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
-                    else:
-                        print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
-                        if result.warning_message:
-                            print(f"  Reason: {result.warning_message}")
-                        print("  Note: Model will revert on restart. Use a verified model to save to config.")
+                    self._persist_session_runtime_settings()
+                    print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
+                    if result.warning_message:
+                        print(f"  Note: {result.warning_message}")
+                    print("  Global default unchanged. Use `hermes model` to change it globally.")
 
                     # Show endpoint info for custom providers
                     if result.is_custom_target:

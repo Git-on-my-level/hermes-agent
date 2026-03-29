@@ -7,6 +7,7 @@ import os
 import sys
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
+import json
 
 from hermes_state import SessionDB
 from tools.todo_tool import TodoStore
@@ -220,3 +221,105 @@ def test_new_session_resets_token_counters(tmp_path):
     assert comp.last_total_tokens == 0
     assert comp.compression_count == 0
     assert comp._context_probed is False
+
+
+def test_model_switch_stays_session_scoped_across_new_session(tmp_path):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+
+    with patch(
+        "hermes_cli.model_switch.switch_model",
+        return_value=ModelSwitchResult(
+            success=True,
+            new_model="glm-5.1",
+            target_provider="zai",
+            provider_changed=True,
+            api_key="z-key",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            persist=True,
+            provider_label="Z.AI",
+        ),
+    ), patch("cli.save_config_value") as mock_save:
+        cli.process_command("/model zai:glm-5.1")
+
+    assert cli.model == "glm-5.1"
+    assert cli.provider == "zai"
+    assert cli.requested_provider == "zai"
+    assert cli.base_url == "https://api.z.ai/api/coding/paas/v4"
+    mock_save.assert_not_called()
+
+    current_row = cli._session_db.get_session(cli.session_id)
+    current_config = json.loads(current_row["model_config"])
+    assert current_row["model"] == "glm-5.1"
+    assert current_config["provider"] == "zai"
+    assert current_config["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+    cli.process_command("/new")
+
+    assert cli.model == "glm-5.1"
+    assert cli.provider == "zai"
+    assert cli.requested_provider == "zai"
+    assert cli.base_url == "https://api.z.ai/api/coding/paas/v4"
+
+    new_row = cli._session_db.get_session(cli.session_id)
+    if new_row is not None:
+        new_config = json.loads(new_row["model_config"])
+        assert new_row["model"] == "glm-5.1"
+        assert new_config["provider"] == "zai"
+        assert new_config["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+
+def test_preload_resumed_session_restores_model_provider_and_base_url(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        session_id="resume_me",
+        source="cli",
+        model="glm-5.1",
+        model_config={
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+        },
+    )
+    db.append_message("resume_me", role="user", content="hello")
+    db.append_message("resume_me", role="assistant", content="hi")
+
+    cli = _make_cli(resume="resume_me")
+    cli._session_db = db
+
+    assert cli._preload_resumed_session() is True
+    assert cli.model == "glm-5.1"
+    assert cli.provider == "zai"
+    assert cli.requested_provider == "zai"
+    assert cli.base_url == "https://api.z.ai/api/coding/paas/v4"
+    assert len(cli.conversation_history) == 2
+
+
+def test_model_switch_clears_stale_session_base_url_override(tmp_path):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli._session_base_url_override = "http://old.local/v1"
+    cli.base_url = "http://old.local/v1"
+    cli.requested_provider = "custom"
+    cli.provider = "custom"
+
+    with patch(
+        "hermes_cli.model_switch.switch_model",
+        return_value=ModelSwitchResult(
+            success=True,
+            new_model="gpt-5.4",
+            target_provider="openai-codex",
+            provider_changed=True,
+            api_key="new-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider_label="OpenAI Codex",
+        ),
+    ):
+        cli.process_command("/model openai-codex:gpt-5.4")
+
+    assert cli._session_base_url_override == "https://chatgpt.com/backend-api/codex"
+
+    row = cli._session_db.get_session(cli.session_id)
+    config = json.loads(row["model_config"])
+    assert config["base_url"] == "https://chatgpt.com/backend-api/codex"

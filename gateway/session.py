@@ -698,6 +698,12 @@ class SessionStore:
             self._ensure_loaded_locked()
             return len(self._entries) > 1
 
+    def get_session(self, session_key: str) -> Optional[SessionEntry]:
+        """Get the active session entry for a session key."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
     def get_or_create_session(
         self,
         source: SessionSource,
@@ -774,6 +780,9 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "model": entry.model,
+                "billing_provider": entry.provider,
+                "billing_base_url": entry.base_url,
             }
 
         # SQLite operations outside the lock
@@ -844,6 +853,13 @@ class SessionStore:
 
         if self._db and db_session_id:
             try:
+                if model is not None or provider is not None or base_url is not None:
+                    self._db.update_session_model_state(
+                        db_session_id,
+                        model=model,
+                        provider=provider,
+                        base_url=base_url,
+                    )
                 self._db.set_token_counts(
                     db_session_id,
                     input_tokens=input_tokens,
@@ -899,6 +915,9 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "model": new_entry.model,
+                "billing_provider": new_entry.provider,
+                "billing_base_url": new_entry.base_url,
             }
 
         if self._db and db_end_session_id:

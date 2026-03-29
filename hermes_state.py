@@ -369,22 +369,34 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+        stored_model_config = dict(model_config) if isinstance(model_config, dict) else None
+        if stored_model_config is not None:
+            if billing_provider and not stored_model_config.get("provider"):
+                stored_model_config["provider"] = billing_provider
+            if billing_base_url and not stored_model_config.get("base_url"):
+                stored_model_config["base_url"] = billing_base_url
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, started_at, billing_provider,
+                   billing_base_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
                     user_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    json.dumps(stored_model_config) if stored_model_config else None,
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    billing_provider,
+                    billing_base_url,
                 ),
             )
         self._execute_write(_do)
@@ -592,6 +604,56 @@ class SessionDB:
                     session_id,
                 ),
             )
+        self._execute_write(_do)
+
+    def update_session_model_state(
+        self,
+        session_id: str,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> None:
+        """Persist session-scoped model/provider/base_url metadata."""
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+
+            model_config: Dict[str, Any] = {}
+            if row and row["model_config"]:
+                try:
+                    loaded = json.loads(row["model_config"])
+                    if isinstance(loaded, dict):
+                        model_config = loaded
+                except (json.JSONDecodeError, TypeError):
+                    model_config = {}
+
+            if provider is not None:
+                model_config["provider"] = provider
+            if base_url is not None:
+                model_config["base_url"] = base_url
+
+            conn.execute(
+                """UPDATE sessions SET
+                   model = CASE WHEN ? IS NULL THEN model ELSE ? END,
+                   billing_provider = CASE WHEN ? IS NULL THEN billing_provider ELSE ? END,
+                   billing_base_url = CASE WHEN ? IS NULL THEN billing_base_url ELSE ? END,
+                   model_config = ?
+                   WHERE id = ?""",
+                (
+                    model,
+                    model,
+                    provider,
+                    provider,
+                    base_url,
+                    base_url,
+                    json.dumps(model_config) if model_config else None,
+                    session_id,
+                ),
+            )
+
         self._execute_write(_do)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:

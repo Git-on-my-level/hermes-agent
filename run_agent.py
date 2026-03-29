@@ -994,8 +994,12 @@ class AIAgent:
                         "max_iterations": self.max_iterations,
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
+                        "provider": self.provider,
+                        "base_url": self.base_url,
                     },
                     user_id=None,
+                    billing_provider=self.provider,
+                    billing_base_url=self.base_url,
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
@@ -5172,6 +5176,12 @@ class AIAgent:
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     parent_session_id=old_session_id,
+                    model_config={
+                        "provider": self.provider,
+                        "base_url": self.base_url,
+                    },
+                    billing_provider=self.provider,
+                    billing_base_url=self.base_url,
                 )
                 # Auto-number the title for the continuation session
                 if old_title:
