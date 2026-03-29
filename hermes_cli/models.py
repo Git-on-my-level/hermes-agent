@@ -320,6 +320,71 @@ _KNOWN_PROVIDER_NAMES: set[str] = (
     | {"openrouter", "custom"}
 )
 
+# Narrow slash-compat syntax for direct providers where users commonly type
+# provider/model by habit. This intentionally excludes common OpenRouter
+# namespaces like anthropic/openai/google so those slugs keep their existing
+# meaning.
+_SLASH_PROVIDER_NAMES: set[str] = {
+    "openai-codex",
+    "nous",
+    "copilot",
+    "copilot-acp",
+    "zai",
+    "glm",
+    "z-ai",
+    "z.ai",
+    "zhipu",
+    "kimi-coding",
+    "kimi",
+    "moonshot",
+    "minimax",
+    "minimax-cn",
+    "minimax-china",
+    "minimax_cn",
+    "kilocode",
+    "kilo",
+    "kilo-code",
+    "kilo-gateway",
+    "opencode-zen",
+    "opencode",
+    "zen",
+    "opencode-go",
+    "opencode-go-sub",
+    "ai-gateway",
+    "aigateway",
+    "vercel",
+    "vercel-ai-gateway",
+    "huggingface",
+    "hf",
+    "hugging-face",
+    "huggingface-hub",
+    "alibaba",
+    "dashscope",
+    "aliyun",
+    "custom",
+}
+
+
+def input_uses_explicit_provider(raw: str) -> bool:
+    """Return True when the model input explicitly names a provider."""
+    stripped = raw.strip()
+
+    colon = stripped.find(":")
+    if colon > 0:
+        provider_part = stripped[:colon].strip().lower()
+        model_part = stripped[colon + 1:].strip()
+        if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
+            return True
+
+    slash = stripped.find("/")
+    if slash > 0:
+        provider_part = stripped[:slash].strip().lower()
+        model_part = stripped[slash + 1:].strip()
+        if provider_part and model_part and provider_part in _SLASH_PROVIDER_NAMES:
+            return True
+
+    return False
+
 
 def list_available_providers() -> list[dict[str, str]]:
     """Return info about all providers the user could use with ``provider:model``.
@@ -399,6 +464,14 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
                 if custom_name and actual_model:
                     return (f"custom:{custom_name}", actual_model)
             return (normalize_provider(provider_part), model_part)
+
+    slash = stripped.find("/")
+    if slash > 0:
+        provider_part = stripped[:slash].strip().lower()
+        model_part = stripped[slash + 1:].strip()
+        if provider_part and model_part and provider_part in _SLASH_PROVIDER_NAMES:
+            return (normalize_provider(provider_part), model_part)
+
     return (current_provider, stripped)
 
 

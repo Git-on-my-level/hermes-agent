@@ -96,7 +96,7 @@ class TestProviderRegistry:
     def test_base_urls(self):
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
-        assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
+        assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/coding/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
         assert PROVIDER_REGISTRY["minimax"].inference_base_url == "https://api.minimax.io/anthropic"
         assert PROVIDER_REGISTRY["minimax-cn"].inference_base_url == "https://api.minimaxi.com/anthropic"
@@ -352,7 +352,7 @@ class TestResolveApiKeyProviderCredentials:
         creds = resolve_api_key_provider_credentials("zai")
         assert creds["provider"] == "zai"
         assert creds["api_key"] == "glm-secret-key"
-        assert creds["base_url"] == "https://api.z.ai/api/paas/v4"
+        assert creds["base_url"] == "https://api.z.ai/api/coding/paas/v4"
         assert creds["source"] == "GLM_API_KEY"
 
     def test_resolve_copilot_with_github_token(self, monkeypatch):
@@ -701,9 +701,9 @@ class TestKimiCodeCredentialAutoDetect:
 
     def test_non_kimi_providers_unaffected(self, monkeypatch):
         """Ensure the auto-detect logic doesn't leak to other providers."""
-        monkeypatch.setenv("GLM_API_KEY", "sk-kimi-looks-like-kimi-but-isnt")
+        monkeypatch.setenv("GLM_API_KEY", "sk-kim...isnt")
         creds = resolve_api_key_provider_credentials("zai")
-        assert creds["base_url"] == "https://api.z.ai/api/paas/v4"
+        assert creds["base_url"] == "https://api.z.ai/api/coding/paas/v4"
 
 
 # =============================================================================

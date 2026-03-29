@@ -129,7 +129,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="zai",
         name="Z.AI / GLM",
         auth_type="api_key",
-        inference_base_url="https://api.z.ai/api/paas/v4",
+        inference_base_url="https://api.z.ai/api/coding/paas/v4",
         api_key_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
         base_url_env_var="GLM_BASE_URL",
     ),

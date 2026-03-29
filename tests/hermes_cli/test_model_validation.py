@@ -61,6 +61,16 @@ class TestParseModelInput:
         assert provider == "zai"
         assert model == "glm-5"
 
+    def test_provider_slash_syntax_for_zai(self):
+        provider, model = parse_model_input("zai/glm-5.1", "openai-codex")
+        assert provider == "zai"
+        assert model == "glm-5.1"
+
+    def test_provider_slash_syntax_for_openai_codex(self):
+        provider, model = parse_model_input("openai-codex/gpt-5.4-mini", "zai")
+        assert provider == "openai-codex"
+        assert model == "gpt-5.4-mini"
+
     def test_no_slash_no_colon_keeps_provider(self):
         provider, model = parse_model_input("gpt-5.4", "openrouter")
         assert provider == "openrouter"

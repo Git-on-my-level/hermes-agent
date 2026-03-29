@@ -70,6 +70,7 @@ def switch_model(
     """
     from hermes_cli.models import (
         parse_model_input,
+        input_uses_explicit_provider,
         detect_provider_for_model,
         validate_requested_model,
         _PROVIDER_LABELS,
@@ -77,6 +78,7 @@ def switch_model(
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     # Step 1: Parse provider:model syntax
+    explicit_provider = input_uses_explicit_provider(raw_input)
     target_provider, new_model = parse_model_input(raw_input, current_provider)
 
     # Step 2: Detect if we're currently on a custom endpoint
@@ -88,7 +90,7 @@ def switch_model(
     # Step 3: Auto-detect provider when no explicit provider:model syntax
     # was used.  Skip for custom providers — the model name might
     # coincidentally match a known provider's catalog.
-    if target_provider == current_provider and not is_custom:
+    if (not explicit_provider) and target_provider == current_provider and not is_custom:
         detected = detect_provider_for_model(new_model, current_provider)
         if detected:
             target_provider, new_model = detected
