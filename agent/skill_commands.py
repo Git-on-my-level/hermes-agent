@@ -91,12 +91,11 @@ def _build_skill_message(
     parts = [activation_note, "", content.strip()]
 
     if loaded_skill.get("setup_skipped"):
-        parts.extend(
-            [
-                "",
-                "[Skill setup note: Required environment setup was skipped. Continue loading the skill and explain any reduced functionality if it matters.]",
-            ]
-        )
+        note_text = "[Skill setup note: Required environment setup was skipped. Continue loading the skill and explain any reduced functionality if it matters.]"
+        # For remote backends, also append the remote-specific guidance
+        if loaded_skill.get("setup_note"):
+            note_text = f"{note_text} {loaded_skill['setup_note']}"
+        parts.extend(["", note_text])
     elif loaded_skill.get("gateway_setup_hint"):
         parts.extend(
             [
