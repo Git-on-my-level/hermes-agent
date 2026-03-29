@@ -91,18 +91,33 @@ class TestGatewayHonchoLifecycle:
         event = _make_event()
         runner._shutdown_gateway_honcho = MagicMock()
         runner._async_flush_memories = AsyncMock()
+        runner._evict_cached_agent = MagicMock()
+        runner._background_tasks = set()
+        runner._format_session_info = MagicMock(return_value="◆ Model: `gpt-5.4-mini`\n◆ Provider: openai-codex")
         runner.session_store = MagicMock()
         runner.session_store._generate_session_key.return_value = "gateway-key"
         runner.session_store._entries = {
-            "gateway-key": SimpleNamespace(session_id="old-session"),
+            "gateway-key": SimpleNamespace(
+                session_id="old-session",
+                model="gpt-5.4-mini",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+            ),
         }
-        runner.session_store.reset_session.return_value = SimpleNamespace(session_id="new-session")
+        runner.session_store.reset_session.return_value = SimpleNamespace(
+            session_id="new-session",
+            model="gpt-5.4-mini",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
 
         result = await runner._handle_reset_command(event)
 
         runner._shutdown_gateway_honcho.assert_called_once_with("gateway-key")
         runner._async_flush_memories.assert_called_once_with("old-session", "gateway-key")
         assert "Session reset" in result
+        assert "◆ Model: `gpt-5.4-mini`" in result
+        runner._format_session_info.assert_called_once_with(runner.session_store.reset_session.return_value)
 
     def test_flush_memories_reuses_gateway_session_key_and_skips_honcho_sync(self):
         runner = _make_runner()

@@ -19,6 +19,8 @@ COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
+CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CODEX_MODELS_URL = f"{CODEX_BASE_URL}/models?client_version=1.0.0"
 
 # Backward-compatible aliases for the earlier GitHub Models-backed Copilot work.
 GITHUB_MODELS_BASE_URL = COPILOT_BASE_URL
@@ -1012,6 +1014,43 @@ def probe_api_models(
             "suggested_base_url": None,
             "used_fallback": False,
         }
+
+    if normalized.startswith(CODEX_BASE_URL):
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(CODEX_MODELS_URL, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+                models = []
+                for item in data.get("models", []) if isinstance(data, dict) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    slug = item.get("slug")
+                    if not isinstance(slug, str) or not slug.strip():
+                        continue
+                    if item.get("supported_in_api") is False:
+                        continue
+                    visibility = item.get("visibility", "")
+                    if isinstance(visibility, str) and visibility.strip().lower() in ("hide", "hidden"):
+                        continue
+                    models.append(slug.strip())
+                return {
+                    "models": models,
+                    "probed_url": CODEX_MODELS_URL,
+                    "resolved_base_url": CODEX_BASE_URL,
+                    "suggested_base_url": None,
+                    "used_fallback": False,
+                }
+        except Exception:
+            return {
+                "models": None,
+                "probed_url": CODEX_MODELS_URL,
+                "resolved_base_url": CODEX_BASE_URL,
+                "suggested_base_url": None,
+                "used_fallback": False,
+            }
 
     if normalized.endswith("/v1"):
         alternate_base = normalized[:-3].rstrip("/")

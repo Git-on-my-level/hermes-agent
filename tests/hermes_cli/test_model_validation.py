@@ -252,6 +252,28 @@ class TestFetchApiModels:
         assert probe["resolved_base_url"] == "https://api.githubcopilot.com"
         assert probe["used_fallback"] is False
 
+    def test_probe_api_models_uses_codex_catalog_endpoint(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"models": [{"slug": "gpt-5.4-mini", "supported_in_api": true}]}'
+
+        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()) as mock_urlopen:
+            probe = probe_api_models("codex-token", "https://chatgpt.com/backend-api/codex")
+
+        assert (
+            mock_urlopen.call_args[0][0].full_url
+            == "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        )
+        assert probe["models"] == ["gpt-5.4-mini"]
+        assert probe["resolved_base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert probe["used_fallback"] is False
+
     def test_fetch_github_model_catalog_filters_non_chat_models(self):
         class _Resp:
             def __enter__(self):
