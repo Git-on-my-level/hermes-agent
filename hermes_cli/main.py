@@ -58,6 +58,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.update_channel import detect_update_target, write_update_channel
 load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
 
@@ -2731,16 +2732,19 @@ def cmd_update(args):
         if sys.platform == "win32":
             git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-        remote = "fork"
-        branch = "main"
-
+        channel, remote, branch = detect_update_target(PROJECT_ROOT, get_hermes_home())
+        if channel == "prod":
+            print(f"→ Updating our prod fork ({remote}/{branch})")
+        else:
+            print(f"→ Updating main channel ({remote}/{branch})")
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", remote],
+            git_cmd + ["fetch", remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
+        fetched_ref = "FETCH_HEAD"
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
             if "Could not resolve host" in stderr or "unable to access" in stderr:
@@ -2764,21 +2768,40 @@ def cmd_update(args):
         )
         current_branch = result.stdout.strip()
 
-        # Always update against main from the fork remote used for prod updates.
-
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
+        # Always update against the install channel target, regardless of the
+        # branch currently checked out in the repo.
+        if current_branch != branch:
             label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
+            print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", "main"],
+            checkout_result = subprocess.run(
+                git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
-                check=True,
             )
+            if checkout_result.returncode != 0 and branch == "prod":
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", "-B", "prod", fetched_ref],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if checkout_result.returncode == 0:
+                    subprocess.run(
+                        git_cmd + ["branch", "--set-upstream-to", f"{remote}/{branch}", "prod"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+            if checkout_result.returncode != 0:
+                print(f"✗ Failed to switch to {branch} for update.")
+                stderr = checkout_result.stderr.strip()
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+                sys.exit(1)
         else:
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
@@ -2786,7 +2809,7 @@ def cmd_update(args):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..{remote}/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{fetched_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -2802,12 +2825,8 @@ def cmd_update(args):
                     git_cmd, PROJECT_ROOT, auto_stash_ref,
                     prompt_user=prompt_for_restore,
                 )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
-                )
             print("✓ Already up to date!")
+            write_update_channel(channel, get_hermes_home())
             return
 
         print(f"→ Found {commit_count} new commit(s)")
@@ -2827,7 +2846,7 @@ def cmd_update(args):
                 # stashed, reset to match the remote exactly.
                 print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"{remote}/{branch}"],
+                    git_cmd + ["reset", "--hard", fetched_ref],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
@@ -2836,7 +2855,7 @@ def cmd_update(args):
                     print(f"✗ Failed to reset to {remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
-                    print(f"  Try manually: git fetch {remote} && git reset --hard {remote}/{branch}")
+                    print(f"  Try manually: git fetch {remote} {branch} && git reset --hard FETCH_HEAD")
                     sys.exit(1)
             update_succeeded = True
         finally:
@@ -2855,6 +2874,7 @@ def cmd_update(args):
                     )
         
         _invalidate_update_cache()
+        write_update_channel(channel, get_hermes_home())
         
         # Reinstall Python dependencies (try .[all] first for optional extras,
         # fall back to . if extras fail — mirrors the install script behavior)

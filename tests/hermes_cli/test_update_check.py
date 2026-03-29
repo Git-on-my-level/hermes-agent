@@ -28,7 +28,7 @@ def test_check_for_updates_uses_cache(tmp_path):
     cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
 
     with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
-        with patch("hermes_cli.banner.subprocess.run") as mock_run:
+        with patch("hermes_cli.banner.detect_update_target", return_value=("main", "origin", "main")), patch("hermes_cli.banner.write_update_channel"), patch("hermes_cli.banner.subprocess.run") as mock_run:
             result = check_for_updates()
 
     assert result == 3
@@ -50,7 +50,7 @@ def test_check_for_updates_expired_cache(tmp_path):
     mock_result = MagicMock(returncode=0, stdout="5\n")
 
     with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
-        with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("hermes_cli.banner.detect_update_target", return_value=("main", "origin", "main")), patch("hermes_cli.banner.write_update_channel"), patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
             result = check_for_updates()
 
     assert result == 5
@@ -70,7 +70,7 @@ def test_check_for_updates_no_git_dir(tmp_path):
     try:
         banner.__file__ = str(fake_banner)
         with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
-            with patch("hermes_cli.banner.subprocess.run") as mock_run:
+            with patch("hermes_cli.banner.detect_update_target", return_value=("main", "origin", "main")), patch("hermes_cli.banner.write_update_channel"), patch("hermes_cli.banner.subprocess.run") as mock_run:
                 result = banner.check_for_updates()
         assert result is None
         mock_run.assert_not_called()
@@ -90,7 +90,7 @@ def test_check_for_updates_fallback_to_project_root():
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         with patch("hermes_cli.banner.os.getenv", return_value=td):
-            with patch("hermes_cli.banner.subprocess.run") as mock_run:
+            with patch("hermes_cli.banner.detect_update_target", return_value=("main", "origin", "main")), patch("hermes_cli.banner.write_update_channel"), patch("hermes_cli.banner.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="0\n")
                 result = banner.check_for_updates()
         # Should have fallen back to project root and run git commands
@@ -133,3 +133,27 @@ def test_get_update_result_timeout():
     # Should have waited ~0.1s and returned None
     assert result is None
     assert elapsed < 0.5
+
+
+def test_check_for_updates_uses_prod_target_when_detected(tmp_path):
+    """Prod installs should compare against fork/prod, not origin/main."""
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return MagicMock(returncode=0, stdout="2\n")
+
+    with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
+        with patch("hermes_cli.banner.detect_update_target", return_value=("prod", "fork", "prod")), patch("hermes_cli.banner.write_update_channel") as mock_write, patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+            result = check_for_updates()
+
+    assert result == 2
+    assert ["git", "fetch", "fork", "prod", "--quiet"] in calls
+    assert ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"] in calls
+    mock_write.assert_called_once_with("prod", tmp_path)
