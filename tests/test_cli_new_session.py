@@ -293,3 +293,33 @@ def test_preload_resumed_session_restores_model_provider_and_base_url(tmp_path):
     assert cli.requested_provider == "zai"
     assert cli.base_url == "https://api.z.ai/api/coding/paas/v4"
     assert len(cli.conversation_history) == 2
+
+
+def test_model_switch_clears_stale_session_base_url_override(tmp_path):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli._session_base_url_override = "http://old.local/v1"
+    cli.base_url = "http://old.local/v1"
+    cli.requested_provider = "custom"
+    cli.provider = "custom"
+
+    with patch(
+        "hermes_cli.model_switch.switch_model",
+        return_value=ModelSwitchResult(
+            success=True,
+            new_model="gpt-5.4",
+            target_provider="openai-codex",
+            provider_changed=True,
+            api_key="new-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider_label="OpenAI Codex",
+        ),
+    ):
+        cli.process_command("/model openai-codex:gpt-5.4")
+
+    assert cli._session_base_url_override == "https://chatgpt.com/backend-api/codex"
+
+    row = cli._session_db.get_session(cli.session_id)
+    config = json.loads(row["model_config"])
+    assert config["base_url"] == "https://chatgpt.com/backend-api/codex"

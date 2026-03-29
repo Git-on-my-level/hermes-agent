@@ -3850,6 +3850,7 @@ class HermesCLI:
                         self.provider = "custom"
                         self.api_key = result.api_key
                         self.base_url = result.base_url
+                        self._session_base_url_override = result.base_url
                         self.agent = None
                         self._persist_session_runtime_settings()
                         print(f"(^_^) Model changed to: {result.model} [provider: Custom] (this session only)")
@@ -3884,6 +3885,7 @@ class HermesCLI:
                         self.provider = result.target_provider
                         self.api_key = result.api_key
                         self.base_url = result.base_url
+                        self._session_base_url_override = result.base_url or None
 
                     provider_note = f" [provider: {result.provider_label}]" if result.provider_changed else ""
                     self._persist_session_runtime_settings()

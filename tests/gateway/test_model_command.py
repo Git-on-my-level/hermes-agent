@@ -125,3 +125,58 @@ async def test_model_command_lists_current_and_configured_models():
     assert "openai-codex" in result
     assert "Not configured" in result
     runner.session_store.get_or_create_session.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_model_command_preserves_existing_token_totals_when_switching():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        model="glm-5.1",
+        provider="zai",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        input_tokens=111,
+        output_tokens=222,
+        cache_read_tokens=333,
+        cache_write_tokens=444,
+        estimated_cost_usd=1.23,
+        cost_status="estimated",
+    )
+    runner = _make_runner(session_entry)
+
+    with patch(
+        "hermes_cli.model_switch.switch_model",
+        return_value=SimpleNamespace(
+            success=True,
+            new_model="gpt-5.4",
+            target_provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider_label="OpenAI Codex",
+            warning_message="",
+        ),
+    ), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value={
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "z-key",
+        },
+    ):
+        await runner._handle_model_command(_make_event("/model openai-codex:gpt-5.4"))
+
+    runner.session_store.update_session.assert_called_once_with(
+        session_entry.session_key,
+        input_tokens=111,
+        output_tokens=222,
+        cache_read_tokens=333,
+        cache_write_tokens=444,
+        estimated_cost_usd=1.23,
+        cost_status="estimated",
+        model="gpt-5.4",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )

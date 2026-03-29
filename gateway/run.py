@@ -3151,6 +3151,12 @@ class GatewayRunner:
 
         self.session_store.update_session(
             session_key,
+            input_tokens=session_entry.input_tokens,
+            output_tokens=session_entry.output_tokens,
+            cache_read_tokens=session_entry.cache_read_tokens,
+            cache_write_tokens=session_entry.cache_write_tokens,
+            estimated_cost_usd=session_entry.estimated_cost_usd,
+            cost_status=session_entry.cost_status,
             model=result.new_model,
             provider=result.target_provider,
             base_url=result.base_url,
