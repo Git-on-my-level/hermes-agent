@@ -77,6 +77,64 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+def _install_fake_compress_agent(monkeypatch):
+    class FakeCompressAgent:
+        captured_messages = None
+        last_approx_tokens = None
+
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._print_fn = None
+
+        def _compress_context(self, messages, *_args, **kwargs):
+            type(self).captured_messages = list(messages)
+            type(self).last_approx_tokens = kwargs.get("approx_tokens")
+            self.session_id = f"{self.session_id}_compressed"
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    return FakeCompressAgent
+
+
+def _make_runner_with_history(history, adapter=None):
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = adapter or HygieneCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:group:-1001:17585",
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    runner.session_store.load_transcript.return_value = history
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store._save = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    return runner, gateway_run, adapter
+
+
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
@@ -385,3 +443,94 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     assert adapter.sent[1]["chat_id"] == "-1001"
     assert "Compressed:" in adapter.sent[1]["content"]
     assert adapter.sent[1]["metadata"] == {"thread_id": "17585"}
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_passes_full_history_to_compressor(monkeypatch):
+    fake_agent = _install_fake_compress_agent(monkeypatch)
+    history = [
+        {"role": "user", "content": "hello", "timestamp": "t1"},
+        {"role": "tool", "content": "x" * 600, "timestamp": "t2"},
+        {"role": "assistant", "content": "hi", "timestamp": "t3"},
+        {"role": "tool", "content": "y" * 600, "timestamp": "t4"},
+    ]
+
+    runner, gateway_run, adapter = _make_runner_with_history(history)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="17585",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert fake_agent.captured_messages == history
+    assert any(msg["role"] == "tool" for msg in fake_agent.captured_messages)
+    runner.session_store.rewrite_transcript.assert_called_once_with(
+        "sess-1_compressed",
+        [{"role": "assistant", "content": "compressed"}],
+    )
+    assert "Compressed: 4 → 1 messages" in adapter.sent[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_manual_compress_passes_full_history_to_compressor(monkeypatch):
+    fake_agent = _install_fake_compress_agent(monkeypatch)
+    history = [
+        {"role": "user", "content": "hello", "timestamp": "t1"},
+        {"role": "tool", "content": "x" * 300, "timestamp": "t2"},
+        {"role": "assistant", "content": "hi", "timestamp": "t3"},
+        {"role": "tool", "content": "y" * 300, "timestamp": "t4"},
+    ]
+
+    runner, gateway_run, _adapter = _make_runner_with_history(history)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "fake-model")
+
+    event = MessageEvent(
+        text="/compress",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="17585",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_compress_command(event)
+
+    assert fake_agent.captured_messages == history
+    assert any(msg["role"] == "tool" for msg in fake_agent.captured_messages)
+    assert fake_agent.last_approx_tokens == estimate_messages_tokens_rough(history)
+    runner.session_store.rewrite_transcript.assert_called_once_with(
+        "sess-1_compressed",
+        [{"role": "assistant", "content": "compressed"}],
+    )
+    runner.session_store.update_session.assert_called_once_with(
+        "agent:main:telegram:group:-1001:17585",
+        last_prompt_tokens=0,
+    )
+    assert "Compressed: 4 → 1 messages" in result

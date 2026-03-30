@@ -2265,12 +2265,7 @@ class GatewayRunner:
 
                         _hyg_runtime = _resolve_runtime_agent_kwargs()
                         if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in ("user", "assistant")
-                                and m.get("content")
-                            ]
+                            _hyg_msgs = list(history)
 
                             if len(_hyg_msgs) >= 4:
                                 _hyg_agent = AIAgent(
@@ -4069,11 +4064,7 @@ class GatewayRunner:
             # Resolve model from config (same reason as memory flush above).
             model = _resolve_gateway_model()
 
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
+            msgs = list(history)
             original_count = len(msgs)
             approx_tokens = estimate_messages_tokens_rough(msgs)
 
