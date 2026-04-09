@@ -424,6 +424,7 @@ def switch_model(
         detect_provider_for_model,
         validate_requested_model,
         opencode_model_api_mode,
+        input_uses_explicit_provider,
     )
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -574,9 +575,11 @@ def switch_model(
         is_custom = current_provider in ("custom", "local") or (
             "localhost" in _base or "127.0.0.1" in _base
         )
+        _input_explicit = input_uses_explicit_provider(raw_input)
 
         if (
-            target_provider == current_provider
+            not _input_explicit
+            and target_provider == current_provider
             and not is_custom
             and not resolved_alias
         ):

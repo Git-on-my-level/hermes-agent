@@ -19,6 +19,8 @@ COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
+CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CODEX_MODELS_URL = f"{CODEX_BASE_URL}/models?client_version=1.0.0"
 
 # Backward-compatible aliases for the earlier GitHub Models-backed Copilot work.
 GITHUB_MODELS_BASE_URL = COPILOT_BASE_URL
@@ -757,6 +759,71 @@ _KNOWN_PROVIDER_NAMES: set[str] = (
     | {"openrouter", "custom"}
 )
 
+# Narrow slash-compat syntax for direct providers where users commonly type
+# provider/model by habit. This intentionally excludes common OpenRouter
+# namespaces like anthropic/openai/google so those slugs keep their existing
+# meaning.
+_SLASH_PROVIDER_NAMES: set[str] = {
+    "openai-codex",
+    "nous",
+    "copilot",
+    "copilot-acp",
+    "zai",
+    "glm",
+    "z-ai",
+    "z.ai",
+    "zhipu",
+    "kimi-coding",
+    "kimi",
+    "moonshot",
+    "minimax",
+    "minimax-cn",
+    "minimax-china",
+    "minimax_cn",
+    "kilocode",
+    "kilo",
+    "kilo-code",
+    "kilo-gateway",
+    "opencode-zen",
+    "opencode",
+    "zen",
+    "opencode-go",
+    "opencode-go-sub",
+    "ai-gateway",
+    "aigateway",
+    "vercel",
+    "vercel-ai-gateway",
+    "huggingface",
+    "hf",
+    "hugging-face",
+    "huggingface-hub",
+    "alibaba",
+    "dashscope",
+    "aliyun",
+    "custom",
+}
+
+
+def input_uses_explicit_provider(raw: str) -> bool:
+    """Return True when the model input explicitly names a provider."""
+    stripped = raw.strip()
+
+    colon = stripped.find(":")
+    if colon > 0:
+        provider_part = stripped[:colon].strip().lower()
+        model_part = stripped[colon + 1:].strip()
+        if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
+            return True
+
+    slash = stripped.find("/")
+    if slash > 0:
+        provider_part = stripped[:slash].strip().lower()
+        model_part = stripped[slash + 1:].strip()
+        if provider_part and model_part and provider_part in _SLASH_PROVIDER_NAMES:
+            return True
+
+    return False
+
 
 def list_available_providers() -> list[dict[str, str]]:
     """Return info about all providers the user could use with ``provider:model``.
@@ -838,6 +905,14 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
                 if custom_name and actual_model:
                     return (f"custom:{custom_name}", actual_model)
             return (normalize_provider(provider_part), model_part)
+
+    slash = stripped.find("/")
+    if slash > 0:
+        provider_part = stripped[:slash].strip().lower()
+        model_part = stripped[slash + 1:].strip()
+        if provider_part and model_part and provider_part in _SLASH_PROVIDER_NAMES:
+            return (normalize_provider(provider_part), model_part)
+
     return (current_provider, stripped)
 
 
@@ -1488,7 +1563,7 @@ def probe_api_models(
         }
 
     if _is_github_models_base_url(normalized):
-        models = _fetch_github_models(api_key=api_key, timeout=timeout)
+        models = _fetch_github_models(api_key=*** timeout=timeout)
         return {
             "models": models,
             "probed_url": COPILOT_MODELS_URL,
@@ -1496,6 +1571,43 @@ def probe_api_models(
             "suggested_base_url": None,
             "used_fallback": False,
         }
+
+    if normalized.startswith(CODEX_BASE_URL):
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(CODEX_MODELS_URL, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+                models = []
+                for item in data.get("models", []) if isinstance(data, dict) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    slug = item.get("slug")
+                    if not isinstance(slug, str) or not slug.strip():
+                        continue
+                    if item.get("supported_in_api") is False:
+                        continue
+                    visibility = item.get("visibility", "")
+                    if isinstance(visibility, str) and visibility.strip().lower() in ("hide", "hidden"):
+                        continue
+                    models.append(slug.strip())
+                return {
+                    "models": models,
+                    "probed_url": CODEX_MODELS_URL,
+                    "resolved_base_url": CODEX_BASE_URL,
+                    "suggested_base_url": None,
+                    "used_fallback": False,
+                }
+        except Exception:
+            return {
+                "models": None,
+                "probed_url": CODEX_MODELS_URL,
+                "resolved_base_url": CODEX_BASE_URL,
+                "suggested_base_url": None,
+                "used_fallback": False,
+            }
 
     if normalized.endswith("/v1"):
         alternate_base = normalized[:-3].rstrip("/")
