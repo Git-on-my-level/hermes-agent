@@ -289,7 +289,11 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(
+    *,
+    requested: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -298,7 +302,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
     try:
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested or os.getenv("HERMES_INFERENCE_PROVIDER"),
+            explicit_base_url=explicit_base_url,
         )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
@@ -312,6 +317,31 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+
+def _resolve_session_runtime_config(
+    session_overrides: Optional[Dict[str, Any]],
+    config: dict | None = None,
+) -> tuple[str, dict]:
+    """Resolve the effective model/runtime for a session-aware gateway turn.
+
+    Reads the in-memory ``_session_model_overrides`` dict (populated by
+    ``/model``) and, when present, uses the session-scoped provider and
+    base_url instead of the global defaults.
+    """
+    session_model = session_overrides.get("model") if session_overrides else None
+    session_provider = session_overrides.get("provider") if session_overrides else None
+    session_base_url = session_overrides.get("base_url") if session_overrides else None
+
+    model = session_model or _resolve_gateway_model(config)
+    if session_provider or session_base_url:
+        runtime_kwargs = _resolve_runtime_agent_kwargs(
+            requested=session_provider,
+            explicit_base_url=session_base_url,
+        )
+    else:
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+    return model, runtime_kwargs
 
 
 def _build_media_placeholder(event) -> str:
@@ -3024,12 +3054,13 @@ class GatewayRunner:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
+                resolved_model = agent_result.get("model")
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
+                        "model": resolved_model or "",
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }
@@ -6278,6 +6309,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        session_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -6626,6 +6658,15 @@ class GatewayRunner:
                     "tools": [],
                 }
 
+            # Override model/runtime with session-scoped settings from /model.
+            # _session_model_overrides is populated by _handle_model_command and
+            # cleared on /new or /reset.
+            _effective_overrides = session_overrides
+            if _effective_overrides is None and session_key:
+                _effective_overrides = getattr(self, "_session_model_overrides", {}).get(session_key)
+            if _effective_overrides:
+                model, runtime_kwargs = _resolve_session_runtime_config(_effective_overrides, user_config)
+
             pr = self._provider_routing
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
@@ -6906,11 +6947,21 @@ class GatewayRunner:
             _input_toks = 0
             _output_toks = 0
             _agent = agent_holder[0]
+            _requested_turn = _effective_overrides or {}
+            _requested_runtime = {}
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _resolved_provider = getattr(_agent, "provider", None) if _agent else None
+            _resolved_base_url = getattr(_agent, "base_url", None) if _agent else None
+            if _resolved_model is None:
+                _resolved_model = _requested_turn.get("model")
+            if _resolved_provider is None:
+                _resolved_provider = _requested_turn.get("provider")
+            if _resolved_base_url is None:
+                _resolved_base_url = _requested_turn.get("base_url")
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
@@ -6924,6 +6975,8 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": _resolved_provider,
+                    "base_url": _resolved_base_url,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -7013,6 +7066,8 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
+                "base_url": _resolved_base_url,
                 "session_id": effective_session_id,
             }
         
@@ -7244,8 +7299,8 @@ class GatewayRunner:
             # the actually-active model instead of the config default.
             _agent = agent_holder[0]
             if _agent is not None and hasattr(_agent, 'model'):
-                _cfg_model = _resolve_gateway_model()
-                if _agent.model != _cfg_model:
+                _requested_model = _requested_turn.get("model") or _resolve_gateway_model()
+                if _requested_model and _agent.model != _requested_model:
                     self._effective_model = _agent.model
                     self._effective_provider = getattr(_agent, 'provider', None)
                     # Fallback activated — evict cached agent so the next
@@ -7260,49 +7315,53 @@ class GatewayRunner:
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
             
-            # Get pending message from adapter.
-            # Use session_key (not source.chat_id) to match adapter's storage keys.
+            # Get any pending follow-up from the adapter.
+            # Use session_key (not source.chat_id) to match adapter storage keys.
+            pending_event = None
             pending = None
             if result and adapter and session_key:
                 if result.get("interrupted"):
-                    pending = _dequeue_pending_text(adapter, session_key)
+                    # Interrupted — consume the interrupt message.
+                    pending_event = adapter.get_pending_message(session_key)
+                    if pending_event:
+                        pending = pending_event.text
+                        if not pending and getattr(pending_event, "media_urls", None):
+                            pending = _build_media_placeholder(pending_event)
                     if not pending and result.get("interrupt_message"):
                         pending = result.get("interrupt_message")
                 else:
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if pending:
-                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-            
-            # Safety net: if the pending text is a slash command (e.g. "/stop",
-            # "/new"), discard it — commands should never be passed to the agent
-            # as user input.  The primary fix is in base.py (commands bypass the
-            # active-session guard), but this catches edge cases where command
-            # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
-                _pending_parts = pending.strip().split(None, 1)
-                _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
-                if _pending_cmd_word:
-                    try:
-                        from hermes_cli.commands import resolve_command as _rc_pending
-                        if _rc_pending(_pending_cmd_word):
-                            logger.info(
-                                "Discarding command '/%s' from pending queue — "
-                                "commands must not be passed as agent input",
-                                _pending_cmd_word,
-                            )
-                            pending = None
-                    except Exception:
-                        pass
+                    pending_event = adapter.get_pending_message(session_key)
+                    if pending_event:
+                        pending = pending_event.text
+                        if not pending and getattr(pending_event, "media_urls", None):
+                            pending = _build_media_placeholder(pending_event)
+                        if pending:
+                            logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
-            if pending:
-                logger.debug("Processing pending message: '%s...'", pending[:40])
-                
-                # Clear the adapter's interrupt event so the next _run_agent call
-                # doesn't immediately re-trigger the interrupt before the new agent
-                # even makes its first API call (this was causing an infinite loop).
+            if pending_event or pending:
+                if pending:
+                    logger.debug("Processing pending message: '%s...'", pending[:40])
+
+                # Clear the adapter's interrupt event so the next turn doesn't
+                # immediately re-trigger before the follow-up is dispatched.
                 if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
                     adapter._active_sessions[session_key].clear()
-                
+
+                # If the queued follow-up is a slash command (e.g. /new, /model),
+                # redispatch it through _handle_message so it keeps its command
+                # semantics instead of being demoted to plain text input.
+                if pending_event and pending_event.is_command():
+                    logger.debug(
+                        "Dispatching queued command follow-up directly: '%s'",
+                        pending_event.text[:40],
+                    )
+                    # Clear the running-agent marker before re-dispatching so
+                    # commands like /new and /model aren't blocked by the
+                    # active-session guard.
+                    if session_key and session_key in self._running_agents:
+                        del self._running_agents[session_key]
+                    return await self._handle_message(pending_event)
+
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
                 if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
@@ -7313,7 +7372,7 @@ class GatewayRunner:
                     )
                     # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
-                    if adapter and hasattr(adapter, 'queue_message'):
+                    if adapter and hasattr(adapter, 'queue_message') and pending:
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
@@ -7345,6 +7404,7 @@ class GatewayRunner:
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
+                    session_overrides=session_overrides,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
