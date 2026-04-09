@@ -43,7 +43,7 @@ def _make_run_side_effect(
             rc = 0 if verify_ok else 128
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
-        # git rev-list HEAD..origin/{branch} --count
+        # git rev-list HEAD..FETCH_HEAD --count
         if "rev-list" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
 
@@ -300,11 +300,11 @@ class TestCmdUpdateLaunchdRestart:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_detects_launchd_and_skips_manual_restart_message(
+    def test_update_detects_launchd_and_uses_healthchecked_restart(
         self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
     ):
         """When launchd is running the gateway, update should print
-        'auto-restart via launchd' instead of 'Restart it with: hermes gateway run'."""
+        the restart success path and avoid direct stop/start commands."""
         # Create a fake launchd plist so is_macos + plist.exists() passes
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist/>")
@@ -321,15 +321,33 @@ class TestCmdUpdateLaunchdRestart:
             launchctl_loaded=True,
         )
 
-        # Mock launchd_restart + find_gateway_pids (new code discovers all gateways)
-        with patch.object(gateway_cli, "launchd_restart") as mock_launchd_restart, \
+        with patch("gateway.status.get_running_pid", return_value=12345), \
+             patch(
+                 "hermes_cli.gateway.launchd_restart_for_update",
+                 return_value={
+                     "ok": True,
+                     "checks": {},
+                 },
+             ) as restart_helper, \
+             patch(
+                 "hermes_cli.gateway.format_launchd_restart_report",
+                 return_value=["  runtime_status: ok (state=running, pid=456)"],
+             ), \
              patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
             cmd_update(mock_args)
 
         captured = capsys.readouterr().out
         assert "Restarted" in captured
         assert "Restart manually: hermes gateway run" not in captured
-        mock_launchd_restart.assert_called_once_with()
+        restart_helper.assert_called_once_with(previous_pid=12345)
+        launchctl_calls = [
+            c for c in mock_run.call_args_list
+            if len(c.args[0]) > 0 and c.args[0][0] == "launchctl"
+        ]
+        stop_calls = [c for c in launchctl_calls if "stop" in c.args[0]]
+        start_calls = [c for c in launchctl_calls if "start" in c.args[0]]
+        assert len(stop_calls) == 0
+        assert len(start_calls) == 0
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -358,6 +376,49 @@ class TestCmdUpdateLaunchdRestart:
 
         captured = capsys.readouterr().out
         assert "Restart manually: hermes gateway run" in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_reports_launchd_healthcheck_failure(
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>")
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        mock_run.side_effect = _make_run_side_effect(
+            commit_count="3",
+            launchctl_loaded=True,
+        )
+
+        with patch("gateway.status.get_running_pid", return_value=12345), \
+             patch(
+                 "hermes_cli.gateway.launchd_restart_for_update",
+                 return_value={
+                     "ok": False,
+                     "checks": {
+                         "launchctl": {"ok": False, "detail": "loaded=no, stderr=Could not find service"},
+                         "gateway_pid": {"ok": False, "detail": "pid=missing"},
+                     },
+                 },
+             ), \
+             patch(
+                 "hermes_cli.gateway.format_launchd_restart_report",
+                 return_value=[
+                     "  launchctl: failed (loaded=no, stderr=Could not find service)",
+                     "  gateway_pid: failed (pid=missing)",
+                 ],
+             ), \
+             patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
+            cmd_update(mock_args)
+
+        captured = capsys.readouterr().out
+        assert "Code update succeeded, but gateway restart healthcheck failed" in captured
+        assert "launchctl: failed" in captured
+        assert "gateway_pid: failed" in captured
+        assert "Try manually: hermes gateway restart" in captured
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

@@ -5,12 +5,17 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -1174,6 +1179,413 @@ def launchd_stop():
     label = get_launchd_label()
     subprocess.run(["launchctl", "kill", "SIGTERM", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
     print("✓ Service stopped")
+
+
+def _get_gateway_log_path() -> Path:
+    """Return the gateway log path for the current Hermes home."""
+    return get_hermes_home() / "logs" / "gateway.log"
+
+
+def _read_json_payload(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_log_excerpt_since(log_path: Path, *, offset: int, max_bytes: int = 8192) -> str:
+    """Read new gateway log output written since ``offset`` when possible."""
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return ""
+
+    start = min(offset, size)
+    if size < offset:
+        start = max(0, size - max_bytes)
+    elif size - start > max_bytes:
+        start = size - max_bytes
+
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(max_bytes)
+    except OSError:
+        return ""
+
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def _collect_recent_gateway_log_signals(log_path: Path, *, offset: int) -> dict[str, Any]:
+    """Extract recent success-looking lines from the gateway log."""
+    excerpt = _read_log_excerpt_since(log_path, offset=offset)
+    if not excerpt:
+        return {"ok": False, "detail": "no new gateway log output", "matches": [], "excerpt": ""}
+
+    matches: list[str] = []
+    for raw_line in excerpt.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if "gateway running with " in lowered:
+            matches.append(line)
+            continue
+        if re.search(r"\bconnected\b", lowered) and "disconnected" not in lowered and "not connected" not in lowered:
+            matches.append(line)
+
+    matches = matches[-3:]
+    detail = matches[-1] if matches else "no recent connected/running log line observed"
+    return {
+        "ok": bool(matches),
+        "detail": detail,
+        "matches": matches,
+        "excerpt": excerpt,
+    }
+
+
+def _launchctl_list_state(label: str) -> dict[str, Any]:
+    """Return the current launchctl state for a label."""
+    domain_label = f"gui/{os.getuid()}/{label}"
+    result = subprocess.run(
+        ["launchctl", "print", domain_label],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    source = "print"
+
+    if result.returncode != 0:
+        fallback = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        result = fallback
+        stdout = (fallback.stdout or "").strip()
+        stderr = (fallback.stderr or "").strip()
+        source = "list"
+
+    pid = None
+    last_exit_status = None
+    state = None
+
+    if source == "print":
+        state_match = re.search(r"(?m)^\s*state = ([^\n]+)$", stdout)
+        if state_match:
+            state = state_match.group(1).strip()
+        pid_match = re.search(r"(?m)^\s*pid = (\d+)$", stdout)
+        if pid_match:
+            pid = int(pid_match.group(1))
+        exit_match = re.search(r"(?m)^\s*last exit code = (-?\d+)$", stdout)
+        if exit_match:
+            last_exit_status = int(exit_match.group(1))
+    else:
+        header_match = re.search(
+            rf"(?m)^(?P<pid>\d+|-)\s+(?P<status>-?\d+|-)\s+{re.escape(label)}$",
+            stdout,
+        )
+        if header_match:
+            pid_token = header_match.group("pid")
+            status_token = header_match.group("status")
+            if pid_token != "-":
+                try:
+                    pid = int(pid_token)
+                except ValueError:
+                    pid = None
+            if status_token != "-":
+                try:
+                    last_exit_status = int(status_token)
+                except ValueError:
+                    last_exit_status = None
+            state = "running" if pid is not None else "not running"
+
+    detail_parts = [f"source={source}", f"loaded={'yes' if result.returncode == 0 else 'no'}"]
+    if state:
+        detail_parts.append(f"state={state}")
+    if pid is not None:
+        detail_parts.append(f"pid={pid}")
+    if last_exit_status is not None:
+        detail_parts.append(f"last_exit={last_exit_status}")
+    if stderr:
+        detail_parts.append(f"stderr={stderr}")
+
+    ok = result.returncode == 0 and state != "not running"
+    return {
+        "ok": ok,
+        "loaded": result.returncode == 0,
+        "returncode": result.returncode,
+        "state": state,
+        "pid": pid,
+        "last_exit_status": last_exit_status,
+        "stdout": stdout,
+        "stderr": stderr,
+        "detail": ", ".join(detail_parts),
+    }
+
+
+def _runtime_health_snapshot(*, previous_pid: Optional[int], started_at: float) -> dict[str, Any]:
+    """Return whether the persisted runtime status looks freshly healthy."""
+    try:
+        from gateway.status import get_running_pid, read_runtime_status
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"runtime helpers unavailable: {exc}",
+            "gateway_pid": None,
+            "payload": None,
+        }
+
+    gateway_pid = get_running_pid()
+    payload = read_runtime_status()
+    details: list[str] = []
+    ok = False
+
+    if gateway_pid is None:
+        details.append("pid=missing")
+    else:
+        details.append(f"pid={gateway_pid}")
+        if previous_pid is not None and gateway_pid == previous_pid:
+            details.append("pid did not change yet")
+
+    runtime_pid = None
+    platforms_summary = ""
+    if payload:
+        gateway_state = payload.get("gateway_state")
+        runtime_pid = payload.get("pid")
+        details.append(f"state={gateway_state or 'unknown'}")
+        if runtime_pid is not None:
+            details.append(f"runtime_pid={runtime_pid}")
+
+        platforms = payload.get("platforms") or {}
+        platform_bits = []
+        for name, pdata in sorted(platforms.items()):
+            state = pdata.get("state")
+            if state:
+                platform_bits.append(f"{name}={state}")
+        if platform_bits:
+            platforms_summary = ", ".join(platform_bits[:4])
+            details.append(f"platforms={platforms_summary}")
+
+        updated_at = payload.get("updated_at")
+        updated_ts = None
+        if isinstance(updated_at, str):
+            try:
+                updated_ts = datetime.fromisoformat(updated_at).timestamp()
+            except ValueError:
+                updated_ts = None
+        if updated_ts is not None and updated_ts < started_at - 1:
+            details.append("runtime status is stale")
+        elif (
+            gateway_pid is not None
+            and runtime_pid == gateway_pid
+            and gateway_state == "running"
+            and (previous_pid is None or gateway_pid != previous_pid)
+        ):
+            ok = True
+    else:
+        details.append("runtime_status=missing")
+
+    return {
+        "ok": ok,
+        "detail": ", ".join(details),
+        "gateway_pid": gateway_pid,
+        "payload": payload,
+        "platforms_summary": platforms_summary,
+    }
+
+
+def _launchd_restart_checks(
+    *,
+    label: str,
+    previous_pid: Optional[int],
+    helper_result_path: Path,
+    log_offset: int,
+    started_at: float,
+) -> dict[str, Any]:
+    """Collect the current restart/healthcheck state for a launchd restart."""
+    helper_payload = _read_json_payload(helper_result_path)
+    helper_ok = helper_payload is not None and helper_payload.get("returncode") == 0
+    helper_detail = "pending detached kickstart helper"
+    if helper_payload is not None:
+        helper_detail = f"rc={helper_payload.get('returncode')}"
+        if helper_payload.get("stderr"):
+            helper_detail += f", stderr={helper_payload['stderr'].strip()}"
+        elif helper_payload.get("stdout"):
+            helper_detail += f", stdout={helper_payload['stdout'].strip()}"
+        elif helper_payload.get("exception"):
+            helper_detail += f", exception={helper_payload['exception']}"
+
+    launchctl_state = _launchctl_list_state(label)
+    runtime = _runtime_health_snapshot(previous_pid=previous_pid, started_at=started_at)
+    log_signals = _collect_recent_gateway_log_signals(_get_gateway_log_path(), offset=log_offset)
+
+    pid_ok = runtime["gateway_pid"] is not None and (
+        previous_pid is None or runtime["gateway_pid"] != previous_pid
+    )
+
+    checks = {
+        "kickstart": {"ok": helper_ok, "detail": helper_detail},
+        "launchctl": {"ok": launchctl_state["ok"], "detail": launchctl_state["detail"]},
+        "gateway_pid": {
+            "ok": pid_ok,
+            "detail": (
+                f"pid={runtime['gateway_pid']}"
+                if runtime["gateway_pid"] is not None
+                else "pid=missing"
+            ),
+        },
+        "runtime_status": {"ok": runtime["ok"], "detail": runtime["detail"]},
+        "gateway_logs": {"ok": log_signals["ok"], "detail": log_signals["detail"]},
+    }
+
+    ok = helper_ok and launchctl_state["ok"] and pid_ok and (runtime["ok"] or log_signals["ok"])
+
+    return {
+        "ok": ok,
+        "label": label,
+        "helper": helper_payload,
+        "launchctl": launchctl_state,
+        "runtime": runtime,
+        "logs": log_signals,
+        "checks": checks,
+    }
+
+
+def _wait_for_launchd_restart_health(
+    *,
+    label: str,
+    previous_pid: Optional[int],
+    helper_result_path: Path,
+    log_offset: int,
+    started_at: float,
+    timeout: float = 20.0,
+    poll_interval: float = 0.5,
+) -> dict[str, Any]:
+    """Wait for a bounded launchd restart healthcheck to pass or fail."""
+    deadline = time.monotonic() + timeout
+    last_report: Optional[dict[str, Any]] = None
+
+    while True:
+        last_report = _launchd_restart_checks(
+            label=label,
+            previous_pid=previous_pid,
+            helper_result_path=helper_result_path,
+            log_offset=log_offset,
+            started_at=started_at,
+        )
+        if last_report["ok"]:
+            return last_report
+
+        helper_payload = last_report.get("helper")
+        helper_failed = helper_payload is not None and helper_payload.get("returncode") not in (0, None)
+        if helper_failed or time.monotonic() >= deadline:
+            return last_report
+
+        time.sleep(poll_interval)
+
+
+def format_launchd_restart_report(report: dict[str, Any], *, failure_only: bool = False) -> list[str]:
+    """Format a launchd restart report for operator-visible output."""
+    lines: list[str] = []
+    checks = report.get("checks", {})
+    for name in ("kickstart", "launchctl", "gateway_pid", "runtime_status", "gateway_logs"):
+        entry = checks.get(name)
+        if not entry:
+            continue
+        if failure_only and entry.get("ok"):
+            continue
+        if report.get("ok") and not failure_only and not entry.get("ok"):
+            continue
+        status = "ok" if entry.get("ok") else "failed"
+        lines.append(f"  {name}: {status} ({entry.get('detail')})")
+
+    helper = report.get("helper") or {}
+    if helper.get("command"):
+        lines.append(f"  helper_command: {' '.join(str(part) for part in helper['command'])}")
+
+    excerpt = (report.get("logs") or {}).get("excerpt", "")
+    if excerpt and not report.get("ok"):
+        lines.append("  recent_gateway_log:")
+        for raw_line in excerpt.splitlines()[-5:]:
+            lines.append(f"    {raw_line}")
+
+    return lines
+
+
+def launchd_restart_for_update(
+    *,
+    previous_pid: Optional[int],
+    health_timeout: float = 20.0,
+    helper_delay: float = 0.25,
+) -> dict[str, Any]:
+    """Kick launchd from a detached helper and verify the gateway really returned."""
+    plist_path = get_launchd_plist_path()
+    label = get_launchd_label()
+    target = f"{_launchd_domain()}/{label}"
+    log_path = _get_gateway_log_path()
+    log_offset = log_path.stat().st_size if log_path.exists() else 0
+    started_at = time.time()
+
+    if not plist_path.exists():
+        return {
+            "ok": False,
+            "label": label,
+            "checks": {
+                "kickstart": {"ok": False, "detail": "launchd plist missing"},
+            },
+            "logs": {"excerpt": "", "matches": [], "detail": "launchd plist missing", "ok": False},
+        }
+
+    refresh_launchd_plist_if_needed()
+
+    helper_result_path = get_hermes_home() / ".launchd-kickstart-update.json"
+    helper_result_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_result_path.unlink(missing_ok=True)
+
+    helper_code = (
+        "import json, subprocess, sys, time\n"
+        "target, out_path, delay = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+        "payload = {'command': ['launchctl', 'kickstart', '-k', target], 'target': target}\n"
+        "try:\n"
+        "    if delay > 0:\n"
+        "        time.sleep(delay)\n"
+        "    result = subprocess.run(payload['command'], capture_output=True, text=True)\n"
+        "    payload.update({'returncode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})\n"
+        "except Exception as exc:\n"
+        "    payload.update({'returncode': None, 'exception': repr(exc)})\n"
+        "with open(out_path, 'w', encoding='utf-8') as handle:\n"
+        "    json.dump(payload, handle)\n"
+    )
+
+    subprocess.Popen(
+        [sys.executable, "-c", helper_code, target, str(helper_result_path), str(helper_delay)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        cwd=str(PROJECT_ROOT),
+    )
+
+    return _wait_for_launchd_restart_health(
+        label=label,
+        previous_pid=previous_pid,
+        helper_result_path=helper_result_path,
+        log_offset=log_offset,
+        started_at=started_at,
+        timeout=health_timeout,
+    )
+
 
 def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float = 5.0):
     """Wait for the gateway process (by saved PID) to exit.

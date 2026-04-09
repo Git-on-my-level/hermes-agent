@@ -323,6 +323,8 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
+    monkeypatch.setattr(hermes_main, "detect_update_target", lambda *a, **kw: ("main", "origin", "main"))
+    monkeypatch.setattr(hermes_main, "write_update_channel", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
@@ -339,13 +341,13 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd == ["git", "fetch", "origin", "main"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd == ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "origin", "main"]:
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]", "--quiet"]:
             raise CalledProcessError(returncode=1, cmd=cmd)
@@ -384,13 +386,13 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd == ["git", "fetch", "origin", "main"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd == ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "origin", "main"]:
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0)
 
@@ -421,7 +423,7 @@ def _make_update_side_effect(
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
         joined = " ".join(str(c) for c in cmd)
-        if "fetch" in joined and "origin" in joined:
+        if "fetch" in joined:
             if fetch_fails:
                 return SimpleNamespace(stdout="", stderr=fetch_stderr, returncode=128)
             return SimpleNamespace(stdout="", stderr="", returncode=0)
@@ -449,7 +451,7 @@ def _make_update_side_effect(
 
 
 def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+    """When --ff-only fails (diverged history), update resets to FETCH_HEAD."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -460,7 +462,7 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    assert reset_calls[0] == ["git", "reset", "--hard", "FETCH_HEAD"]
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
@@ -519,8 +521,8 @@ def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, c
     assert "detached HEAD" in out
 
 
-def test_cmd_update_restores_stash_and_branch_when_already_up_to_date(monkeypatch, tmp_path, capsys):
-    """When on a feature branch with no updates, stash is restored and branch switched back."""
+def test_cmd_update_restores_stash_and_stays_on_target_branch_when_already_up_to_date(monkeypatch, tmp_path, capsys):
+    """When on a feature branch with no updates, stash is restored and update stays on the target branch."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -545,9 +547,9 @@ def test_cmd_update_restores_stash_and_branch_when_already_up_to_date(monkeypatc
     # Stash should have been restored
     assert len(restore_calls) == 1
 
-    # Should have checked out back to the original branch
+    # Should not have checked out back to the original branch
     checkout_back = [c for c in recorded if "checkout" in c and "fix/something" in c]
-    assert len(checkout_back) == 1
+    assert len(checkout_back) == 0
 
     out = capsys.readouterr().out
     assert "Already up to date" in out
@@ -565,6 +567,126 @@ def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
 
     checkout_calls = [c for c in recorded if "checkout" in c]
     assert len(checkout_calls) == 0
+
+
+def test_cmd_update_prod_channel_switches_to_prod_from_feature_branch(monkeypatch, tmp_path, capsys):
+    """Prod installs always converge back to fork/prod even from feature branches."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "detect_update_target", lambda *a, **kw: ("prod", "fork", "prod"))
+    monkeypatch.setattr(hermes_main, "_attempt_prod_prefetch_sync", lambda *a, **kw: {"updated_remote": False, "warning": None})
+
+    side_effect, recorded = _make_update_side_effect(current_branch="feature/demo")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert [c for c in recorded if c == ["git", "fetch", "fork", "prod"]]
+    assert [c for c in recorded if c == ["git", "checkout", "prod"]]
+    assert [c for c in recorded if c == ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"]]
+    assert [c for c in recorded if c == ["git", "pull", "--ff-only", "fork", "prod"]]
+
+    out = capsys.readouterr().out
+    assert "Updating our prod fork (fork/prod)" in out
+    assert "switching to prod" in out
+
+
+def test_cmd_update_prod_channel_creates_local_prod_tracking_branch_when_missing(monkeypatch, tmp_path):
+    """If local prod is missing, update creates it from fork/prod."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "detect_update_target", lambda *a, **kw: ("prod", "fork", "prod"))
+    monkeypatch.setattr(hermes_main, "_attempt_prod_prefetch_sync", lambda *a, **kw: {"updated_remote": False, "warning": None})
+
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append(cmd)
+        if cmd == ["git", "fetch", "fork", "prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="feature/demo\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "prod"]:
+            return SimpleNamespace(stdout="", stderr="error: pathspec 'prod' did not match\n", returncode=1)
+        if cmd == ["git", "checkout", "-B", "prod", "FETCH_HEAD"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "branch", "--set-upstream-to", "fork/prod", "prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert [c for c in recorded if c == ["git", "checkout", "-B", "prod", "FETCH_HEAD"]]
+    assert [c for c in recorded if c == ["git", "branch", "--set-upstream-to", "fork/prod", "prod"]]
+
+
+def test_attempt_prod_prefetch_sync_pushes_clean_merge(monkeypatch, tmp_path):
+    """Prod pre-sync should push a clean upstream merge before local update."""
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append((cmd, kwargs.get("cwd")))
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "fetch", "fork", "prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge-base", "--is-ancestor", "origin/main", "fork/prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=1)
+        if cmd[:4] == ["git", "worktree", "add", "--detach"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "--no-ff", "origin/main"]:
+            return SimpleNamespace(stdout="Merged\n", stderr="", returncode=0)
+        if cmd == ["git", "push", "fork", "HEAD:prod"]:
+            return SimpleNamespace(stdout="pushed\n", stderr="", returncode=0)
+        if cmd[:4] == ["git", "worktree", "remove", "--force"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    result = hermes_main._attempt_prod_prefetch_sync(["git"], tmp_path)
+
+    assert result["updated_remote"] is True
+    assert result["warning"] is None
+    assert [cmd for cmd, _ in recorded if cmd == ["git", "push", "fork", "HEAD:prod"]]
+
+
+def test_attempt_prod_prefetch_sync_warns_on_merge_conflict(monkeypatch, tmp_path):
+    """Prod pre-sync conflicts should warn and leave the main update unblocked."""
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append((cmd, kwargs.get("cwd")))
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "fetch", "fork", "prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge-base", "--is-ancestor", "origin/main", "fork/prod"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=1)
+        if cmd[:4] == ["git", "worktree", "add", "--detach"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "--no-ff", "origin/main"]:
+            return SimpleNamespace(stdout="", stderr="conflict\n", returncode=1)
+        if cmd == ["git", "diff", "--name-only", "--diff-filter=U"]:
+            return SimpleNamespace(stdout="gateway/run.py\nhermes_cli/main.py\n", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--abort"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[:4] == ["git", "worktree", "remove", "--force"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    result = hermes_main._attempt_prod_prefetch_sync(["git"], tmp_path)
+
+    assert result["updated_remote"] is False
+    assert "could not be auto-synced" in result["warning"]
+    assert "gateway/run.py" in result["warning"]
+    assert [cmd for cmd, _ in recorded if cmd == ["git", "merge", "--abort"]]
 
 
 # ---------------------------------------------------------------------------

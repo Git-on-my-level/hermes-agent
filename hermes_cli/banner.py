@@ -6,13 +6,13 @@ Pure display functions with no HermesCLI state dependency.
 import json
 import logging
 import os
-import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, List, Optional
+from hermes_cli.update_channel import detect_update_target, write_update_channel
 
 from rich.console import Console
 from rich.panel import Panel
@@ -131,7 +131,7 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 
 
 def check_for_updates() -> Optional[int]:
-    """Check how many commits behind origin/main the local repo is.
+    """Check how many commits behind the configured update target the local repo is.
 
     Does a ``git fetch`` at most once every 6 hours (cached to
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
@@ -157,10 +157,17 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Fetch latest refs (fast — only downloads ref metadata, no files)
+    update_target = detect_update_target(repo_dir, hermes_home)
+    _, remote, branch = update_target
+
+    # Persist inferred channel so future updates remain explicit even if the
+    # repo is temporarily checked out elsewhere.
+    write_update_channel(update_target[0], hermes_home)
+
+    # Fetch the specific remote branch so FETCH_HEAD reflects the current tip.
     try:
         subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+            ["git", "fetch", remote, branch, "--quiet"],
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
@@ -170,7 +177,7 @@ def check_for_updates() -> Optional[int]:
     # Count commits behind
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )

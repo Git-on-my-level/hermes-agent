@@ -250,6 +250,126 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_restart_for_update_spawns_detached_kickstart_helper(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+
+        refresh_calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda: refresh_calls.append(True) or False,
+        )
+
+        popen_calls = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append((cmd, kwargs))
+            return SimpleNamespace(pid=999)
+
+        wait_calls = []
+        monkeypatch.setattr(gateway_cli.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_restart_health",
+            lambda **kwargs: wait_calls.append(kwargs) or {"ok": True, "checks": {}},
+        )
+
+        result = gateway_cli.launchd_restart_for_update(previous_pid=321, health_timeout=7.0, helper_delay=0.1)
+
+        assert result["ok"] is True
+        assert refresh_calls == [True]
+        assert len(popen_calls) == 1
+        cmd, kwargs = popen_calls[0]
+        assert cmd[:2] == [gateway_cli.sys.executable, "-c"]
+        assert cmd[3] == f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        assert cmd[5] == "0.1"
+        assert kwargs["start_new_session"] is True
+        assert kwargs["close_fds"] is True
+        assert len(wait_calls) == 1
+        wait_call = wait_calls[0]
+        assert wait_call["label"] == gateway_cli.get_launchd_label()
+        assert wait_call["previous_pid"] == 321
+        assert wait_call["helper_result_path"] == tmp_path / ".launchd-kickstart-update.json"
+        assert wait_call["log_offset"] == 0
+        assert isinstance(wait_call["started_at"], float)
+        assert wait_call["timeout"] == 7.0
+
+    def test_launchd_restart_report_shows_failed_checks_and_recent_logs(self):
+        report = {
+            "ok": False,
+            "checks": {
+                "kickstart": {"ok": True, "detail": "rc=0"},
+                "launchctl": {"ok": False, "detail": "loaded=no, stderr=Could not find service"},
+                "gateway_pid": {"ok": False, "detail": "pid=missing"},
+                "runtime_status": {"ok": False, "detail": "runtime_status=missing"},
+                "gateway_logs": {"ok": False, "detail": "no recent connected/running log line observed"},
+            },
+            "helper": {"command": ["launchctl", "kickstart", "-k", "ai.hermes.gateway"]},
+            "logs": {
+                "excerpt": "2026-03-30 INFO old line\n2026-03-30 ERROR launch failed",
+            },
+        }
+
+        lines = gateway_cli.format_launchd_restart_report(report, failure_only=True)
+
+        assert not any(line.startswith("  kickstart:") for line in lines)
+        assert any("launchctl: failed" in line for line in lines)
+        assert any("gateway_pid: failed" in line for line in lines)
+        assert any("helper_command:" in line for line in lines)
+        assert any("recent_gateway_log:" in line for line in lines)
+
+    def test_launchd_restart_checks_accept_runtime_health_without_log_signal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_json_payload",
+            lambda path: {"returncode": 0, "command": ["launchctl", "kickstart", "-k", "ai.hermes.gateway"]},
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchctl_list_state",
+            lambda label: {"ok": True, "detail": "loaded=yes, pid=456", "returncode": 0, "pid": 456, "last_exit_status": 0},
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_runtime_health_snapshot",
+            lambda previous_pid, started_at: {
+                "ok": True,
+                "detail": "pid=456, state=running, runtime_pid=456",
+                "gateway_pid": 456,
+                "payload": {"gateway_state": "running", "pid": 456},
+                "platforms_summary": "telegram=connected",
+            },
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_collect_recent_gateway_log_signals",
+            lambda log_path, offset: {
+                "ok": False,
+                "detail": "no new gateway log output",
+                "matches": [],
+                "excerpt": "",
+            },
+        )
+
+        report = gateway_cli._launchd_restart_checks(
+            label="ai.hermes.gateway",
+            previous_pid=123,
+            helper_result_path=tmp_path / ".launchd-kickstart-update.json",
+            log_offset=0,
+            started_at=0.0,
+        )
+
+        assert report["ok"] is True
+        assert report["checks"]["kickstart"]["ok"] is True
+        assert report["checks"]["launchctl"]["ok"] is True
+        assert report["checks"]["gateway_pid"]["ok"] is True
+        assert report["checks"]["runtime_status"]["ok"] is True
+        assert report["checks"]["gateway_logs"]["ok"] is False
+
 
 class TestGatewayServiceDetection:
     def test_is_service_running_checks_system_scope_when_user_scope_is_inactive(self, monkeypatch):

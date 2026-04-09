@@ -47,6 +47,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -140,6 +141,7 @@ _apply_profile_override()
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.update_channel import detect_update_target, write_update_channel
 load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
 # Initialize centralized file logging early — all `hermes` subcommands
@@ -3313,6 +3315,125 @@ def _invalidate_update_cache():
             pass
 
 
+def _attempt_prod_prefetch_sync(git_cmd: list[str], cwd: Path) -> dict:
+    """Try to merge upstream main into fork/prod before a local prod update."""
+    result = {"updated_remote": False, "warning": None}
+
+    fetch_origin = subprocess.run(
+        git_cmd + ["fetch", "origin", "main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_origin.returncode != 0:
+        stderr = (fetch_origin.stderr or "").strip()
+        result["warning"] = (
+            "⚠ Could not check whether prod can sync with upstream before updating. "
+            f"Continuing with existing fork/prod. {stderr.splitlines()[0] if stderr else ''}"
+        ).strip()
+        return result
+
+    fetch_prod = subprocess.run(
+        git_cmd + ["fetch", "fork", "prod"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_prod.returncode != 0:
+        stderr = (fetch_prod.stderr or "").strip()
+        result["warning"] = (
+            "⚠ Could not refresh fork/prod for upstream sync check before updating. "
+            f"Continuing with existing fork/prod. {stderr.splitlines()[0] if stderr else ''}"
+        ).strip()
+        return result
+
+    already_synced = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", "origin/main", "fork/prod"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if already_synced.returncode == 0:
+        return result
+
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="hermes-prod-sync-", dir=str(cwd.parent))
+    worktree_path = Path(temp_dir_obj.name)
+    try:
+        add_worktree = subprocess.run(
+            git_cmd + ["worktree", "add", "--detach", str(worktree_path), "fork/prod"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if add_worktree.returncode != 0:
+            stderr = (add_worktree.stderr or "").strip()
+            result["warning"] = (
+                "⚠ Could not prepare a temporary prod sync worktree before updating. "
+                f"Continuing with existing fork/prod. {stderr.splitlines()[0] if stderr else ''}"
+            ).strip()
+            return result
+
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-edit", "--no-ff", "origin/main"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if merge_result.returncode != 0:
+            conflicted = subprocess.run(
+                git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+            )
+            files = [line.strip() for line in conflicted.stdout.splitlines() if line.strip()]
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            file_summary = ", ".join(files[:5])
+            if len(files) > 5:
+                file_summary += ", ..."
+            result["warning"] = (
+                "⚠ prod fork could not be auto-synced with upstream; continuing with existing fork/prod. "
+                + (
+                    f"Resolve separately. Conflicts: {file_summary}"
+                    if file_summary
+                    else "Resolve the merge separately."
+                )
+            )
+            return result
+
+        push_result = subprocess.run(
+            git_cmd + ["push", "fork", "HEAD:prod"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if push_result.returncode != 0:
+            stderr = (push_result.stderr or "").strip()
+            result["warning"] = (
+                "⚠ prod fork merged cleanly with upstream in a temp worktree, but pushing fork/prod failed. "
+                f"Continuing with existing fork/prod. {stderr.splitlines()[0] if stderr else ''}"
+            ).strip()
+            return result
+
+        result["updated_remote"] = True
+        return result
+    finally:
+        subprocess.run(
+            git_cmd + ["worktree", "remove", "--force", str(worktree_path)],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        temp_dir_obj.cleanup()
+
+
 def _load_installable_optional_extras() -> list[str]:
     """Return the optional extras referenced by the ``all`` group.
 
@@ -3358,6 +3479,7 @@ def _install_python_dependencies_with_optional_fallback(
             cwd=PROJECT_ROOT,
             check=True,
             env=env,
+            capture_output=True,
         )
         return
     except subprocess.CalledProcessError:
@@ -3448,14 +3570,25 @@ def cmd_update(args):
 
     # Fetch and pull
     try:
+        channel, remote, branch = detect_update_target(PROJECT_ROOT, get_hermes_home())
+        if channel == "prod":
+            print(f"→ Updating our prod fork ({remote}/{branch})")
+            sync_result = _attempt_prod_prefetch_sync(git_cmd, PROJECT_ROOT)
+            if sync_result.get("updated_remote"):
+                print("  ✓ Synced fork/prod with upstream before updating local checkout")
+            if sync_result.get("warning"):
+                print(sync_result["warning"])
+        else:
+            print(f"→ Updating main channel ({remote}/{branch})")
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + ["fetch", remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
+        fetched_ref = "FETCH_HEAD"
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
             if "Could not resolve host" in stderr or "unable to access" in stderr:
@@ -3464,7 +3597,7 @@ def cmd_update(args):
             elif "Authentication failed" in stderr or "could not read Username" in stderr:
                 print("✗ Authentication failed — check your git credentials or SSH key.")
             else:
-                print(f"✗ Failed to fetch updates from origin.")
+                print(f"✗ Failed to fetch updates from {remote}.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -3479,22 +3612,39 @@ def cmd_update(args):
         )
         current_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
-
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
+        # Always update against the configured install channel target.
+        if current_branch != branch:
             label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
+            print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", "main"],
+            checkout_result = subprocess.run(
+                git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
-                check=True,
             )
+            if checkout_result.returncode != 0 and branch == "prod":
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", "-B", "prod", fetched_ref],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if checkout_result.returncode == 0:
+                    subprocess.run(
+                        git_cmd + ["branch", "--set-upstream-to", f"{remote}/{branch}", "prod"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+            if checkout_result.returncode != 0:
+                print(f"✗ Failed to switch to {branch} for update.")
+                stderr = checkout_result.stderr.strip()
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+                sys.exit(1)
         else:
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
@@ -3504,7 +3654,7 @@ def cmd_update(args):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{fetched_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -3514,17 +3664,13 @@ def cmd_update(args):
 
         if commit_count == 0:
             _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
+            write_update_channel(channel, get_hermes_home())
+            # Restore stash and stay on the target branch if we moved
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
                     git_cmd, PROJECT_ROOT, auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
                 )
             print("✓ Already up to date!")
             return
@@ -3535,7 +3681,7 @@ def cmd_update(args):
         update_succeeded = False
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--ff-only", remote, branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -3546,16 +3692,16 @@ def cmd_update(args):
                 # stashed, reset to match the remote exactly.
                 print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", fetched_ref],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
-                    print("  Try manually: git fetch origin && git reset --hard origin/main")
+                    print(f"  Try manually: git fetch {remote} {branch} && git reset --hard FETCH_HEAD")
                     sys.exit(1)
             update_succeeded = True
         finally:
@@ -3573,8 +3719,9 @@ def cmd_update(args):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
-        
+
         _invalidate_update_cache()
+        write_update_channel(channel, get_hermes_home())
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
@@ -3801,20 +3948,31 @@ def cmd_update(args):
             # --- Launchd services (macOS) ---
             if is_macos():
                 try:
-                    from hermes_cli.gateway import launchd_restart, get_launchd_label, get_launchd_plist_path
+                    from gateway.status import get_running_pid
+                    from hermes_cli.gateway import (
+                        format_launchd_restart_report,
+                        get_launchd_label,
+                        get_launchd_plist_path,
+                        launchd_restart_for_update,
+                    )
                     plist_path = get_launchd_plist_path()
                     if plist_path.exists():
+                        previous_pid = get_running_pid()
                         check = subprocess.run(
                             ["launchctl", "list", get_launchd_label()],
                             capture_output=True, text=True, timeout=5,
                         )
                         if check.returncode == 0:
-                            try:
-                                launchd_restart()
+                            restart_report = launchd_restart_for_update(previous_pid=previous_pid)
+                            if restart_report.get("ok"):
                                 restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
+                                for line in format_launchd_restart_report(restart_report, failure_only=False):
+                                    print(line)
+                            else:
+                                print("  ⚠ Code update succeeded, but gateway restart healthcheck failed.")
+                                for line in format_launchd_restart_report(restart_report, failure_only=True):
+                                    print(line)
+                                print("  Try manually: hermes gateway restart")
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 
@@ -3847,6 +4005,7 @@ def cmd_update(args):
                 pass
 
         except Exception as e:
+            print(f"⚠ Code update succeeded, but gateway restart handling failed: {e}")
             logger.debug("Gateway restart during update failed: %s", e)
         
         print()
