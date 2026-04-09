@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Pre-push hook: basic guardrails before pushing to remote.
+#
+# Checks:
+#   1. Refuse to push to main/master with a dirty working tree.
+#   2. Warn if the latest commit is a "WIP" or "fixup!" commit.
+#   3. Run a fast lint check (flake8 / ruff) if available.
+#
+# Install:  scripts/install-githooks.sh
+
+set -euo pipefail
+
+REMOTE="$1"
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+# --- 1. Dirty-tree guard for protected branches ---
+if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+    if ! git diff --quiet HEAD -- ':!*.lock' 2>/dev/null; then
+        echo "::error::Refusing to push to '$BRANCH' with uncommitted changes." >&2
+        exit 1
+    fi
+fi
+
+# --- 2. WIP / fixup warning ---
+LAST_MSG="$(git log -1 --pretty=%s HEAD 2>/dev/null || true)"
+if echo "$LAST_MSG" | grep -qiE '^(WIP|fixup!|squash!)'; then
+    echo "::warning::Pushing a WIP/fixup commit: $LAST_MSG" >&2
+fi
+
+# --- 3. Fast lint (optional) ---
+if command -v ruff &>/dev/null; then
+    echo "[pre-push] Running ruff check ..."
+    ruff check hermes_cli/ agent/ gateway/ --quiet || {
+        echo "::warning::ruff found issues (non-blocking)." >&2
+    }
+elif command -v flake8 &>/dev/null; then
+    echo "[pre-push] Running flake8 ..."
+    flake8 hermes_cli/ agent/ gateway/ --max-line-length=120 --statistics || {
+        echo "::warning::flake8 found issues (non-blocking)." >&2
+    }
+fi
+
+echo "[pre-push] All checks passed."
