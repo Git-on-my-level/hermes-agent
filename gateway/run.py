@@ -2608,12 +2608,7 @@ class GatewayRunner:
 
                         _hyg_runtime = _resolve_runtime_agent_kwargs()
                         if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in ("user", "assistant")
-                                and m.get("content")
-                            ]
+                            _hyg_msgs = list(history)
 
                             if len(_hyg_msgs) >= 4:
                                 _hyg_agent = AIAgent(
@@ -4995,11 +4990,7 @@ class GatewayRunner:
             # Resolve model from config (same reason as memory flush above).
             model = _resolve_gateway_model()
 
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
+            msgs = list(history)
             original_count = len(msgs)
             approx_tokens = estimate_messages_tokens_rough(msgs)
 
@@ -5286,14 +5277,25 @@ class GatewayRunner:
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
-            msgs = [m for m in history if m.get("role") in ("user", "assistant") and m.get("content")]
-            approx = estimate_messages_tokens_rough(msgs)
-            return (
-                f"📊 **Session Info**\n"
-                f"Messages: {len(msgs)}\n"
-                f"Estimated context: ~{approx:,} tokens\n"
-                f"_(Detailed usage available during active conversations)_"
-            )
+            # Use the full history (all roles) for accurate context estimation.
+            # The previous implementation filtered to only user+assistant messages
+            # with text content, which excluded tool results, tool-calling assistant
+            # turns, and system messages -- often the bulk of context in tool-heavy
+            # conversations.
+            approx = estimate_messages_tokens_rough(history)
+            lines = [
+                "📊 **Session Info**",
+                f"Messages: {len(history)}",
+                f"Estimated context: ~{approx:,} tokens",
+            ]
+            # If we have actual API-reported tokens from the last turn, show those
+            # as a more reliable reference alongside the rough estimate.
+            if session_entry.last_prompt_tokens and session_entry.last_prompt_tokens > 0:
+                lines.append(
+                    f"Last measured prompt: ~{session_entry.last_prompt_tokens:,} tokens"
+                )
+            lines.append("_(Detailed usage available during active conversations)_")
+            return "\n".join(lines)
         return "No usage data available for this session."
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:

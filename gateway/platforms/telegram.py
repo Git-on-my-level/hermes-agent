@@ -82,6 +82,21 @@ def check_telegram_requirements() -> bool:
 # when it appears outside a code span or fenced code block.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 
+_AUTH_ERROR_CLASS_NAMES = {"Unauthorized"}
+_AUTH_ERROR_MESSAGE_FRAGMENTS = (
+    "rejected by the server",
+    "invalid token",
+    "unauthorized",
+    "token is invalid",
+)
+
+
+def _is_nonretryable_auth_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ in _AUTH_ERROR_CLASS_NAMES:
+        return True
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _AUTH_ERROR_MESSAGE_FRAGMENTS)
+
 
 def _escape_mdv2(text: str) -> str:
     """Escape Telegram MarkdownV2 special characters with a preceding backslash."""
@@ -684,7 +699,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             message = f"Telegram startup failed: {e}"
-            self._set_fatal_error("telegram_connect_error", message, retryable=True)
+            if _is_nonretryable_auth_error(e):
+                self._set_fatal_error("telegram_invalid_token", message, retryable=False)
+            else:
+                self._set_fatal_error("telegram_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
     
