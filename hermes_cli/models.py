@@ -1563,7 +1563,7 @@ def probe_api_models(
         }
 
     if _is_github_models_base_url(normalized):
-        models = _fetch_github_models(api_key=*** timeout=timeout)
+        models = _fetch_github_models(api_key=api_key, timeout=timeout)
         return {
             "models": models,
             "probed_url": COPILOT_MODELS_URL,
