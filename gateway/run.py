@@ -7326,7 +7326,10 @@ class GatewayRunner:
             # the actually-active model instead of the config default.
             _agent = agent_holder[0]
             if _agent is not None and hasattr(_agent, 'model'):
-                _requested_model = _requested_turn.get("model") or _resolve_gateway_model()
+                _req_overrides = session_overrides
+                if _req_overrides is None and session_key:
+                    _req_overrides = getattr(self, "_session_model_overrides", {}).get(session_key)
+                _requested_model = (_req_overrides or {}).get("model") or _resolve_gateway_model()
                 if _requested_model and _agent.model != _requested_model:
                     self._effective_model = _agent.model
                     self._effective_provider = getattr(_agent, 'provider', None)
