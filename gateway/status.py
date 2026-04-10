@@ -22,7 +22,9 @@ from typing import Any, Optional
 
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
+_RUNTIME_HEALTH_FILE = "gateway_health.json"
 _LOCKS_DIRNAME = "gateway-locks"
+_UNSET = object()
 
 
 def _get_pid_path() -> Path:
@@ -34,6 +36,11 @@ def _get_pid_path() -> Path:
 def _get_runtime_status_path() -> Path:
     """Return the persisted runtime health/status file path."""
     return _get_pid_path().with_name(_RUNTIME_STATUS_FILE)
+
+
+def _get_runtime_health_path() -> Path:
+    """Return the lightweight gateway health snapshot path."""
+    return _get_pid_path().with_name(_RUNTIME_HEALTH_FILE)
 
 
 def _get_lock_dir() -> Path:
@@ -186,12 +193,12 @@ def write_pid_file() -> None:
 
 def write_runtime_status(
     *,
-    gateway_state: Optional[str] = None,
-    exit_reason: Optional[str] = None,
+    gateway_state: Any = _UNSET,
+    exit_reason: Any = _UNSET,
     platform: Optional[str] = None,
-    platform_state: Optional[str] = None,
-    error_code: Optional[str] = None,
-    error_message: Optional[str] = None,
+    platform_state: Any = _UNSET,
+    error_code: Any = _UNSET,
+    error_message: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -202,18 +209,18 @@ def write_runtime_status(
     payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
-    if gateway_state is not None:
+    if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
-    if exit_reason is not None:
+    if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
 
     if platform is not None:
         platform_payload = payload["platforms"].get(platform, {})
-        if platform_state is not None:
+        if platform_state is not _UNSET:
             platform_payload["state"] = platform_state
-        if error_code is not None:
+        if error_code is not _UNSET:
             platform_payload["error_code"] = error_code
-        if error_message is not None:
+        if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
@@ -224,6 +231,30 @@ def write_runtime_status(
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
     return _read_json_file(_get_runtime_status_path())
+
+
+def write_gateway_health(
+    *,
+    gateway_state: str,
+    adapters: dict[str, Any],
+    uptime_seconds: int,
+    last_error: Optional[dict[str, Any]] = None,
+) -> None:
+    """Persist a lightweight health snapshot for external monitors."""
+    payload = _build_pid_record()
+    payload.update({
+        "gateway_state": gateway_state,
+        "adapters": adapters,
+        "uptime_seconds": max(0, int(uptime_seconds)),
+        "last_error": last_error,
+        "updated_at": _utc_now_iso(),
+    })
+    _write_json_file(_get_runtime_health_path(), payload)
+
+
+def read_gateway_health() -> Optional[dict[str, Any]]:
+    """Read the persisted lightweight gateway health snapshot."""
+    return _read_json_file(_get_runtime_health_path())
 
 
 def remove_pid_file() -> None:

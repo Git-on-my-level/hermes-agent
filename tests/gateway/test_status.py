@@ -103,6 +103,50 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
 
+    def test_write_runtime_status_allows_explicit_field_clear(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="startup_failed",
+            exit_reason="old error",
+            platform="telegram",
+            platform_state="fatal",
+            error_code="telegram_invalid_token",
+            error_message="token rejected",
+        )
+
+        status.write_runtime_status(
+            gateway_state="running",
+            exit_reason=None,
+            platform="telegram",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "running"
+        assert payload["exit_reason"] is None
+        assert payload["platforms"]["telegram"]["state"] == "connected"
+        assert payload["platforms"]["telegram"]["error_code"] is None
+        assert payload["platforms"]["telegram"]["error_message"] is None
+
+    def test_write_gateway_health_snapshot(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_gateway_health(
+            gateway_state="degraded",
+            adapters={"telegram": {"state": "degraded", "retry_in_seconds": 300}},
+            uptime_seconds=42,
+            last_error={"platform": "telegram", "error_code": "telegram_invalid_token"},
+        )
+
+        payload = status.read_gateway_health()
+        assert payload["gateway_state"] == "degraded"
+        assert payload["adapters"]["telegram"]["state"] == "degraded"
+        assert payload["uptime_seconds"] == 42
+        assert payload["last_error"]["error_code"] == "telegram_invalid_token"
+
 
 class TestScopedLocks:
     def test_acquire_scoped_lock_rejects_live_other_process(self, tmp_path, monkeypatch):

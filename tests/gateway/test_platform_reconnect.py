@@ -14,15 +14,20 @@ from gateway.run import GatewayRunner
 class StubAdapter(BasePlatformAdapter):
     """Adapter whose connect() result can be controlled."""
 
-    def __init__(self, *, succeed=True, fatal_error=None, fatal_retryable=True):
+    def __init__(self, *, succeed=True, fatal_error=None, fatal_retryable=True, fatal_error_code="test_error"):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
         self._succeed = succeed
         self._fatal_error = fatal_error
         self._fatal_retryable = fatal_retryable
+        self._fatal_error_code_value = fatal_error_code
 
     async def connect(self):
         if self._fatal_error:
-            self._set_fatal_error("test_error", self._fatal_error, retryable=self._fatal_retryable)
+            self._set_fatal_error(
+                self._fatal_error_code_value,
+                self._fatal_error,
+                retryable=self._fatal_retryable,
+            )
             return False
         return self._succeed
 
@@ -168,6 +173,53 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM not in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_reconnect_degraded_nonretryable_stays_in_queue(self):
+        """Degraded auth failures should stay queued with their long retry delay."""
+        runner = _make_runner()
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+            "retry_delay": 300,
+            "degraded": True,
+            "retryable": False,
+            "max_attempts": None,
+        }
+
+        fail_adapter = StubAdapter(
+            succeed=False,
+            fatal_error="bad token",
+            fatal_retryable=False,
+            fatal_error_code="telegram_invalid_token",
+        )
+
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=fail_adapter):
+            async def run_one_iteration():
+                runner._running = True
+                call_count = 0
+
+                async def fake_sleep(n):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count > 1:
+                        runner._running = False
+                    await real_sleep(0)
+
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await runner._platform_reconnect_watcher()
+
+            await run_one_iteration()
+
+        assert Platform.TELEGRAM in runner._failed_platforms
+        retry_info = runner._failed_platforms[Platform.TELEGRAM]
+        assert retry_info["attempts"] == 2
+        assert retry_info["retry_delay"] == 300
 
     @pytest.mark.asyncio
     async def test_reconnect_retryable_stays_in_queue(self):
