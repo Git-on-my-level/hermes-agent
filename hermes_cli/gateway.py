@@ -163,15 +163,89 @@ def find_gateway_pids(exclude_pids: set | None = None) -> list:
     return pids
 
 
-def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None) -> int:
+def _get_process_command_line(pid: int) -> str:
+    """Best-effort command line lookup for a running PID."""
+    try:
+        if is_windows():
+            result = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/FORMAT:LIST"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("CommandLine="):
+                    return line[len("CommandLine="):].strip()
+            return ""
+
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _get_process_working_directory(pid: int) -> str:
+    """Best-effort working directory lookup for a running PID."""
+    try:
+        proc_cwd = Path(f"/proc/{pid}/cwd")
+        if proc_cwd.exists():
+            return str(proc_cwd.resolve())
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                return line[1:].strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _pid_matches_hermes_home(pid: int, hermes_home: str) -> bool:
+    """Return True when the PID appears to belong to the current HERMES_HOME."""
+    if not hermes_home:
+        return False
+
+    cmdline = _get_process_command_line(pid)
+    if hermes_home in cmdline:
+        return True
+
+    cwd = _get_process_working_directory(pid)
+    return bool(cwd and hermes_home in cwd)
+
+
+def kill_gateway_processes(
+    force: bool = False,
+    exclude_pids: set | None = None,
+    *,
+    all_profiles: bool = False,
+) -> int:
     """Kill any running gateway processes. Returns count killed.
 
     Args:
         force: Use SIGKILL instead of SIGTERM.
         exclude_pids: PIDs to skip (e.g. service-managed PIDs that were just
             restarted and should not be killed).
+        all_profiles: When True, skip HERMES_HOME scoping and kill every
+            matching gateway process on the machine.
     """
     pids = find_gateway_pids(exclude_pids=exclude_pids)
+    if not all_profiles:
+        hermes_home = str(get_hermes_home().resolve())
+        pids = [pid for pid in pids if _pid_matches_hermes_home(pid, hermes_home)]
     killed = 0
     
     for pid in pids:
@@ -2593,7 +2667,7 @@ def gateway_command(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
-            killed = kill_gateway_processes()
+            killed = kill_gateway_processes(all_profiles=True)
             total = killed + (1 if service_available else 0)
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")

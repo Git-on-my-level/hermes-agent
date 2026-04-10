@@ -331,7 +331,7 @@ def release_scoped_lock(scope: str, identity: str) -> None:
 
 
 def release_all_scoped_locks() -> int:
-    """Remove all scoped lock files in the lock directory.
+    """Remove scoped lock files owned by the current process.
 
     Called during --replace to clean up stale locks left by stopped/killed
     gateway processes that did not release their locks gracefully.
@@ -339,8 +339,17 @@ def release_all_scoped_locks() -> int:
     """
     lock_dir = _get_lock_dir()
     removed = 0
+    current_pid = os.getpid()
+    current_start_time = _get_process_start_time(current_pid)
     if lock_dir.exists():
         for lock_file in lock_dir.glob("*.lock"):
+            existing = _read_json_file(lock_file)
+            if not existing:
+                continue
+            if existing.get("pid") != current_pid:
+                continue
+            if existing.get("start_time") != current_start_time:
+                continue
             try:
                 lock_file.unlink(missing_ok=True)
                 removed += 1

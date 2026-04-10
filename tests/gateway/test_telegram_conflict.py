@@ -235,6 +235,41 @@ async def test_connect_marks_retryable_fatal_error_for_startup_network_failure(m
 
 
 @pytest.mark.asyncio
+async def test_connect_preflight_invalid_token_sets_nonretryable_error_and_backs_off(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    released = []
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock",
+        lambda scope, identity: released.append((scope, identity)),
+    )
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", sleep_mock)
+
+    unauthorized = type("Unauthorized", (Exception,), {})
+    bot = SimpleNamespace(get_me=AsyncMock(side_effect=unauthorized("Invalid token")))
+    app = SimpleNamespace(bot=bot)
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.build.return_value = app
+    monkeypatch.setattr("gateway.platforms.telegram.Application", SimpleNamespace(builder=MagicMock(return_value=builder)))
+
+    ok = await adapter.connect()
+
+    assert ok is False
+    assert adapter.fatal_error_code == "telegram_invalid_token"
+    assert adapter.fatal_error_retryable is False
+    assert "getMe() token validation failed" in adapter.fatal_error_message
+    assert released == [("telegram-bot-token", "***")]
+    sleep_mock.assert_awaited_once_with(300)
+
+
+@pytest.mark.asyncio
 async def test_connect_clears_webhook_before_polling(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
 

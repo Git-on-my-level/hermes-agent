@@ -176,6 +176,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
 
+    def _release_token_lock(self) -> None:
+        if not self._token_lock_identity:
+            return
+        try:
+            from gateway.status import release_scoped_lock
+            release_scoped_lock("telegram-bot-token", self._token_lock_identity)
+        except Exception as e:
+            logger.warning("[%s] Error releasing Telegram token lock: %s", self.name, e, exc_info=True)
+        finally:
+            self._token_lock_identity = None
+
     @staticmethod
     def _parse_allowed_inbound_targets(raw_targets: Any) -> set[tuple[str, Optional[str]]]:
         """Normalize inbound allowlist config into {(chat_id, thread_id)} tuples."""
@@ -640,6 +651,26 @@ class TelegramAdapter(BasePlatformAdapter):
                 builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
+
+            get_me = getattr(self._bot, "get_me", None)
+            if callable(get_me):
+                try:
+                    await get_me()
+                except Exception as preflight_err:
+                    if _is_nonretryable_auth_error(preflight_err):
+                        message = f"Telegram getMe() token validation failed: {preflight_err}"
+                        self._set_fatal_error("telegram_invalid_token", message, retryable=False)
+                        logger.error(
+                            "[%s] %s Sleeping 300s before returning failure to avoid restart loops.",
+                            self.name,
+                            message,
+                        )
+                        self._release_token_lock()
+                        self._app = None
+                        self._bot = None
+                        await asyncio.sleep(300)
+                        return False
+                    raise
             
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
@@ -784,12 +815,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
             
         except Exception as e:
-            if self._token_lock_identity:
-                try:
-                    from gateway.status import release_scoped_lock
-                    release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-                except Exception:
-                    pass
+            self._release_token_lock()
             message = f"Telegram startup failed: {e}"
             if _is_nonretryable_auth_error(e):
                 self._set_fatal_error("telegram_invalid_token", message, retryable=False)
@@ -818,12 +844,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.shutdown()
             except Exception as e:
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, e, exc_info=True)
-        if self._token_lock_identity:
-            try:
-                from gateway.status import release_scoped_lock
-                release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-            except Exception as e:
-                logger.warning("[%s] Error releasing Telegram token lock: %s", self.name, e, exc_info=True)
+        self._release_token_lock()
 
         for task in self._pending_photo_batch_tasks.values():
             if task and not task.done():

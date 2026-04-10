@@ -145,13 +145,37 @@ class TestGatewayStopCleanup:
         monkeypatch.setattr(
             gateway_cli,
             "kill_gateway_processes",
-            lambda force=False: kill_calls.append(force) or 2,
+            lambda force=False, all_profiles=False: kill_calls.append((force, all_profiles)) or 2,
         )
 
         gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", **{"all": True}))
 
         assert service_calls == ["stop"]
-        assert kill_calls == [False]
+        assert kill_calls == [(False, True)]
+
+    def test_kill_gateway_processes_scopes_to_current_profile(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda exclude_pids=None: [100, 200])
+        monkeypatch.setattr(gateway_cli, "_pid_matches_hermes_home", lambda pid, hermes_home: pid == 100)
+
+        killed = []
+        monkeypatch.setattr(gateway_cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        count = gateway_cli.kill_gateway_processes()
+
+        assert count == 1
+        assert [pid for pid, _sig in killed] == [100]
+
+    def test_kill_gateway_processes_all_profiles_bypasses_scope_filter(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda exclude_pids=None: [100, 200])
+        monkeypatch.setattr(gateway_cli, "_pid_matches_hermes_home", lambda pid, hermes_home: pid == 100)
+
+        killed = []
+        monkeypatch.setattr(gateway_cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        count = gateway_cli.kill_gateway_processes(all_profiles=True)
+
+        assert count == 2
+        assert [pid for pid, _sig in killed] == [100, 200]
 
 
 class TestLaunchdServiceRecovery:

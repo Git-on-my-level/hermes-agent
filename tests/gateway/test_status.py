@@ -155,3 +155,31 @@ class TestScopedLocks:
 
         status.release_scoped_lock("telegram-bot-token", "secret")
         assert not lock_path.exists()
+
+    def test_release_all_scoped_locks_only_removes_current_process_locks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_dir = tmp_path / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+
+        current_start_time = 111
+        monkeypatch.setattr(
+            status,
+            "_get_process_start_time",
+            lambda pid: current_start_time if pid == os.getpid() else 222,
+        )
+
+        owned_lock = lock_dir / "owned.lock"
+        owned_lock.write_text(json.dumps({"pid": os.getpid(), "start_time": current_start_time}))
+
+        same_pid_stale_start = lock_dir / "stale.lock"
+        same_pid_stale_start.write_text(json.dumps({"pid": os.getpid(), "start_time": 999}))
+
+        other_lock = lock_dir / "other.lock"
+        other_lock.write_text(json.dumps({"pid": 99999, "start_time": 222}))
+
+        removed = status.release_all_scoped_locks()
+
+        assert removed == 1
+        assert not owned_lock.exists()
+        assert same_pid_stale_start.exists()
+        assert other_lock.exists()
