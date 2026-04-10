@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -431,6 +432,145 @@ class TestPrompt:
         resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
 
         assert resp.stop_reason == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_prompt_emits_session_idle_before_slow_tail_work_finishes(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+        })
+
+        events: list[str] = []
+        raw_conn = SimpleNamespace()
+
+        async def _send_notification(method, params):
+            assert method == "session.idle"
+            assert params["sessionId"] == new_resp.session_id
+            assert params["finalOutput"] == "done"
+            events.append("session.idle")
+
+        raw_conn.send_notification = AsyncMock(side_effect=_send_notification)
+
+        async def _session_update(session_id, update):
+            assert session_id == new_resp.session_id
+            assert update.session_update == "agent_message_chunk"
+            events.append("agent_message_chunk")
+
+        agent._conn = SimpleNamespace(
+            session_update=AsyncMock(side_effect=_session_update),
+            request_permission=AsyncMock(),
+            _conn=raw_conn,
+        )
+
+        tail_started = asyncio.Event()
+        tail_release = asyncio.Event()
+        tail_finished = asyncio.Event()
+
+        async def _slow_tail_work(session_id):
+            assert session_id == new_resp.session_id
+            events.append("tail_started")
+            tail_started.set()
+            await tail_release.wait()
+            events.append("tail_finished")
+            tail_finished.set()
+
+        agent._run_prompt_tail_work = _slow_tail_work  # type: ignore[method-assign]
+
+        started_at = time.monotonic()
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hello")],
+            session_id=new_resp.session_id,
+        )
+        returned_after = time.monotonic() - started_at
+
+        assert resp.stop_reason == "end_turn"
+        assert returned_after < 0.5
+        await asyncio.wait_for(tail_started.wait(), timeout=0.2)
+        assert not tail_finished.is_set()
+        assert events[:3] == ["agent_message_chunk", "session.idle", "tail_started"]
+
+        tail_release.set()
+        await asyncio.wait_for(tail_finished.wait(), timeout=0.2)
+
+    @pytest.mark.asyncio
+    async def test_prompt_cancelled_does_not_emit_session_idle(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def _mock_run(*args, **kwargs):
+            state.cancel_event.set()
+            return {
+                "final_response": "interrupted",
+                "messages": [{"role": "user", "content": "stop"}],
+            }
+
+        state.agent.run_conversation = _mock_run
+
+        raw_conn = SimpleNamespace(send_notification=AsyncMock())
+        agent._conn = SimpleNamespace(
+            session_update=AsyncMock(),
+            request_permission=AsyncMock(),
+            _conn=raw_conn,
+        )
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="stop")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "cancelled"
+        raw_conn.send_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_uses_captured_connection_and_ignores_idle_notification_failure(
+        self, agent
+    ):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+        })
+
+        first_raw_conn = SimpleNamespace()
+        second_raw_conn = SimpleNamespace(send_notification=AsyncMock())
+
+        async def _session_update(session_id, update):
+            assert session_id == new_resp.session_id
+            assert update.session_update == "agent_message_chunk"
+            agent._conn = SimpleNamespace(
+                session_update=AsyncMock(),
+                request_permission=AsyncMock(),
+                _conn=second_raw_conn,
+            )
+
+        first_raw_conn.send_notification = AsyncMock(
+            side_effect=RuntimeError("idle notification boom")
+        )
+        agent._conn = SimpleNamespace(
+            session_update=AsyncMock(side_effect=_session_update),
+            request_permission=AsyncMock(),
+            _conn=first_raw_conn,
+        )
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hello")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "end_turn"
+        first_raw_conn.send_notification.assert_awaited_once()
+        second_raw_conn.send_notification.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
