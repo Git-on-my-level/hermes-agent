@@ -1,8 +1,8 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import json
 import os
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -30,6 +30,18 @@ from acp.schema import (
 from acp_adapter.server import HermesACPAgent, HERMES_VERSION
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
+
+
+def _structured_log_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and "event" in payload:
+            events.append(payload)
+    return events
 
 
 @pytest.fixture()
@@ -434,7 +446,9 @@ class TestPrompt:
         assert resp.stop_reason == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_prompt_emits_session_idle_before_slow_tail_work_finishes(self, agent):
+    async def test_prompt_emits_prompt_completed_before_slow_tail_work_finishes(
+        self, agent
+    ):
         new_resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(new_resp.session_id)
 
@@ -450,10 +464,12 @@ class TestPrompt:
         raw_conn = SimpleNamespace()
 
         async def _send_notification(method, params):
-            assert method == "session.idle"
+            assert method == "prompt/completed"
             assert params["sessionId"] == new_resp.session_id
+            assert params["turnId"] == "turn-123"
+            assert params["status"] == "completed"
             assert params["finalOutput"] == "done"
-            events.append("session.idle")
+            events.append("prompt/completed")
 
         raw_conn.send_notification = AsyncMock(side_effect=_send_notification)
 
@@ -482,24 +498,27 @@ class TestPrompt:
 
         agent._run_prompt_tail_work = _slow_tail_work  # type: ignore[method-assign]
 
-        started_at = time.monotonic()
-        resp = await agent.prompt(
-            prompt=[TextContentBlock(type="text", text="hello")],
-            session_id=new_resp.session_id,
+        prompt_task = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=new_resp.session_id,
+                message_id="turn-123",
+            )
         )
-        returned_after = time.monotonic() - started_at
-
-        assert resp.stop_reason == "end_turn"
-        assert returned_after < 0.5
         await asyncio.wait_for(tail_started.wait(), timeout=0.2)
         assert not tail_finished.is_set()
-        assert events[:3] == ["agent_message_chunk", "session.idle", "tail_started"]
+        assert prompt_task.done() is False
+        assert events[:3] == ["agent_message_chunk", "prompt/completed", "tail_started"]
 
         tail_release.set()
         await asyncio.wait_for(tail_finished.wait(), timeout=0.2)
+        resp = await asyncio.wait_for(prompt_task, timeout=0.2)
+
+        assert resp.stop_reason == "end_turn"
+        assert resp.user_message_id == "turn-123"
 
     @pytest.mark.asyncio
-    async def test_prompt_cancelled_does_not_emit_session_idle(self, agent):
+    async def test_prompt_cancelled_emits_prompt_cancelled(self, agent):
         new_resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(new_resp.session_id)
 
@@ -522,13 +541,53 @@ class TestPrompt:
         resp = await agent.prompt(
             prompt=[TextContentBlock(type="text", text="stop")],
             session_id=new_resp.session_id,
+            message_id="turn-cancelled",
         )
 
         assert resp.stop_reason == "cancelled"
-        raw_conn.send_notification.assert_not_awaited()
+        raw_conn.send_notification.assert_awaited_once_with(
+            "prompt/cancelled",
+            {
+                "sessionId": new_resp.session_id,
+                "turnId": "turn-cancelled",
+                "status": "cancelled",
+            },
+        )
 
     @pytest.mark.asyncio
-    async def test_prompt_uses_captured_connection_and_ignores_idle_notification_failure(
+    async def test_prompt_failure_emits_prompt_failed(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(side_effect=RuntimeError("boom"))
+
+        raw_conn = SimpleNamespace(send_notification=AsyncMock())
+        agent._conn = SimpleNamespace(
+            session_update=AsyncMock(),
+            request_permission=AsyncMock(),
+            _conn=raw_conn,
+        )
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="explode")],
+            session_id=new_resp.session_id,
+            message_id="turn-failed",
+        )
+
+        assert resp.stop_reason == "end_turn"
+        assert resp.user_message_id == "turn-failed"
+        raw_conn.send_notification.assert_awaited_once_with(
+            "prompt/failed",
+            {
+                "sessionId": new_resp.session_id,
+                "turnId": "turn-failed",
+                "status": "failed",
+                "message": "boom",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_prompt_uses_captured_connection_and_ignores_terminal_notification_failure(
         self, agent
     ):
         new_resp = await agent.new_session(cwd=".")
@@ -566,11 +625,103 @@ class TestPrompt:
         resp = await agent.prompt(
             prompt=[TextContentBlock(type="text", text="hello")],
             session_id=new_resp.session_id,
+            message_id="turn-456",
         )
 
         assert resp.stop_reason == "end_turn"
         first_raw_conn.send_notification.assert_awaited_once()
         second_raw_conn.send_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_emits_terminal_before_request_return_gate_releases(
+        self,
+        agent,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level("INFO")
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+        })
+
+        terminal_emitted = asyncio.Event()
+        release_return = asyncio.Event()
+        raw_conn = SimpleNamespace()
+
+        async def _send_notification(method, params):
+            assert method == "prompt/completed"
+            assert params["turnId"] == "turn-delayed"
+            terminal_emitted.set()
+
+        raw_conn.send_notification = AsyncMock(side_effect=_send_notification)
+        agent._conn = SimpleNamespace(
+            session_update=AsyncMock(),
+            request_permission=AsyncMock(),
+            _conn=raw_conn,
+        )
+
+        async def _gate_prompt_return(*args, **kwargs):
+            await release_return.wait()
+
+        agent._await_prompt_response_release = _gate_prompt_return  # type: ignore[method-assign]
+
+        prompt_task = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=new_resp.session_id,
+                message_id="turn-delayed",
+            )
+        )
+        await asyncio.wait_for(terminal_emitted.wait(), timeout=0.2)
+        assert prompt_task.done() is False
+
+        release_return.set()
+        resp = await asyncio.wait_for(prompt_task, timeout=0.2)
+
+        assert resp.stop_reason == "end_turn"
+        structured_events = _structured_log_events(caplog)
+        for _ in range(20):
+            if any(
+                event.get("event") == "hermes.acp.prompt.tail_work_finished"
+                for event in structured_events
+            ):
+                break
+            await asyncio.sleep(0.01)
+            structured_events = _structured_log_events(caplog)
+        request_started = next(
+            event
+            for event in structured_events
+            if event.get("event") == "hermes.acp.prompt.request_started"
+        )
+        terminal_event = next(
+            event
+            for event in structured_events
+            if event.get("event") == "hermes.acp.prompt.terminal_emitted"
+        )
+        request_returned = next(
+            event
+            for event in structured_events
+            if event.get("event") == "hermes.acp.prompt.request_returned"
+        )
+        tail_finished = next(
+            event
+            for event in structured_events
+            if event.get("event") == "hermes.acp.prompt.tail_work_finished"
+        )
+
+        assert request_started["turn_id"] == "turn-delayed"
+        assert isinstance(request_started.get("request_started_at"), str)
+        assert terminal_event["terminal_method"] == "prompt/completed"
+        assert isinstance(terminal_event.get("terminal_emitted_at"), str)
+        assert isinstance(request_returned.get("request_returned_at"), str)
+        assert int(request_returned.get("terminal_to_return_ms") or 0) >= 0
+        assert int(tail_finished.get("tail_work_duration_ms") or 0) >= 0
 
 
 # ---------------------------------------------------------------------------

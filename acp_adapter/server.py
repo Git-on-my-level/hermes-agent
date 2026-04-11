@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Deque, Optional
 
 import acp
@@ -68,6 +71,18 @@ except Exception:
 
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+
+
+@dataclass(frozen=True)
+class _PromptTerminalNotification:
+    method: str
+    status: str
+    final_output: str = ""
+    error_detail: str | None = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _extract_text(
@@ -139,7 +154,6 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
-        self._tail_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     def _elapsed_ms(started_at: float | None) -> int | None:
@@ -147,30 +161,35 @@ class HermesACPAgent(acp.Agent):
             return None
         return max(int((time.monotonic() - started_at) * 1000), 0)
 
-    def _track_tail_task(self, task: asyncio.Task[None]) -> None:
-        self._tail_tasks.add(task)
+    def _log_prompt_lifecycle(
+        self,
+        event: str,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        level: int = logging.INFO,
+        **fields: Any,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "event": event,
+            "session_id": session_id,
+            "turn_id": turn_id,
+        }
+        payload.update(fields)
+        logger.log(level, json.dumps(payload, sort_keys=True, default=str))
 
-        def _discard(done: asyncio.Task[None]) -> None:
-            self._tail_tasks.discard(done)
-            try:
-                done.result()
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.exception("Unhandled ACP prompt tail task failure")
-
-        task.add_done_callback(_discard)
-
-    async def _emit_session_idle(
+    async def _emit_prompt_terminal_notification(
         self,
         session_id: str,
         *,
+        turn_id: str | None,
         conn: acp.Client | None,
-        final_output: str,
+        terminal: _PromptTerminalNotification,
+        request_started_at: str,
         started_at: float | None = None,
-    ) -> None:
+    ) -> str | None:
         if conn is None:
-            return
+            return None
 
         raw_conn = getattr(conn, "_conn", None)
         send_notification = getattr(raw_conn, "send_notification", None)
@@ -179,58 +198,119 @@ class HermesACPAgent(acp.Agent):
                 "Session %s: ACP transport does not expose raw notifications",
                 session_id,
             )
-            return
+            return None
 
-        payload: dict[str, Any] = {"sessionId": session_id}
-        if final_output:
-            payload["finalOutput"] = final_output
+        terminal_emitted_at = _utc_now_iso()
+        payload: dict[str, Any] = {
+            "sessionId": session_id,
+            "status": terminal.status,
+        }
+        if turn_id:
+            payload["turnId"] = turn_id
+        if terminal.final_output:
+            payload["finalOutput"] = terminal.final_output
+        if terminal.error_detail:
+            payload["message"] = terminal.error_detail
         try:
-            await send_notification("session.idle", payload)
+            await send_notification(terminal.method, payload)
         except Exception:
+            self._log_prompt_lifecycle(
+                "hermes.acp.prompt.terminal_emit_failed",
+                session_id=session_id,
+                turn_id=turn_id,
+                level=logging.WARNING,
+                terminal_method=terminal.method,
+                terminal_status=terminal.status,
+                request_started_at=request_started_at,
+                terminal_emitted_at=terminal_emitted_at,
+                elapsed_ms=self._elapsed_ms(started_at),
+                error_detail=terminal.error_detail,
+            )
             logger.warning(
-                "Session %s: terminal lifecycle signal failed (method=session.idle, elapsed_ms=%s)",
+                "Session %s: terminal lifecycle signal failed",
                 session_id,
-                self._elapsed_ms(started_at),
                 exc_info=True,
             )
-            return
-        logger.info(
-            "Session %s: terminal lifecycle signal sent (method=session.idle, elapsed_ms=%s)",
-            session_id,
-            self._elapsed_ms(started_at),
+            return None
+        self._log_prompt_lifecycle(
+            "hermes.acp.prompt.terminal_emitted",
+            session_id=session_id,
+            turn_id=turn_id,
+            terminal_method=terminal.method,
+            terminal_status=terminal.status,
+            request_started_at=request_started_at,
+            terminal_emitted_at=terminal_emitted_at,
+            elapsed_ms=self._elapsed_ms(started_at),
+            final_output_chars=len(terminal.final_output),
+            error_detail=terminal.error_detail,
         )
+        return terminal_emitted_at
 
     async def _run_prompt_tail_work(self, session_id: str) -> None:
         await asyncio.to_thread(self.session_manager.save_session, session_id)
+
+    async def _await_prompt_response_release(
+        self,
+        session_id: str,
+        *,
+        turn_id: str | None,
+        stop_reason: str,
+        request_started_at: str,
+        terminal_emitted_at: str | None,
+    ) -> None:
+        return None
 
     async def _run_prompt_tail_work_logged(
         self,
         session_id: str,
         *,
+        turn_id: str | None,
+        request_started_at: str,
+        terminal_emitted_at: str | None,
         started_at: float | None = None,
     ) -> None:
         tail_started_at = time.monotonic()
-        logger.info(
-            "Session %s: slow tail work started (elapsed_ms=%s)",
-            session_id,
-            self._elapsed_ms(started_at),
+        tail_started_at_iso = _utc_now_iso()
+        self._log_prompt_lifecycle(
+            "hermes.acp.prompt.tail_work_started",
+            session_id=session_id,
+            turn_id=turn_id,
+            request_started_at=request_started_at,
+            terminal_emitted_at=terminal_emitted_at,
+            tail_work_started_at=tail_started_at_iso,
+            elapsed_ms=self._elapsed_ms(started_at),
         )
         try:
             await self._run_prompt_tail_work(session_id)
         except Exception:
+            self._log_prompt_lifecycle(
+                "hermes.acp.prompt.tail_work_failed",
+                session_id=session_id,
+                turn_id=turn_id,
+                level=logging.WARNING,
+                request_started_at=request_started_at,
+                terminal_emitted_at=terminal_emitted_at,
+                tail_work_started_at=tail_started_at_iso,
+                tail_work_finished_at=_utc_now_iso(),
+                elapsed_ms=self._elapsed_ms(started_at),
+                tail_work_duration_ms=self._elapsed_ms(tail_started_at),
+            )
             logger.warning(
-                "Session %s: slow tail work failed (elapsed_ms=%s, tail_elapsed_ms=%s)",
+                "Session %s: slow tail work failed",
                 session_id,
-                self._elapsed_ms(started_at),
-                self._elapsed_ms(tail_started_at),
                 exc_info=True,
             )
             return
-        logger.info(
-            "Session %s: slow tail work finished (elapsed_ms=%s, tail_elapsed_ms=%s)",
-            session_id,
-            self._elapsed_ms(started_at),
-            self._elapsed_ms(tail_started_at),
+        self._log_prompt_lifecycle(
+            "hermes.acp.prompt.tail_work_finished",
+            session_id=session_id,
+            turn_id=turn_id,
+            request_started_at=request_started_at,
+            terminal_emitted_at=terminal_emitted_at,
+            tail_work_started_at=tail_started_at_iso,
+            tail_work_finished_at=_utc_now_iso(),
+            elapsed_ms=self._elapsed_ms(started_at),
+            tail_work_duration_ms=self._elapsed_ms(tail_started_at),
         )
 
     # ---- Connection lifecycle -----------------------------------------------
@@ -450,6 +530,7 @@ class HermesACPAgent(acp.Agent):
             | EmbeddedResourceContentBlock
         ],
         session_id: str,
+        message_id: str | None = None,
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
@@ -473,6 +554,15 @@ class HermesACPAgent(acp.Agent):
 
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
         prompt_started_at = time.monotonic()
+        request_started_at = _utc_now_iso()
+        turn_id = str(message_id or "").strip() or None
+        self._log_prompt_lifecycle(
+            "hermes.acp.prompt.request_started",
+            session_id=session_id,
+            turn_id=turn_id,
+            request_started_at=request_started_at,
+            prompt_chars=len(user_text),
+        )
 
         conn = self._conn
         loop = asyncio.get_running_loop()
@@ -510,17 +600,17 @@ class HermesACPAgent(acp.Agent):
             except Exception:
                 logger.debug("Could not set ACP approval callback", exc_info=True)
 
-        def _run_agent() -> dict:
+        def _run_agent() -> dict[str, Any]:
             try:
                 result = agent.run_conversation(
                     user_message=user_text,
                     conversation_history=state.history,
                     task_id=session_id,
                 )
-                return result
+                return {"result": result, "error": None}
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
-                return {"final_response": f"Error: {e}", "messages": state.history}
+                return {"result": None, "error": str(e)}
             finally:
                 if approval_cb:
                     try:
@@ -530,19 +620,24 @@ class HermesACPAgent(acp.Agent):
                         logger.debug("Could not restore approval callback", exc_info=True)
 
         try:
-            result = await loop.run_in_executor(_executor, _run_agent)
+            run_outcome = await loop.run_in_executor(_executor, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             return PromptResponse(stop_reason="end_turn")
+
+        result_payload = run_outcome.get("result")
+        result = result_payload if isinstance(result_payload, dict) else {}
+        agent_error = str(run_outcome.get("error") or "").strip() or None
 
         updated_history = result.get("messages")
         if updated_history:
             state.history = updated_history
 
-        stop_reason = "cancelled" if state.cancel_event and state.cancel_event.is_set() else "end_turn"
+        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+        stop_reason = "cancelled" if cancelled else "end_turn"
 
         final_response = result.get("final_response", "")
-        if final_response and conn:
+        if final_response and conn and not agent_error:
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
             logger.info(
@@ -552,22 +647,34 @@ class HermesACPAgent(acp.Agent):
                 self._elapsed_ms(prompt_started_at),
             )
 
-        if stop_reason == "end_turn":
-            await self._emit_session_idle(
-                session_id,
-                conn=conn,
-                final_output=final_response,
-                started_at=prompt_started_at,
-            )
+        terminal = _PromptTerminalNotification(
+            method=(
+                "prompt/failed"
+                if agent_error
+                else "prompt/cancelled"
+                if cancelled
+                else "prompt/completed"
+            ),
+            status="failed" if agent_error else "cancelled" if cancelled else "completed",
+            final_output=final_response if not agent_error and not cancelled else "",
+            error_detail=agent_error,
+        )
+        terminal_emitted_at = await self._emit_prompt_terminal_notification(
+            session_id,
+            turn_id=turn_id,
+            conn=conn,
+            terminal=terminal,
+            request_started_at=request_started_at,
+            started_at=prompt_started_at,
+        )
 
         if updated_history:
-            self._track_tail_task(
-                asyncio.create_task(
-                    self._run_prompt_tail_work_logged(
-                        session_id,
-                        started_at=prompt_started_at,
-                    )
-                )
+            await self._run_prompt_tail_work_logged(
+                session_id,
+                turn_id=turn_id,
+                request_started_at=request_started_at,
+                terminal_emitted_at=terminal_emitted_at,
+                started_at=prompt_started_at,
             )
 
         usage = None
@@ -581,13 +688,43 @@ class HermesACPAgent(acp.Agent):
                 cached_read_tokens=usage_data.get("cached_tokens"),
             )
 
-        logger.info(
-            "Session %s: PromptResponse returned (stop_reason=%s, elapsed_ms=%s)",
+        await self._await_prompt_response_release(
             session_id,
-            stop_reason,
-            self._elapsed_ms(prompt_started_at),
+            turn_id=turn_id,
+            stop_reason=stop_reason,
+            request_started_at=request_started_at,
+            terminal_emitted_at=terminal_emitted_at,
         )
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
+        request_returned_at = _utc_now_iso()
+        self._log_prompt_lifecycle(
+            "hermes.acp.prompt.request_returned",
+            session_id=session_id,
+            turn_id=turn_id,
+            request_started_at=request_started_at,
+            terminal_emitted_at=terminal_emitted_at,
+            request_returned_at=request_returned_at,
+            stop_reason=stop_reason,
+            elapsed_ms=self._elapsed_ms(prompt_started_at),
+            terminal_to_return_ms=(
+                max(
+                    int(
+                        (
+                            datetime.fromisoformat(request_returned_at)
+                            - datetime.fromisoformat(terminal_emitted_at)
+                        ).total_seconds()
+                        * 1000
+                    ),
+                    0,
+                )
+                if terminal_emitted_at
+                else None
+            ),
+        )
+        return PromptResponse(
+            stop_reason=stop_reason,
+            usage=usage,
+            user_message_id=turn_id,
+        )
 
     # ---- Slash commands (headless) -------------------------------------------
 
