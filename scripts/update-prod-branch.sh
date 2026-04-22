@@ -162,6 +162,12 @@ if [ "$AHEAD_COUNT" != "0" ]; then
   done
 fi
 
+# ── Step 7: Install repo-bundled skills ───────────────────
+if [ -f "${REPO_DIR}/scripts/install-repo-skills.sh" ]; then
+  log "Installing repo-bundled skills..."
+  run "${REPO_DIR}/scripts/install-repo-skills.sh"
+fi
+
 # Return to original branch if needed
 if [ "$CURRENT_BRANCH" != "prod" ] && [ "$CURRENT_BRANCH" != "main" ]; then
   run git checkout "$CURRENT_BRANCH"
