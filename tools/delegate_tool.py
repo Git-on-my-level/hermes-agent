@@ -1063,6 +1063,7 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    model: Optional[str] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
@@ -1072,13 +1073,17 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, model, role)
+      - Batch:  provide tasks array [{goal, context, toolsets, model, role}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'model' parameter overrides the model used by subagents.
+    In batch mode, tasks[N].model takes precedence over the top-level
+    model parameter.
 
     Returns JSON with results array, one entry per task.
     """
@@ -1163,12 +1168,13 @@ def delegate_task(
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
+            effective_model = t.get("model") or model or creds["model"]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
+                toolsets=t.get("toolsets") or toolsets, model=effective_model,
                 max_iterations=effective_max_iter, task_count=n_tasks, parent_agent=parent_agent,
                 override_provider=creds["provider"], override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
@@ -1569,6 +1575,15 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the model for subagent(s). When set, subagents use this model "
+                    "instead of inheriting from the parent agent or delegation.model config. "
+                    "Example: 'anthropic/claude-sonnet-4-20250514' or 'gpt-4.1'. "
+                    "In batch mode, can be overridden per-task via tasks[].model."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -1589,6 +1604,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override. Takes precedence over the top-level model parameter.",
                         },
                         "role": {
                             "type": "string",
@@ -1663,6 +1682,7 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        model=args.get("model"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
