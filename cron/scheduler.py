@@ -886,6 +886,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
+            enabled_toolsets=job.get("enabled_toolsets") or None,
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
@@ -970,6 +971,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
                 f"— last activity: {_last_desc}"
+            )
+
+        # Guard against non-dict returns from run_conversation under error conditions
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
             )
 
         final_response = result.get("final_response", "") or ""

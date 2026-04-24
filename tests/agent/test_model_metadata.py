@@ -385,6 +385,7 @@ class TestStripProviderPrefix:
         assert _strip_provider_prefix("local:my-model") == "my-model"
         assert _strip_provider_prefix("openrouter:anthropic/claude-sonnet-4") == "anthropic/claude-sonnet-4"
         assert _strip_provider_prefix("anthropic:claude-sonnet-4") == "claude-sonnet-4"
+        assert _strip_provider_prefix("stepfun:step-3.5-flash") == "step-3.5-flash"
 
     def test_ollama_model_tag_preserved(self):
         """Ollama model:tag format must NOT be stripped."""
@@ -619,6 +620,10 @@ class TestParseContextLimitFromError:
     def test_lmstudio_format(self):
         msg = "Error: context window of 4096 tokens exceeded"
         assert parse_context_limit_from_error(msg) == 4096
+
+    def test_minimax_delta_only_message_returns_none(self):
+        msg = "invalid params, context window exceeds limit (2013)"
+        assert parse_context_limit_from_error(msg) is None
 
     def test_completely_unrelated_error(self):
         assert parse_context_limit_from_error("Invalid API key") is None

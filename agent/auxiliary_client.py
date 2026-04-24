@@ -134,6 +134,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
+    "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
     "minimax": "MiniMax-M2.7",
     "minimax-cn": "MiniMax-M2.7",
@@ -150,7 +151,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
 # differs from their main chat model, map it here.  The vision auto-detect
 # "exotic provider" branch checks this before falling back to the main model.
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
-    "xiaomi": "mimo-v2-omni",
+    "xiaomi": "mimo-v2.5",
     "zai": "glm-5v-turbo",
 }
 
@@ -572,7 +573,8 @@ class _AnthropicCompletionsAdapter:
         self._is_oauth = is_oauth
 
     def create(self, **kwargs) -> Any:
-        from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+        from agent.anthropic_adapter import build_anthropic_kwargs
+        from agent.transports import get_transport
 
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
@@ -609,7 +611,19 @@ class _AnthropicCompletionsAdapter:
                 anthropic_kwargs["temperature"] = temperature
 
         response = self._client.messages.create(**anthropic_kwargs)
-        assistant_message, finish_reason = normalize_anthropic_response(response)
+        _transport = get_transport("anthropic_messages")
+        _nr = _transport.normalize_response(
+            response, strip_tool_prefix=self._is_oauth
+        )
+
+        # ToolCall already duck-types as OpenAI shape (.type, .function.name,
+        # .function.arguments) via properties, so no wrapping needed.
+        assistant_message = SimpleNamespace(
+            content=_nr.content,
+            tool_calls=_nr.tool_calls,
+            reasoning=_nr.reasoning,
+        )
+        finish_reason = _nr.finish_reason
 
         usage = None
         if hasattr(response, "usage") and response.usage:
@@ -900,6 +914,19 @@ def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
                    default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+
+
+def _describe_openrouter_unavailable() -> str:
+    """Return a more precise OpenRouter auth failure reason for logs."""
+    pool_present, entry = _select_pool_entry("openrouter")
+    if pool_present:
+        if entry is None:
+            return "OpenRouter credential pool has no usable entries (credentials may be exhausted)"
+        if not _pool_runtime_api_key(entry):
+            return "OpenRouter credential pool entry is missing a runtime API key"
+    if not str(os.getenv("OPENROUTER_API_KEY") or "").strip():
+        return "OPENROUTER_API_KEY not set"
+    return "no usable OpenRouter credentials found"
 
 
 def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -1613,8 +1640,10 @@ def resolve_provider_client(
     if provider == "openrouter":
         client, default = _try_openrouter()
         if client is None:
-            logger.warning("resolve_provider_client: openrouter requested "
-                           "but OPENROUTER_API_KEY not set")
+            logger.warning(
+                "resolve_provider_client: openrouter requested but %s",
+                _describe_openrouter_unavailable(),
+            )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model) if async_mode

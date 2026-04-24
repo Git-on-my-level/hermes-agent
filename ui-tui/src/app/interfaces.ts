@@ -27,6 +27,8 @@ export interface StateSetter<T> {
   (value: SetStateAction<T>): void
 }
 
+export type StatusBarMode = 'bottom' | 'off' | 'top'
+
 export interface SelectionApi {
   clearSelection: () => void
   copySelection: () => string
@@ -53,6 +55,8 @@ export interface GatewayProviderProps {
 }
 
 export interface OverlayState {
+  agents: boolean
+  agentsInitialHistoryIndex: number
   approval: ApprovalReq | null
   clarify: ClarifyReq | null
   confirm: ConfirmReq | null
@@ -87,7 +91,7 @@ export interface UiState {
   showReasoning: boolean
   sid: null | string
   status: string
-  statusBar: boolean
+  statusBar: StatusBarMode
   streaming: boolean
   theme: Theme
   usage: Usage

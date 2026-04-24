@@ -710,7 +710,26 @@ class GatewayRunner:
             self._session_db = SessionDB()
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
-        
+
+        # Opportunistic state.db maintenance: prune ended sessions older
+        # than sessions.retention_days + optional VACUUM. Tracks last-run
+        # in state_meta so it only actually executes once per
+        # sessions.min_interval_hours.  Gateway is long-lived so blocking
+        # a few seconds once per day is acceptable; failures are logged
+        # but never raised.
+        if self._session_db is not None:
+            try:
+                from hermes_cli.config import load_config as _load_full_config
+                _sess_cfg = (_load_full_config().get("sessions") or {})
+                if _sess_cfg.get("auto_prune", False):
+                    self._session_db.maybe_auto_prune_and_vacuum(
+                        retention_days=int(_sess_cfg.get("retention_days", 90)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                    )
+            except Exception as exc:
+                logger.debug("state.db auto-maintenance skipped: %s", exc)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
@@ -1532,27 +1551,23 @@ class GatewayRunner:
             )
             return True
 
-        # --- Normal busy case (agent actively running a task) ---
-        # The user sent a message while the agent is working.  Interrupt the
-        # agent immediately so it stops the current tool-calling loop and
-        # processes the new message.  The pending message is stored in the
-        # adapter so the base adapter picks it up once the interrupted run
-        # returns.  A brief ack tells the user what's happening (debounced
-        # to avoid spam when they fire multiple messages quickly).
-
+        # Normal busy case (agent actively running a task)
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
 
         # Store the message so it's processed as the next turn after the
-        # interrupt causes the current run to exit.
+        # current run finishes (or is interrupted).
         from gateway.platforms.base import merge_pending_message_event
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
-        # Interrupt the running agent — this aborts in-flight tool calls and
-        # causes the agent loop to exit at the next check point.
+        is_queue_mode = self._busy_input_mode == "queue"
+
+        # If not in queue mode, interrupt the running agent immediately.
+        # This aborts in-flight tool calls and causes the agent loop to exit
+        # at the next check point.
         running_agent = self._running_agents.get(session_key)
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+        if not is_queue_mode and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 running_agent.interrupt(event.text)
             except Exception:
@@ -1564,7 +1579,7 @@ class GatewayRunner:
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent, ack already delivered recently
+            return True  # interrupt sent (if not queue), ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
 
@@ -1589,10 +1604,16 @@ class GatewayRunner:
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        message = (
-            f"⚡ Interrupting current task{status_detail}. "
-            f"I'll respond to your message shortly."
-        )
+        if is_queue_mode:
+            message = (
+                f"⏳ Queued for the next turn{status_detail}. "
+                f"I'll respond once the current task finishes."
+            )
+        else:
+            message = (
+                f"⚡ Interrupting current task{status_detail}. "
+                f"I'll respond to your message shortly."
+            )
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         try:
@@ -2541,6 +2562,40 @@ class GatewayRunner:
             return
 
         async def _stop_impl() -> None:
+            def _kill_tool_subprocesses(phase: str) -> None:
+                """Kill tool subprocesses + tear down terminal envs + browsers.
+
+                Called twice in the shutdown path: once eagerly after a
+                drain timeout forces agent interrupt (so we reclaim bash/
+                sleep children before systemd TimeoutStopSec escalates to
+                SIGKILL on the cgroup — #8202), and once as a final
+                catch-all at the end of _stop_impl() for the graceful
+                path or anything respawned mid-teardown.
+
+                All steps are best-effort; exceptions are swallowed so
+                one subsystem's failure doesn't block the rest.
+                """
+                try:
+                    from tools.process_registry import process_registry
+                    _killed = process_registry.kill_all()
+                    if _killed:
+                        logger.info(
+                            "Shutdown (%s): killed %d tool subprocess(es)",
+                            phase, _killed,
+                        )
+                except Exception as _e:
+                    logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
+                try:
+                    from tools.terminal_tool import cleanup_all_environments
+                    cleanup_all_environments()
+                except Exception as _e:
+                    logger.debug("cleanup_all_environments (%s) error: %s", phase, _e)
+                try:
+                    from tools.browser_tool import cleanup_all_browsers
+                    cleanup_all_browsers()
+                except Exception as _e:
+                    logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
+
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -2602,6 +2657,16 @@ class GatewayRunner:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
 
+                # Kill lingering tool subprocesses NOW, before we spend more
+                # budget on adapter disconnect / session DB close.  Under
+                # systemd (TimeoutStopSec bounded by drain_timeout+headroom),
+                # deferring this to the end of stop() risks systemd escalating
+                # to SIGKILL on the cgroup first — at which point bash/sleep
+                # children left behind by an interrupted terminal tool get
+                # killed by systemd instead of us (issue #8202).  The final
+                # catch-all cleanup below still runs for the graceful path.
+                _kill_tool_subprocesses("post-interrupt")
+
             if self._restart_requested and self._restart_detached:
                 try:
                     await self._launch_detached_restart_command()
@@ -2637,22 +2702,13 @@ class GatewayRunner:
             self._shutdown_event.set()
 
             # Global cleanup: kill any remaining tool subprocesses not tied
-            # to a specific agent (catch-all for zombie prevention).
-            try:
-                from tools.process_registry import process_registry
-                process_registry.kill_all()
-            except Exception:
-                pass
-            try:
-                from tools.terminal_tool import cleanup_all_environments
-                cleanup_all_environments()
-            except Exception:
-                pass
-            try:
-                from tools.browser_tool import cleanup_all_browsers
-                cleanup_all_browsers()
-            except Exception:
-                pass
+            # to a specific agent (catch-all for zombie prevention). On the
+            # drain-timeout path we already did this earlier after agent
+            # interrupt — this second call catches (a) the graceful path
+            # where drain succeeded without interrupt, and (b) anything
+            # that got respawned between the earlier call and adapter
+            # disconnect (defense in depth; safe to call repeatedly).
+            _kill_tool_subprocesses("final-cleanup")
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -2668,8 +2724,9 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
 
-            from gateway.status import remove_pid_file
+            from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
+            release_gateway_runtime_lock()
 
             # Write a clean-shutdown marker so the next startup knows this
             # wasn't a crash.  suspend_recently_active() only needs to run
@@ -3466,22 +3523,72 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
-        
-        # Emit command:* hook for any recognized slash command.
-        # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
-        # in hermes_cli/commands.py — no hardcoded set to maintain here.
-        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command as _resolve_cmd
-        if command and command in GATEWAY_KNOWN_COMMANDS:
-            await self.hooks.emit(f"command:{command}", {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "command": command,
-                "args": event.get_command_args().strip(),
-            })
 
-        # Resolve aliases to canonical name so dispatch only checks canonicals.
+        from hermes_cli.commands import (
+            GATEWAY_KNOWN_COMMANDS,
+            is_gateway_known_command,
+            resolve_command as _resolve_cmd,
+        )
+
+        # Resolve aliases to canonical name so dispatch and hook names
+        # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        # Fire the ``command:<canonical>`` hook for any recognized slash
+        # command — built-in OR plugin-registered. Handlers can return a
+        # dict with ``{"decision": "deny" | "handled" | "rewrite", ...}``
+        # to intercept dispatch before core handling runs. This replaces
+        # the previous fire-and-forget emit(): return values are now
+        # honored, but handlers that return nothing behave exactly as
+        # before (telemetry-style hooks keep working).
+        if command and is_gateway_known_command(canonical):
+            raw_args = event.get_command_args().strip()
+            hook_ctx = {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": canonical,
+                "raw_command": command,
+                "args": raw_args,
+                "raw_args": raw_args,
+            }
+            try:
+                hook_results = await self.hooks.emit_collect(
+                    f"command:{canonical}", hook_ctx
+                )
+            except Exception as _hook_err:
+                logger.debug(
+                    "command:%s hook dispatch failed (non-fatal): %s",
+                    canonical, _hook_err,
+                )
+                hook_results = []
+
+            for hook_result in hook_results:
+                if not isinstance(hook_result, dict):
+                    continue
+                decision = str(hook_result.get("decision", "")).strip().lower()
+                if not decision or decision == "allow":
+                    continue
+                if decision == "deny":
+                    message = hook_result.get("message")
+                    if isinstance(message, str) and message:
+                        return message
+                    return f"Command `/{command}` was blocked by a hook."
+                if decision == "handled":
+                    message = hook_result.get("message")
+                    return message if isinstance(message, str) and message else None
+                if decision == "rewrite":
+                    new_command = str(
+                        hook_result.get("command_name", "")
+                    ).strip().lstrip("/")
+                    if not new_command:
+                        continue
+                    new_args = str(hook_result.get("raw_args", "")).strip()
+                    event.text = f"/{new_command} {new_args}".strip()
+                    command = event.get_command()
+                    _cmd_def = _resolve_cmd(command) if command else None
+                    canonical = _cmd_def.name if _cmd_def else command
+                    break
 
         if canonical == "new":
             return await self._handle_reset_command(event)
@@ -4901,6 +5008,11 @@ class GatewayRunner:
         # the configured default instead of the previously switched model.
         self._session_model_overrides.pop(session_key, None)
 
+        # Clear session-scoped dangerous-command approvals and /yolo state.
+        # /new is a conversation-boundary operation — approval state from the
+        # previous conversation must not survive the reset.
+        self._clear_session_boundary_security_state(session_key)
+
         # Fire plugin on_session_finalize hook (session boundary)
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -5409,6 +5521,7 @@ class GatewayRunner:
                 try:
                     providers = list_authenticated_providers(
                         current_provider=current_provider,
+                        current_base_url=current_base_url,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
                         max_models=50,
@@ -5520,6 +5633,7 @@ class GatewayRunner:
             try:
                 providers = list_authenticated_providers(
                     current_provider=current_provider,
+                    current_base_url=current_base_url,
                     user_providers=user_provs,
                     custom_providers=custom_provs,
                     max_models=5,
@@ -6456,6 +6570,11 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_name=source.user_name,
+                    chat_id=source.chat_id,
+                    chat_name=source.chat_name,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -7142,6 +7261,7 @@ class GatewayRunner:
         new_entry = self.session_store.switch_session(session_key, target_id)
         if not new_entry:
             return "Failed to switch session."
+        self._clear_session_boundary_security_state(session_key)
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
@@ -7216,6 +7336,7 @@ class GatewayRunner:
                     tool_calls=msg.get("tool_calls"),
                     tool_call_id=msg.get("tool_call_id"),
                     reasoning=msg.get("reasoning"),
+                    reasoning_content=msg.get("reasoning_content"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -7230,6 +7351,7 @@ class GatewayRunner:
         new_entry = self.session_store.switch_session(session_key, new_session_id)
         if not new_entry:
             return "Branch created but failed to switch to it."
+        self._clear_session_boundary_security_state(session_key)
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
@@ -7620,13 +7742,14 @@ class GatewayRunner:
         from hermes_cli.debug import (
             _capture_dump, collect_debug_report,
             upload_to_pastebin, _schedule_auto_delete,
-            _GATEWAY_PRIVACY_NOTICE,
+            _GATEWAY_PRIVACY_NOTICE, _best_effort_sweep_expired_pastes,
         )
 
         loop = asyncio.get_running_loop()
 
         # Run blocking I/O (dump capture, log reads, uploads) in a thread.
         def _collect_and_upload():
+            _best_effort_sweep_expired_pastes()
             dump_text = _capture_dump()
             report = collect_debug_report(log_lines=200, dump_text=dump_text)
 
@@ -8579,7 +8702,12 @@ class GatewayRunner:
         override = self._session_model_overrides.get(session_key)
         return override is not None and override.get("model") == agent_model
 
-    def _release_running_agent_state(self, session_key: str) -> None:
+    def _release_running_agent_state(
+        self,
+        session_key: str,
+        *,
+        run_generation: Optional[int] = None,
+    ) -> bool:
         """Pop ALL per-running-agent state entries for ``session_key``.
 
         Replaces ad-hoc ``del self._running_agents[key]`` calls scattered
@@ -8595,13 +8723,48 @@ class GatewayRunner:
         across turns (``_session_model_overrides``, ``_voice_mode``,
         ``_pending_approvals``, ``_update_prompt_pending``) is NOT
         touched here — those have their own lifecycles.
+
+        When ``run_generation`` is provided, only clear the slot if that
+        generation is still current for the session.  This prevents an
+        older async run whose generation was bumped by /stop or /new from
+        clobbering a newer run's state during its own unwind.  Returns
+        True when the slot was cleared, False when an ownership guard
+        blocked it.
         """
         if not session_key:
-            return
+            return False
+        if run_generation is not None and not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            return False
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        return True
+
+    def _clear_session_boundary_security_state(self, session_key: str) -> None:
+        """Clear approval state that must not survive a real conversation switch."""
+        if not session_key:
+            return
+
+        pending_approvals = getattr(self, "_pending_approvals", None)
+        if isinstance(pending_approvals, dict):
+            pending_approvals.pop(session_key, None)
+
+        try:
+            from tools.approval import clear_session as _clear_approval_session
+        except Exception:
+            return
+
+        try:
+            _clear_approval_session(session_key)
+        except Exception as e:
+            logger.debug(
+                "Failed to clear approval state for session boundary %s: %s",
+                session_key,
+                e,
+            )
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh run generation token for ``session_key``.
@@ -9698,6 +9861,11 @@ class GatewayRunner:
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_name=source.user_name,
+                    chat_id=source.chat_id,
+                    chat_name=source.chat_name,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
@@ -10135,10 +10303,24 @@ class GatewayRunner:
             # Wait for agent to be created
             while agent_holder[0] is None:
                 await asyncio.sleep(0.05)
-            if session_key:
-                self._running_agents[session_key] = agent_holder[0]
-                if self._draining:
-                    self._update_runtime_status("draining")
+            if not session_key:
+                return
+            # Only promote the sentinel to the real agent if this run is still
+            # current.  If /stop or /new bumped the generation while we were
+            # spinning up, leave the newer run's slot alone — we'll be
+            # discarded by the stale-result check in _handle_message_with_agent.
+            if run_generation is not None and not self._is_session_run_current(
+                session_key, run_generation
+            ):
+                logger.info(
+                    "Skipping stale agent promotion for %s — generation %s is no longer current",
+                    (session_key or "")[:20],
+                    run_generation,
+                )
+                return
+            self._running_agents[session_key] = agent_holder[0]
+            if self._draining:
+                self._update_runtime_status("draining")
         
         tracking_task = asyncio.create_task(track_agent())
         
@@ -10193,9 +10375,9 @@ class GatewayRunner:
         # Periodic "still working" notifications for long-running tasks.
         # Fires every N seconds so the user knows the agent hasn't died.
         # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 600s (10 min).
+        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
         # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 600))
+        _NOTIFY_INTERVAL_RAW = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 180))
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
 
@@ -10644,7 +10826,14 @@ class GatewayRunner:
             # Clean up tracking
             tracking_task.cancel()
             if session_key:
-                self._release_running_agent_state(session_key)
+                # Only release the slot if this run's generation still owns
+                # it.  A /stop or /new that bumped the generation while we
+                # were unwinding has already installed its own state; this
+                # guard prevents an old run from clobbering it on the way
+                # out.
+                self._release_running_agent_state(
+                    session_key, run_generation=run_generation
+                )
             if self._draining:
                 self._update_runtime_status("draining")
             
@@ -10764,10 +10953,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # The PID file is scoped to HERMES_HOME, so future multi-profile
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
-    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
+    from gateway.status import (
+        acquire_gateway_runtime_lock,
+        get_running_pid,
+        get_process_start_time,
+        release_gateway_runtime_lock,
+        remove_pid_file,
+        terminate_pid,
+    )
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",
                 existing_pid,
@@ -10836,7 +11033,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # leaving stale lock files that block the new gateway from starting.
             try:
                 from gateway.status import release_all_scoped_locks
-                _released = release_all_scoped_locks()
+                _released = release_all_scoped_locks(
+                    owner_pid=existing_pid,
+                    owner_start_time=existing_start_time,
+                )
                 if _released:
                     logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
             except Exception:
@@ -10977,14 +11177,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Exiting to avoid double-running.", _current_pid
         )
         return False
+    if not acquire_gateway_runtime_lock():
+        logger.error(
+            "Gateway runtime lock is already held by another instance. Exiting."
+        )
+        return False
     try:
         write_pid_file()
     except FileExistsError:
+        release_gateway_runtime_lock()
         logger.error(
             "PID file race lost to another gateway instance. Exiting."
         )
         return False
     atexit.register(remove_pid_file)
+    atexit.register(release_gateway_runtime_lock)
 
     # Start the gateway
     success = await runner.start()

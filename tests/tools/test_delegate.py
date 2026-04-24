@@ -70,7 +70,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
-        self.assertIn("max_iterations", props)
+        # max_iterations is intentionally NOT exposed to the model — it's
+        # config-authoritative via delegation.max_iterations so users get
+        # predictable budgets.
+        self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
 
@@ -1058,6 +1061,59 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             )
 
             self.assertEqual(mock_child._credential_pool, mock_pool)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_preserves_mcp_toolsets_by_default(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web", "browser", "mcp-MiniMax"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test narrowed toolsets",
+                context=None,
+                toolsets=["web", "browser"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"],
+            ["web", "browser", "mcp-MiniMax"],
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"inherit_mcp_toolsets": False},
+    )
+    def test_build_child_agent_strict_intersection_when_opted_out(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web", "browser", "mcp-MiniMax"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test narrowed toolsets",
+                context=None,
+                toolsets=["web", "browser"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"],
+            ["web", "browser"],
+        )
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
