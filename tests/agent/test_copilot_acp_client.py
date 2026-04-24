@@ -141,6 +141,101 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertIn("error", response)
         self.assertFalse(outside.exists())
 
+    def test_session_update_streams_live_text_and_reasoning_callbacks(self) -> None:
+        streamed: list[str] = []
+        reasoned: list[str] = []
+
+        self.client = CopilotACPClient(
+            acp_cwd="/tmp",
+            stream_delta_callback=streamed.append,
+            reasoning_callback=reasoned.append,
+        )
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        process = _FakeProcess()
+
+        handled = self.client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"text": "hello"},
+                    }
+                },
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+        )
+        self.assertTrue(handled)
+
+        handled = self.client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"text": "thinking"},
+                    }
+                },
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+        )
+        self.assertTrue(handled)
+
+        self.assertEqual(text_parts, ["hello"])
+        self.assertEqual(reasoning_parts, ["thinking"])
+        self.assertEqual(streamed, ["hello"])
+        self.assertEqual(reasoned, ["thinking"])
+
+    def test_session_update_filters_tool_call_markup_from_stream_callbacks(self) -> None:
+        streamed: list[str] = []
+
+        self.client = CopilotACPClient(
+            acp_cwd="/tmp",
+            stream_delta_callback=streamed.append,
+        )
+
+        text_parts: list[str] = []
+        process = _FakeProcess()
+        chunks = [
+            "Before ",
+            "<tool",
+            "_call>{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{}\"}}",
+            "</tool_call>",
+            " after",
+        ]
+
+        for chunk in chunks:
+            handled = self.client._handle_server_message(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"text": chunk},
+                        }
+                    },
+                },
+                process=process,
+                cwd="/tmp",
+                text_parts=text_parts,
+                reasoning_parts=[],
+            )
+            self.assertTrue(handled)
+
+        self.assertEqual("".join(text_parts), "".join(chunks))
+        self.assertEqual("".join(streamed), "Before  after")
+
 
 if __name__ == "__main__":
     unittest.main()

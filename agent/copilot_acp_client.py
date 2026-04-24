@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -25,10 +26,31 @@ from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
 
 ACP_MARKER_BASE_URL = "acp://copilot"
-_DEFAULT_TIMEOUT_SECONDS = 900.0
+
+logger = logging.getLogger(__name__)
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
+_TOOL_CALL_START_TAG = "<tool_call>"
+_TOOL_CALL_END_TAG = "</tool_call>"
+
+
+def _resolve_timeout_seconds() -> float:
+    raw = os.getenv("HERMES_COPILOT_ACP_TIMEOUT_SECONDS", "").strip()
+    try:
+        timeout = float(raw) if raw else 300.0
+    except ValueError:
+        return 300.0
+    return timeout if timeout > 0 else 300.0
+
+
+def _resolve_inactivity_timeout_seconds() -> float:
+    raw = os.getenv("HERMES_COPILOT_ACP_INACTIVITY_TIMEOUT_SECONDS", "").strip()
+    try:
+        timeout = float(raw) if raw else 300.0
+    except ValueError:
+        return 300.0
+    return timeout if timeout > 0 else 300.0
 
 
 def _resolve_command() -> str:
@@ -277,6 +299,9 @@ class CopilotACPClient:
         api_key: str | None = None,
         base_url: str | None = None,
         default_headers: dict[str, str] | None = None,
+        activity_callback: Any | None = None,
+        stream_delta_callback: Any | None = None,
+        reasoning_callback: Any | None = None,
         acp_command: str | None = None,
         acp_args: list[str] | None = None,
         acp_cwd: str | None = None,
@@ -287,6 +312,11 @@ class CopilotACPClient:
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
+        self._activity_callback = activity_callback
+        self._stream_delta_callback = stream_delta_callback
+        self._reasoning_callback = reasoning_callback
+        self._stream_filter_buffer = ""
+        self._stream_filter_in_tool_call = False
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
@@ -331,7 +361,7 @@ class CopilotACPClient:
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
         if timeout is None:
-            _effective_timeout = _DEFAULT_TIMEOUT_SECONDS
+            _effective_timeout = _resolve_timeout_seconds()
         elif isinstance(timeout, (int, float)):
             _effective_timeout = float(timeout)
         else:
@@ -342,7 +372,7 @@ class CopilotACPClient:
                 for attr in ("read", "write", "connect", "pool", "timeout")
             ]
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
-            _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
+            _effective_timeout = max(_numeric) if _numeric else _resolve_timeout_seconds()
 
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
@@ -436,13 +466,24 @@ class CopilotACPClient:
             proc.stdin.flush()
 
             deadline = time.time() + timeout_seconds
+            last_message_time = time.time()
+            inactivity_timeout = min(timeout_seconds, _resolve_inactivity_timeout_seconds())
             while time.time() < deadline:
                 if proc.poll() is not None:
                     break
                 try:
                     msg = inbox.get(timeout=0.1)
                 except queue.Empty:
+                    silence = time.time() - last_message_time
+                    if silence > inactivity_timeout:
+                        raise TimeoutError(
+                            f"Copilot ACP {method} went silent for {int(silence)}s "
+                            f"(threshold: {int(inactivity_timeout)}s)."
+                        )
                     continue
+
+                last_message_time = time.time()
+                self._notify_activity(f"copilot-acp:{method}")
 
                 if self._handle_server_message(
                     msg,
@@ -468,6 +509,7 @@ class CopilotACPClient:
             raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
 
         try:
+            self._reset_stream_filters()
             _request(
                 "initialize",
                 {
@@ -539,8 +581,10 @@ class CopilotACPClient:
                 chunk_text = str(content.get("text") or "")
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
+                self._emit_stream_delta(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+                self._emit_reasoning_delta(chunk_text)
             return True
 
         if process.stdin is None:
@@ -602,3 +646,83 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+    def _notify_activity(self, detail: str | None = None) -> None:
+        cb = self._activity_callback
+        if cb is None:
+            return
+        try:
+            cb(detail)
+        except Exception:
+            logger.debug("Copilot ACP activity callback failed", exc_info=True)
+
+    def _emit_stream_delta(self, text: str) -> None:
+        cb = self._stream_delta_callback
+        if cb is None or not text:
+            return
+        safe_text = self._filter_stream_text(text)
+        if not safe_text:
+            return
+        try:
+            cb(safe_text)
+        except Exception:
+            logger.debug("Copilot ACP stream delta callback failed", exc_info=True)
+
+    def _emit_reasoning_delta(self, text: str) -> None:
+        cb = self._reasoning_callback
+        if cb is None or not text:
+            return
+        try:
+            cb(text)
+        except Exception:
+            logger.debug("Copilot ACP reasoning callback failed", exc_info=True)
+
+    def _reset_stream_filters(self) -> None:
+        self._stream_filter_buffer = ""
+        self._stream_filter_in_tool_call = False
+
+    def _filter_stream_text(self, text: str) -> str:
+        if not text:
+            return ""
+
+        buffer = self._stream_filter_buffer + text
+        self._stream_filter_buffer = ""
+        visible_parts: list[str] = []
+
+        while buffer:
+            if self._stream_filter_in_tool_call:
+                end_idx = buffer.find(_TOOL_CALL_END_TAG)
+                if end_idx < 0:
+                    self._stream_filter_buffer = buffer
+                    return "".join(visible_parts)
+                buffer = buffer[end_idx + len(_TOOL_CALL_END_TAG):]
+                self._stream_filter_in_tool_call = False
+                continue
+
+            start_idx = buffer.find(_TOOL_CALL_START_TAG)
+            if start_idx >= 0:
+                if start_idx > 0:
+                    visible_parts.append(buffer[:start_idx])
+                buffer = buffer[start_idx + len(_TOOL_CALL_START_TAG):]
+                self._stream_filter_in_tool_call = True
+                continue
+
+            holdback = self._longest_tool_tag_prefix_suffix(buffer)
+            if holdback:
+                visible_parts.append(buffer[:-holdback])
+                self._stream_filter_buffer = buffer[-holdback:]
+            else:
+                visible_parts.append(buffer)
+                self._stream_filter_buffer = ""
+            break
+
+        return "".join(visible_parts)
+
+    @staticmethod
+    def _longest_tool_tag_prefix_suffix(text: str) -> int:
+        for tag in (_TOOL_CALL_START_TAG, _TOOL_CALL_END_TAG):
+            max_prefix = min(len(text), len(tag) - 1)
+            for size in range(max_prefix, 0, -1):
+                if text.endswith(tag[:size]):
+                    return size
+        return 0

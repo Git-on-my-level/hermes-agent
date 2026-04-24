@@ -1,5 +1,6 @@
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -153,6 +154,46 @@ def test_concurrent_requests_do_not_break_each_other_when_one_client_closes(monk
     assert values.count({"ok": "second"}) == 1
     assert len(factory.calls) == 2
 
+
+def test_copilot_acp_provider_activity_prevents_false_stale_timeout(monkeypatch):
+    class FakeCopilotRequestClient(FakeRequestClient):
+        def __init__(self, kwargs):
+            self._kwargs = dict(kwargs)
+            super().__init__(self._responder)
+
+        def _responder(self, **kwargs):
+            activity_cb = self._kwargs.get("activity_callback")
+            stream_cb = self._kwargs.get("stream_delta_callback")
+            reasoning_cb = self._kwargs.get("reasoning_callback")
+            for i in range(8):
+                if activity_cb is not None:
+                    activity_cb(f"copilot-acp heartbeat {i}")
+                time.sleep(0.05)
+            if reasoning_cb is not None:
+                reasoning_cb("thinking")
+            if stream_cb is not None:
+                stream_cb("done")
+            return {"ok": True}
+
+    def _fake_acp_factory(**kwargs):
+        return FakeCopilotRequestClient(kwargs)
+
+    monkeypatch.setattr("agent.copilot_acp_client.CopilotACPClient", _fake_acp_factory)
+
+    agent = _build_agent()
+    agent.provider = "copilot-acp"
+    agent.base_url = "acp://copilot"
+    agent.model = "gpt-5.4"
+    agent._client_kwargs = {"api_key": "copilot-acp", "base_url": agent.base_url}
+    agent.client = FakeSharedClient(lambda **kwargs: {"shared": True})
+    agent.stream_delta_callback = lambda _delta: None
+    agent.reasoning_callback = lambda _delta: None
+    agent.status_callback = None
+    agent._compute_non_stream_stale_timeout = lambda _messages: 0.08
+
+    result = agent._interruptible_api_call({"model": agent.model, "messages": []})
+
+    assert result == {"ok": True}
 
 
 def test_streaming_call_recreates_closed_shared_client_before_request(monkeypatch):
