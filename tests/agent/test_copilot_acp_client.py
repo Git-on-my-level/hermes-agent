@@ -141,6 +141,61 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertIn("error", response)
         self.assertFalse(outside.exists())
 
+    def test_session_update_streams_live_text_and_reasoning_callbacks(self) -> None:
+        streamed: list[str] = []
+        reasoned: list[str] = []
+
+        self.client = CopilotACPClient(
+            acp_cwd="/tmp",
+            stream_delta_callback=streamed.append,
+            reasoning_callback=reasoned.append,
+        )
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        process = _FakeProcess()
+
+        handled = self.client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"text": "hello"},
+                    }
+                },
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+        )
+        self.assertTrue(handled)
+
+        handled = self.client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"text": "thinking"},
+                    }
+                },
+            },
+            process=process,
+            cwd="/tmp",
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+        )
+        self.assertTrue(handled)
+
+        self.assertEqual(text_parts, ["hello"])
+        self.assertEqual(reasoning_parts, ["thinking"])
+        self.assertEqual(streamed, ["hello"])
+        self.assertEqual(reasoned, ["thinking"])
+
 
 if __name__ == "__main__":
     unittest.main()
