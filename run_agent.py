@@ -5340,7 +5340,12 @@ class AIAgent:
         provider fallback.
         """
         result = {"response": None, "error": None}
-        request_client_holder = {"client": None}
+        request_client_holder = {"client": None, "last_provider_activity": None}
+
+        def _note_provider_activity(detail: str | None = None) -> None:
+            request_client_holder["last_provider_activity"] = time.time()
+            if detail:
+                self._touch_activity(detail)
 
         def _call():
             try:
@@ -5368,7 +5373,21 @@ class AIAgent:
                     raw_response = client.converse(**api_kwargs)
                     result["response"] = normalize_converse_response(raw_response)
                 else:
-                    request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
+                    if self.provider == "copilot-acp":
+                        with self._openai_client_lock():
+                            request_kwargs = dict(self._client_kwargs)
+                        request_kwargs.update({
+                            "activity_callback": _note_provider_activity,
+                            "stream_delta_callback": self._fire_stream_delta,
+                            "reasoning_callback": self._fire_reasoning_delta,
+                        })
+                        request_client_holder["client"] = self._create_openai_client(
+                            request_kwargs,
+                            reason="chat_completion_request",
+                            shared=False,
+                        )
+                    else:
+                        request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
                 result["error"] = e
@@ -5408,16 +5427,18 @@ class AIAgent:
             # Stale-call detector: kill the connection if no response
             # arrives within the configured timeout.
             _elapsed = time.time() - _call_start
-            if _elapsed > _stale_timeout:
+            _last_provider_activity = request_client_holder.get("last_provider_activity") or _call_start
+            _stale_elapsed = time.time() - _last_provider_activity
+            if _stale_elapsed > _stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
-                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _elapsed, _stale_timeout,
+                    "Non-streaming API call stale for %.0fs since last provider activity "
+                    "(wall %.0fs, threshold %.0fs). model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _elapsed, _stale_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
                 self._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
+                    f"⚠️ No provider activity for {int(_stale_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
@@ -5438,7 +5459,7 @@ class AIAgent:
                 except Exception:
                     pass
                 self._touch_activity(
-                    f"stale non-streaming call killed after {int(_elapsed)}s"
+                    f"stale non-streaming call killed after {int(_stale_elapsed)}s of silence"
                 )
                 # Wait briefly for the thread to notice the closed connection.
                 t.join(timeout=2.0)
@@ -5535,7 +5556,7 @@ class AIAgent:
                 cb(text)
                 delivered = True
             except Exception:
-                pass
+                logger.debug("stream_delta_callback error", exc_info=True)
         if delivered:
             self._record_streamed_assistant_text(text)
 
@@ -5546,7 +5567,7 @@ class AIAgent:
             try:
                 cb(text)
             except Exception:
-                pass
+                logger.debug("reasoning_callback error", exc_info=True)
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
