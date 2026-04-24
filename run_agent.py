@@ -4097,6 +4097,11 @@ class AIAgent:
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
         )
 
+    def _interruptible_api_call(self, api_kwargs: dict):
+        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
+        from agent.chat_completion_helpers import interruptible_api_call
+        return interruptible_api_call(self, api_kwargs)
+
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.
 
@@ -4122,11 +4127,6 @@ class AIAgent:
                 timeout=get_provider_request_timeout(self.provider, self.model),
                 drop_context_1m_beta=_drop_1m,
             )
-
-    def _interruptible_api_call(self, api_kwargs: dict):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
-        from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -4259,7 +4259,7 @@ class AIAgent:
                 cb(text)
                 delivered = True
             except Exception:
-                pass
+                logger.debug("stream_delta_callback error", exc_info=True)
         if delivered:
             self._record_streamed_assistant_text(text)
 
@@ -4270,7 +4270,7 @@ class AIAgent:
             try:
                 cb(text)
             except Exception:
-                pass
+                logger.debug("reasoning_callback error", exc_info=True)
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
