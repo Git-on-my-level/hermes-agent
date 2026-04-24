@@ -196,6 +196,46 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertEqual(streamed, ["hello"])
         self.assertEqual(reasoned, ["thinking"])
 
+    def test_session_update_filters_tool_call_markup_from_stream_callbacks(self) -> None:
+        streamed: list[str] = []
+
+        self.client = CopilotACPClient(
+            acp_cwd="/tmp",
+            stream_delta_callback=streamed.append,
+        )
+
+        text_parts: list[str] = []
+        process = _FakeProcess()
+        chunks = [
+            "Before ",
+            "<tool",
+            "_call>{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{}\"}}",
+            "</tool_call>",
+            " after",
+        ]
+
+        for chunk in chunks:
+            handled = self.client._handle_server_message(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"text": chunk},
+                        }
+                    },
+                },
+                process=process,
+                cwd="/tmp",
+                text_parts=text_parts,
+                reasoning_parts=[],
+            )
+            self.assertTrue(handled)
+
+        self.assertEqual("".join(text_parts), "".join(chunks))
+        self.assertEqual("".join(streamed), "Before  after")
+
 
 if __name__ == "__main__":
     unittest.main()
