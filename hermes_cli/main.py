@@ -5264,6 +5264,12 @@ def _prod_channel_update(
         print("    hermes update")
         sys.exit(1)
 
+    # ── Stash uncommitted changes before any destructive operations ─────
+    # The main-channel path does this via _stash_local_changes_if_needed().
+    # We must do the same here because Step 7 does `reset --hard` which
+    # would otherwise destroy uncommitted work.
+    auto_stash_ref = _stash_local_changes_if_needed(git_cmd, cwd)
+
     # ── Step 2: Fetch upstream tags + fork remote ─────────────────────
     print("→ Fetching upstream tags...")
     try:
@@ -5280,7 +5286,20 @@ def _prod_channel_update(
             print(f"  {stderr.splitlines()[0]}")
         sys.exit(1)
 
-    # Also fetch the fork remote so we can read fork/prod
+    # Also fetch the fork remote so we have a fresh fork/prod for the merge.
+    # Without this, the worktree merge could start from a stale fork/prod and
+    # produce unnecessary conflicts or fail to push (non-fast-forward).
+    fork_remote = _get_fork_remote_name(git_cmd, cwd)
+    try:
+        subprocess.run(
+            git_cmd + ["fetch", fork_remote, "--quiet"],
+            cwd=cwd,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        pass  # non-fatal; best-effort
+
     origin_url = _get_origin_url(git_cmd, cwd)
     if _is_fork(origin_url):
         try:
@@ -5433,6 +5452,10 @@ def _prod_channel_update(
             capture_output=True,
             check=True,
         )
+
+        # Restore any stashed uncommitted changes
+        if auto_stash_ref is not None:
+            _restore_stashed_changes(git_cmd, cwd, auto_stash_ref)
 
         _invalidate_update_cache()
         print(f"✓ {PROD_CHANNEL} synced to {latest_tag}")
