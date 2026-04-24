@@ -4877,6 +4877,41 @@ SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 INSTALL_CHANNEL_FILE = "install-channel"
 PROD_CHANNEL = "prod"
 
+# ═══════════════════════════════════════════════════════════════════════
+# PROD-CHANNEL UPDATE LOGIC — FORK-SPECIFIC, DO NOT REMOVE OR REFACTOR AWAY
+# ═══════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS:
+#   The original `hermes update` command hardcoded branch="main" and silently
+#   switched to main/origin/main when on any other branch.  For agents running
+#   on a forked `prod` branch (with custom patches like ACP streaming fixes),
+#   this meant every update silently DROPPED all fork-only changes — the agent
+#   would end up on upstream `main` with no way to know it had lost its patches.
+#
+#   This was discovered after issue #9 (ACP stream_delta_callback) was merged
+#   into fork/prod but `hermes update` left the agent on origin/main without
+#   the fix.  The supply chain scanner also produced false positives because
+#   PR branches based on origin/main targeting prod created giant merge diffs.
+#
+# WHAT THESE FUNCTIONS DO:
+#   - _detect_update_channel(): reads ~/.hermes/install-channel or detects
+#     prod-branch heuristic → returns "prod" or "main"
+#   - _prod_channel_update(): tag-based sync of fork/prod to latest upstream
+#     release via temp worktree merge.  FAILS LOUDLY (sys.exit(1)) on:
+#       * wrong branch (not on prod)
+#       * merge conflict (prints conflicted files, does NOT fall back to main)
+#   - _resolve_fork_prod_ref() / _get_fork_remote_name(): git remote helpers
+#
+# IF YOU ARE RESOLVING A MERGE CONFLICT IN THIS SECTION:
+#   Do NOT remove these functions or route around them.  Doing so will cause
+#   prod-channel agents to silently fall back to main-channel behavior,
+#   losing fork-only changes on every future update.
+#   Keep both the channel detection AND the loud-fail guards.
+#
+# See: tests/hermes_cli/test_prod_channel_update.py (15 tests)
+# See: https://github.com/NousResearch/hermes-agent/pull/15071 (upstream PR)
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def _detect_update_channel(git_cmd: list[str], cwd: Path) -> str:
     """Detect which update channel this install uses.
@@ -4888,6 +4923,10 @@ def _detect_update_channel(git_cmd: list[str], cwd: Path) -> str:
       3. Default: ``"main"``
 
     Returns ``"prod"`` or ``"main"``.
+
+    **FORK-SPECIFIC**: This function enables the prod-channel update path.
+    Removing it causes fallback to "main", which silently drops fork changes.
+    DO NOT remove or bypass this detection.
     """
     from hermes_constants import get_hermes_home
 
@@ -5169,6 +5208,11 @@ def _prod_channel_update(
 ) -> None:
     """Update a prod-channel install: sync fork/prod with latest upstream tag.
 
+    **FORK-SPECIFIC — DO NOT REMOVE OR BYPASS.**  See the block comment above
+    _detect_update_channel() for the full rationale.  In short: without this
+    function, prod-channel agents silently fall back to main/origin/main on
+    every update, losing all fork-only patches.
+
     This is the prod-specific update path.  It:
 
     1. Verifies we are on the ``prod`` branch (fails loud if not).
@@ -5181,6 +5225,9 @@ def _prod_channel_update(
        the local checkout.
     7. If the merge **conflicts** → aborts, prints every conflicted file,
        and exits with an error (does NOT silently fall back to main).
+
+    Loud-fail design choice:  A silent fallback to main was the original bug.
+    We intentionally exit(1) so the operator knows something needs attention.
     """
     import tempfile
 
@@ -5883,9 +5930,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         current_branch = result.stdout.strip()
 
         # ── Detect update channel ─────────────────────────────────────
+        # FORK-SPECIFIC: This routing is critical.  Do NOT remove the
+        # prod-channel branch below or merge it into the main-channel path.
+        # See block comment above _detect_update_channel() for rationale.
         update_channel = _detect_update_channel(git_cmd, PROJECT_ROOT)
 
         # ── Prod channel: use tag-based fork/prod sync ───────────────
+        # This branch MUST exist.  Removing it re-introduces the silent
+        # fallback bug where fork/prod agents end up on origin/main.
         if update_channel == PROD_CHANNEL:
             print(f"  (update channel: {PROD_CHANNEL})")
             print()
