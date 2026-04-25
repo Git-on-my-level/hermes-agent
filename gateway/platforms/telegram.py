@@ -226,6 +226,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._allowed_inbound_targets = self._parse_allowed_inbound_targets(
+            self.config.extra.get("allowed_inbound_targets", [])
+            if getattr(self.config, "extra", None)
+            else []
+        )
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
@@ -251,6 +256,93 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+
+    @staticmethod
+    def _parse_allowed_inbound_targets(raw_targets: Any) -> set[tuple[str, Optional[str]]]:
+        """Normalize inbound allowlist config into {(chat_id, thread_id)} tuples."""
+        if raw_targets is None:
+            return set()
+
+        if isinstance(raw_targets, (str, int, dict)):
+            raw_targets = [raw_targets]
+
+        normalized: set[tuple[str, Optional[str]]] = set()
+        for item in raw_targets:
+            chat_id: Optional[str] = None
+            thread_id: Optional[str] = None
+
+            if isinstance(item, dict):
+                chat_val = item.get("chat_id")
+                thread_val = item.get("thread_id")
+                if chat_val is None:
+                    continue
+                chat_id = str(chat_val).strip()
+                thread_id = str(thread_val).strip() if thread_val is not None else None
+            elif isinstance(item, int) and not isinstance(item, bool):
+                chat_id = str(item)
+            elif isinstance(item, str):
+                target = item.strip()
+                if not target:
+                    continue
+                if target.startswith("telegram:"):
+                    target = target.split(":", 1)[1]
+                if ":" in target:
+                    chat_part, thread_part = target.rsplit(":", 1)
+                    chat_id = chat_part.strip()
+                    thread_id = thread_part.strip() or None
+                else:
+                    chat_id = target
+            else:
+                continue
+
+            if not chat_id:
+                continue
+            normalized.add((chat_id, thread_id or None))
+
+        return normalized
+
+    def _is_inbound_target_allowed(
+        self,
+        *,
+        chat_id: str,
+        chat_type: str,
+        thread_id: Optional[str],
+    ) -> bool:
+        """Return whether an inbound Telegram message should be processed."""
+        if not self._allowed_inbound_targets:
+            return True
+        if chat_type == "dm":
+            return True
+
+        for allowed_chat_id, allowed_thread_id in self._allowed_inbound_targets:
+            if allowed_chat_id != chat_id:
+                continue
+            if allowed_thread_id is None or allowed_thread_id == thread_id:
+                return True
+        return False
+
+    def _is_inbound_message_allowed(self, message: Message) -> bool:
+        """Convenience wrapper around _is_inbound_target_allowed for PTB Message."""
+        chat = message.chat
+        chat_type = "dm"
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            chat_type = "group"
+        elif chat.type == ChatType.CHANNEL:
+            chat_type = "channel"
+        thread_id = str(message.message_thread_id) if getattr(message, "message_thread_id", None) else None
+        allowed = self._is_inbound_target_allowed(
+            chat_id=str(chat.id),
+            chat_type=chat_type,
+            thread_id=thread_id,
+        )
+        if not allowed:
+            logger.info(
+                "[%s] Ignoring inbound Telegram message outside allowlist: chat=%s thread=%s",
+                self.name,
+                chat.id,
+                thread_id or "-",
+            )
+        return allowed
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -2392,6 +2484,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+        if not self._is_inbound_message_allowed(update.message):
+            return
         if not self._should_process_message(update.message):
             return
 
@@ -2403,6 +2497,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+        if not self._is_inbound_message_allowed(update.message):
+            return
         if not self._should_process_message(update.message, is_command=True):
             return
         
@@ -2412,6 +2508,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
+            return
+        if not self._is_inbound_message_allowed(update.message):
             return
         if not self._should_process_message(update.message):
             return
@@ -2571,6 +2669,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if not self._is_inbound_message_allowed(update.message):
             return
         if not self._should_process_message(update.message):
             return
