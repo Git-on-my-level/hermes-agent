@@ -25,9 +25,15 @@ gateway/platforms/telegram.py:_is_inbound_message_allowed
 tests/gateway/test_telegram_inbound_allowlist.py
 
 ### ── Prod Update Guards ────────────────────────────────────────────
-# Commit: ea9b6f32
-# Loud-fail on wrong branch / merge conflict during hermes update
+# Commit: ea9b6f32 (original), c286b2ed (macOS multi-profile restart)
+# update-prod-branch.sh: auto-verifies features after sync, exits 1 on failure
+# Pre-push git hook: blocks push if verification fails
+# hermes_cli/main.py: macOS launchd path now iterates ALL profile plists (not just default)
 scripts/update-prod-branch.sh
+scripts/verify-prod-features.sh
+scripts/prod-feature-manifest.txt
+.git/hooks/pre-push
+hermes_cli/main.py
 
 ### ── Stream Delta Callback (ACP) ──────────────────────────────────
 # Commit: 9dca9cee (PR #13)
