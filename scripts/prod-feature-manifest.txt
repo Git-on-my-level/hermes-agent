@@ -1,0 +1,46 @@
+# Prod Feature Manifest
+# ======================
+# This file lists ALL code symbols, config keys, test files, and behaviors
+# that are custom to our fork/prod and NOT from upstream.
+#
+# After EVERY `hermes update` or `./scripts/update-prod-branch.sh`,
+# run:  ./scripts/verify-prod-features.sh
+# It will grep for each symbol and FAIL if any are missing.
+#
+# To add a new prod-only feature:
+#   1. Add your symbol below in the appropriate section
+#   2. Add its test file to the test section
+#   3. That's it — the verifier will protect it going forward
+#
+# Format: one symbol per line, # comments ignored, blank lines OK.
+# Wildcards (*) are supported for prefix matching.
+
+### ── Telegram Inbound Topic Allowlists ──────────────────────────────
+# Commit: 6d349a53 (restored as 71bdd7bf)
+# Config key: platforms.telegram.extra.allowed_inbound_targets
+gateway/platforms/telegram.py:_allowed_inbound_targets
+gateway/platforms/telegram.py:_parse_allowed_inbound_targets
+gateway/platforms/telegram.py:_is_inbound_target_allowed
+gateway/platforms/telegram.py:_is_inbound_message_allowed
+tests/gateway/test_telegram_inbound_allowlist.py
+
+### ── Prod Update Guards ────────────────────────────────────────────
+# Commit: ea9b6f32
+# Loud-fail on wrong branch / merge conflict during hermes update
+scripts/update-prod-branch.sh
+
+### ── Stream Delta Callback (ACP) ──────────────────────────────────
+# Commit: 9dca9cee (PR #13)
+acp_adapter/events.py:make_stream_delta_cb
+acp_adapter/server.py:stream_delta_callback
+
+### ── Delegation Model Override ─────────────────────────────────────
+# Commit: b6745e1a (PR #14)
+# Added 'model' param to delegate_task() for per-subagent model override
+tools/delegate_tool.py
+tests/tools/test_delegate.py
+
+### ── Fork Prod Skill Bundle ────────────────────────────────────────
+# Commit: 093c1a4f
+# Installed at ~/.hermes/skills/ (not in-repo)
+scripts/install-repo-skills.sh

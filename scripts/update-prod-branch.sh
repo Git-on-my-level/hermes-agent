@@ -162,7 +162,20 @@ if [ "$AHEAD_COUNT" != "0" ]; then
   done
 fi
 
-# ── Step 7: Install repo-bundled skills ───────────────────
+# ── Step 7: Verify prod features survived the merge ────────────────
+if [ -f "${REPO_DIR}/scripts/verify-prod-features.sh" ]; then
+  log "Verifying prod-only features..."
+  if ! run "${REPO_DIR}/scripts/verify-prod-features.sh"; then
+    err ""
+    err "⚠️  Prod feature verification FAILED!"
+    err "   Upstream merge may have nuked custom code."
+    err "   Review output above, recover lost changes, then re-run verifier."
+    err ""
+    exit 1
+  fi
+fi
+
+# ── Step 8: Install repo-bundled skills ───────────────────────────
 if [ -f "${REPO_DIR}/scripts/install-repo-skills.sh" ]; then
   log "Installing repo-bundled skills..."
   run "${REPO_DIR}/scripts/install-repo-skills.sh"
