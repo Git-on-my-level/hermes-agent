@@ -6504,29 +6504,63 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         pass
 
             # --- Launchd services (macOS) ---
+            # Restart ALL loaded Hermes gateway services (default + profiles),
+            # mirroring the systemd path which iterates over all hermes-gateway* units.
+            # Code updates (git pull / pip install) are shared across all profiles,
+            # so every running gateway must restart to pick up new modules.
             if is_macos():
                 try:
                     from hermes_cli.gateway import (
-                        launchd_restart,
+                        _launchd_domain,
                         get_launchd_label,
                         get_launchd_plist_path,
                     )
+                    import glob as _glob
 
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
+                    _launchd_agents_dir = Path.home() / "Library" / "LaunchAgents"
+                    _plist_pattern = str(_launchd_agents_dir / "ai.hermes.gateway*.plist")
+                    for _plist_file in sorted(_glob.glob(_plist_pattern)):
+                        # Extract label from plist filename (ai.hermes.gateway-<suffix>.plist)
+                        _label = Path(_plist_file).stem  # e.g. ai.hermes.gateway-hermes-m4-pma
                         check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
+                            ["launchctl", "list", _label],
                             capture_output=True,
                             text=True,
                             timeout=5,
                         )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
+                        if check.returncode != 0:
+                            continue  # not loaded, skip
+
+                        try:
+                            target = f"{_launchd_domain()}/{_label}"
+                            print(f"  → {_label}: restarting...")
+                            subprocess.run(
+                                ["launchctl", "kickstart", "-k", target],
+                                check=True, timeout=90,
+                            )
+                            restarted_services.append(_label)
+                            print(f"  ✓ {_label} restarted")
+                        except subprocess.CalledProcessError as e:
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            if e.returncode in (3, 113):
+                                # Job not loaded — bootstrap and start fresh
+                                print(f"  ↻ {_label} was unloaded; reloading...")
+                                try:
+                                    subprocess.run(
+                                        ["launchctl", "bootstrap", _launchd_domain(), _plist_file],
+                                        check=True, timeout=30,
+                                    )
+                                    target2 = f"{_launchd_domain()}/{_label}"
+                                    subprocess.run(
+                                        ["launchctl", "kickstart", "-k", target2],
+                                        check=True, timeout=30,
+                                    )
+                                    restarted_services.append(_label)
+                                    print(f"  ✓ {_label} restarted")
+                                except Exception as e2:
+                                    print(f"  ⚠ {_label} bootstrap/restart failed: {e2}")
+                            else:
+                                print(f"  ⚠ {_label} restart failed: {stderr}")
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 
