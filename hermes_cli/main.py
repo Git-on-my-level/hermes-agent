@@ -7309,8 +7309,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             input_fn=gw_input_fn,
                         )
 
-    # Shared post-update steps (both prod and main channels)
-    _invalidate_update_cache()
+        # Shared post-update steps (both prod and main channels)
+        _invalidate_update_cache()
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in

@@ -6326,7 +6326,6 @@ class AIAgent:
                         raise
                     result["response"] = normalize_converse_response(raw_response)
                 else:
-                else:
                     if self.provider == "copilot-acp":
                         with self._openai_client_lock():
                             request_kwargs = dict(self._client_kwargs)
