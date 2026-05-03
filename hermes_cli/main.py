@@ -6332,7 +6332,7 @@ def _prod_channel_update(
     if result.returncode == 0:
         _invalidate_update_cache()
         print(f"✓ Already up to date ({latest_tag})")
-        return
+        return True
 
     print(f"→ Syncing {PROD_CHANNEL} to upstream {latest_tag}...")
 
@@ -7231,20 +7231,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             commit_count = int(result.stdout.strip())
 
-        prompt_for_restore = auto_stash_ref is not None and (
-            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
-        )
-
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
-
         if commit_count == 0:
             _invalidate_update_cache()
             # Restore stash and switch back to original branch if we moved
@@ -7333,16 +7319,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
-                if current_branch not in ("main", "HEAD"):
-                    subprocess.run(
-                        git_cmd + ["checkout", current_branch],
-                        cwd=PROJECT_ROOT,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                print("✓ Already up to date!")
-                return
 
             print(f"→ Found {commit_count} new commit(s)")
 
