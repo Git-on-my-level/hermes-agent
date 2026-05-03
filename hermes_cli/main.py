@@ -5205,8 +5205,12 @@ def _prod_channel_update(
     git_cmd: list[str],
     cwd: Path,
     gateway_mode: bool = False,
-) -> None:
+) -> bool:
     """Update a prod-channel install: sync fork/prod with latest upstream tag.
+
+    Returns True on success, False if merge conflicts or other errors
+    prevented the sync.  The caller MUST check the return value and
+    must NOT print "Update complete" when it is False.
 
     **FORK-SPECIFIC — DO NOT REMOVE OR BYPASS.**  See the block comment above
     _detect_update_channel() for the full rationale.  In short: without this
@@ -5223,11 +5227,12 @@ def _prod_channel_update(
        worktree** so the live checkout stays clean.
     6. If the merge is **clean** → pushes to ``fork/prod`` and fast-forwards
        the local checkout.
-    7. If the merge **conflicts** → aborts, prints every conflicted file,
-       and exits with an error (does NOT silently fall back to main).
+    7. If the merge **conflicts** → returns False; caller prints a final
+       error summary and exits with code 1 (does NOT print "Update complete").
 
     Loud-fail design choice:  A silent fallback to main was the original bug.
-    We intentionally exit(1) so the operator knows something needs attention.
+    We return False (not raise/exit) so the caller controls the exit path,
+    but the caller MUST check and must NOT continue to "Update complete".
     """
     import tempfile
 
@@ -5398,7 +5403,7 @@ def _prod_channel_update(
                 print('    git commit -m "merge: sync prod to '
                       f'{latest_tag}"')
                 print(f"    git push origin HEAD:{PROD_CHANNEL}")
-                return  # don't sys.exit — let the rest of update finish
+                return False  # signal failure so caller skips "Update complete"
             else:
                 # Non-conflict failure (e.g. GPG sig issue)
                 print(f"⚠ Merge reported error but no file conflicts.")
@@ -5409,7 +5414,7 @@ def _prod_channel_update(
                     cwd=tmpdir,
                     capture_output=True,
                 )
-                return
+                return False
 
         # Clean merge! Commit it.
         subprocess.run(
@@ -5437,7 +5442,7 @@ def _prod_channel_update(
             print(f"  Local worktree at {tmpdir} has the merged result.")
             print(f"  Push manually: cd {tmpdir} && git push "
                   f"{push_remote} HEAD:{PROD_CHANNEL}")
-            return
+            return False
 
         # Fast-forward local prod to match
         subprocess.run(
@@ -5459,6 +5464,7 @@ def _prod_channel_update(
 
         _invalidate_update_cache()
         print(f"✓ {PROD_CHANNEL} synced to {latest_tag}")
+        return True
 
     finally:
         # Clean up temp worktree
@@ -5964,7 +5970,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if update_channel == PROD_CHANNEL:
             print(f"  (update channel: {PROD_CHANNEL})")
             print()
-            _prod_channel_update(git_cmd, PROJECT_ROOT, gateway_mode=gateway_mode)
+            prod_ok = _prod_channel_update(git_cmd, PROJECT_ROOT, gateway_mode=gateway_mode)
+            if not prod_ok:
+                print()
+                print("✗ Update stopped — merge conflicts require manual resolution.")
+                print("  See the conflict details above.")
+                sys.exit(1)
             # _prod_channel_update handles stashing, fetching, merging,
             # and fast-forwarding.  Fall through to dependency install.
             auto_stash_ref = None  # prod path manages its own stash
