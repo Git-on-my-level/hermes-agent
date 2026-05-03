@@ -7231,87 +7231,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
-            _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            print("✓ Already up to date!")
-            return
-
-        print(f"→ Found {commit_count} new commit(s)")
-
-        # Snapshot critical state (state.db, config, pairing JSONs, etc.)
-        # before pulling so a user can recover if something goes wrong.
-        # Issue #15733 reported missing pairing data after an update; even
-        # though `git pull` can't touch $HERMES_HOME, this is cheap
-        # belt-and-suspenders insurance and gives the user something to
-        # restore from via `/snapshot list` / `/snapshot restore <id>`.
-        try:
-            from hermes_cli.backup import create_quick_snapshot
-
-            snap_id = create_quick_snapshot(label="pre-update")
-            if snap_id:
-                print(f"  ✓ Pre-update snapshot: {snap_id}")
-        except Exception as exc:
-            # Never let a snapshot failure block an update.
-            logger.debug("Pre-update snapshot failed: %s", exc)
-
-        print("→ Pulling updates...")
-        update_succeeded = False
-        try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
-                    )
-                    sys.exit(1)
-            update_succeeded = True
-        finally:
-            if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(
-                        f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
-                    )
-                    print(f"  Restore manually with: git stash apply")
-                else:
+            if commit_count == 0:
+                _invalidate_update_cache()
+                # Restore stash and switch back to original branch if we moved
+                if auto_stash_ref is not None:
                     _restore_stashed_changes(
                         git_cmd,
                         PROJECT_ROOT,
@@ -7319,8 +7242,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
+                if current_branch not in ("main", "HEAD"):
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                print("✓ Already up to date!")
+                return
 
             print(f"→ Found {commit_count} new commit(s)")
+
+            # Snapshot critical state before pulling (issue #15733)
+            try:
+                from hermes_cli.backup import create_quick_snapshot
+
+                snap_id = create_quick_snapshot(label="pre-update")
+                if snap_id:
+                    print(f"  ✓ Pre-update snapshot: {snap_id}")
+            except Exception as exc:
+                logger.debug("Pre-update snapshot failed: %s", exc)
 
             print("→ Pulling updates...")
             update_succeeded = False
@@ -7332,9 +7275,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     text=True,
                 )
                 if pull_result.returncode != 0:
-                    # ff-only failed — local and remote have diverged (e.g. upstream
-                    # force-pushed or rebase).  Since local changes are already
-                    # stashed, reset to match the remote exactly.
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
@@ -7355,8 +7295,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 update_succeeded = True
             finally:
                 if auto_stash_ref is not None:
-                    # Don't attempt stash restore if the code update itself failed —
-                    # working tree is in an unknown state.
                     if not update_succeeded:
                         print(
                             f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
@@ -7371,7 +7309,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             input_fn=gw_input_fn,
                         )
 
-        _invalidate_update_cache()
+    # Shared post-update steps (both prod and main channels)
+    _invalidate_update_cache()
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
