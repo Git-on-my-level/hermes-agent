@@ -6855,7 +6855,7 @@ def _prod_channel_update(
     if result.returncode == 0:
         _invalidate_update_cache()
         print(f"✓ Already up to date ({latest_tag})")
-        return
+        return True
 
     print(f"→ Syncing {PROD_CHANNEL} to upstream {latest_tag}...")
 
