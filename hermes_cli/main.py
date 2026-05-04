@@ -9389,8 +9389,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
 
         # Fork upstream sync logic (only for main branch on forks)
+        sync_ok = True
         if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+            sync_ok = _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -9754,7 +9755,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         print()
-        print("✓ Update complete!")
+        if not sync_ok:
+            print("✗ Unable to complete update — merge conflicts require manual resolution.")
+            print("  See the conflict details above.")
+            print()
+            print("  Dependencies, skills, and config were refreshed, but the code")
+            print("  sync was blocked.  Resolve conflicts then re-run `hermes update`.")
+        else:
+            print("✓ Update complete!")
 
         # Curator first-run heads-up. Only prints when curator is enabled AND
         # has never run — i.e. the window where the ticker would otherwise
