@@ -16,7 +16,14 @@
 # Wildcards (*) are supported for prefix matching.
 
 ### ── Telegram Inbound Topic Allowlists ──────────────────────────────
-# Commit: 6d349a53 (restored as 71bdd7bf)
+# Commit: 145437acc (cherry-picked onto prod 2026-05-07)
+# Originally: 6d349a530 → lost during rebase → restored → lost again
+# ANTI-PATTERN: This feature lived ONLY in feature branches/worktrees for ~6 weeks
+# before making it into any deployment branch. Config key existed in YAML but code
+# was silently ignored. Manifest listed it as "verified" but neither fork/prod nor
+# the running branch actually had the code.
+# LESSON: After adding to manifest, ALWAYS verify with:
+#   git merge-base --is-ancestor <commit-sha> fork/prod && grep -c <symbol> gateway/platforms/telegram.py
 # Config key: platforms.telegram.extra.allowed_inbound_targets
 gateway/platforms/telegram.py:_allowed_inbound_targets
 gateway/platforms/telegram.py:_parse_allowed_inbound_targets
