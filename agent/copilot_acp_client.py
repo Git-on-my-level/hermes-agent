@@ -507,16 +507,16 @@ class CopilotACPClient:
             proc.stdin.write(json.dumps(payload) + "\n")
             proc.stdin.flush()
 
-            deadline = time.time() + timeout_seconds
-            last_message_time = time.time()
+            deadline = time.monotonic() + timeout_seconds
+            last_message_time = time.monotonic()
             inactivity_timeout = min(timeout_seconds, _resolve_inactivity_timeout_seconds())
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     break
                 try:
                     msg = inbox.get(timeout=0.1)
                 except queue.Empty:
-                    silence = time.time() - last_message_time
+                    silence = time.monotonic() - last_message_time
                     if silence > inactivity_timeout:
                         raise TimeoutError(
                             f"Copilot ACP {method} went silent for {int(silence)}s "
@@ -524,7 +524,7 @@ class CopilotACPClient:
                         )
                     continue
 
-                last_message_time = time.time()
+                last_message_time = time.monotonic()
                 self._notify_activity(f"copilot-acp:{method}")
 
                 if self._handle_server_message(
