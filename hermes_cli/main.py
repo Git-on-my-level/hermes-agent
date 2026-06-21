@@ -10530,6 +10530,67 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
 )
 
 
+_BUILTIN_SUBCOMMANDS = frozenset(
+    {
+        "acp",
+        "auth",
+        "backup",
+        "bundles",
+        "chat",
+        "checkpoints",
+        "claw",
+        "completion",
+        "computer-use",
+        "config",
+        "cron",
+        "curator",
+        "dashboard",
+        "debug",
+        "desktop",
+        "doctor",
+        "dump",
+        "fallback",
+        "gateway",
+        "gui",
+        "help",
+        "hooks",
+        "import",
+        "insights",
+        "kanban",
+        "login",
+        "logout",
+        "logs",
+        "lsp",
+        "mcp",
+        "memory",
+        "migrate",
+        "model",
+        "pairing",
+        "portal",
+        "plugins",
+        "postinstall",
+        "profile",
+        "prompt-size",
+        "proxy",
+        "security",
+        "secrets",
+        "send",
+        "sessions",
+        "setup",
+        "skills",
+        "slack",
+        "status",
+        "tools",
+        "uninstall",
+        "update",
+        "version",
+        "webhook",
+        "whatsapp",
+        "whatsapp-cloud",
+    }
+)
+
+
 def _first_positional_argv() -> str | None:
     """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
 
@@ -10563,6 +10624,72 @@ def _first_positional_argv() -> str | None:
             continue
         return tok
     return None
+
+
+def _coalesce_session_name_args(argv: list) -> list:
+    """Join unquoted multi-word session names after -c/--continue and -r/--resume."""
+    _SUBCOMMANDS = {
+        "chat",
+        "model",
+        "gateway",
+        "setup",
+        "whatsapp",
+        "whatsapp-cloud",
+        "login",
+        "logout",
+        "auth",
+        "status",
+        "cron",
+        "doctor",
+        "config",
+        "pairing",
+        "skills",
+        "tools",
+        "mcp",
+        "sessions",
+        "insights",
+        "version",
+        "update",
+        "uninstall",
+        "profile",
+        "dashboard",
+        "desktop",
+        "gui",
+        "honcho",
+        "claw",
+        "plugins",
+        "security",
+        "acp",
+        "webhook",
+        "memory",
+        "dump",
+        "debug",
+        "backup",
+        "import",
+        "completion",
+        "logs",
+        "portal",
+        "lsp",
+    }
+    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+
+    result = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _SESSION_FLAGS:
+            result.append(token)
+            i += 1
+            parts = []
+            while i < len(argv) and not argv[i].startswith("-") and argv[i] not in _SUBCOMMANDS:
+                parts.append(argv[i])
+                i += 1
+            if parts:
+                result.append(" ".join(parts))
+        else:
+            result.append(token)
+            i += 1
+    return result
 
 
 def _plugin_cli_discovery_needed() -> bool:
@@ -10964,6 +11091,219 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def cmd_profile(args):
+    from hermes_cli.profiles import (
+        create_profile,
+        create_wrapper_script,
+        delete_profile,
+        export_profile,
+        get_active_profile_name,
+        get_profile_dir,
+        import_profile,
+        list_profiles,
+        profile_exists,
+        remove_wrapper_script,
+        rename_profile,
+        seed_profile_skills,
+        set_active_profile,
+    )
+
+    action = getattr(args, "profile_action", None)
+    if action in (None, "list"):
+        active = get_active_profile_name()
+        profiles = list_profiles()
+        print(f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} {'Alias':<12}")
+        print(f" {'-' * 15}    {'-' * 27}    {'-' * 11}    {'-' * 11}")
+        for profile in profiles:
+            marker = "*" if (profile.name == active or (active == "default" and profile.is_default)) else " "
+            model = (profile.model or "-")[:26]
+            gateway = "running" if profile.gateway_running else "stopped"
+            alias = (profile.alias_name or profile.name) if profile.alias_path and not profile.is_default else "-"
+            print(f"{marker} {profile.name:<15} {model:<28} {gateway:<12} {alias:<12}")
+        print()
+        return
+    if action == "use":
+        set_active_profile(args.profile_name)
+        print(f"Switched to: {args.profile_name}")
+        return
+    if action == "create":
+        clone_from = getattr(args, "clone_from", None)
+        clone_config = bool(getattr(args, "clone", False) or clone_from)
+        clone_all = bool(getattr(args, "clone_all", False))
+        profile_dir = create_profile(
+            name=args.profile_name,
+            clone_from=clone_from,
+            clone_all=clone_all,
+            clone_config=clone_config,
+            no_alias=bool(getattr(args, "no_alias", False)),
+            no_skills=bool(getattr(args, "no_skills", False)),
+            description=getattr(args, "description", None),
+        )
+        print(f"Profile '{args.profile_name}' created at {profile_dir}")
+        if not (clone_config or clone_all):
+            seed_profile_skills(profile_dir)
+        return
+    if action == "delete":
+        delete_profile(args.profile_name, yes=bool(getattr(args, "yes", False)))
+        return
+    if action == "show":
+        if not profile_exists(args.profile_name):
+            print(f"Error: Profile '{args.profile_name}' does not exist.")
+            sys.exit(1)
+        print(get_profile_dir(args.profile_name))
+        return
+    if action == "alias":
+        alias_name = getattr(args, "alias_name", None) or args.profile_name
+        if getattr(args, "remove", False):
+            removed = remove_wrapper_script(alias_name)
+            print(f"{'Removed' if removed else 'No'} alias '{alias_name}'")
+        else:
+            wrapper = create_wrapper_script(
+                alias_name,
+                target=args.profile_name if alias_name != args.profile_name else None,
+            )
+            if wrapper:
+                print(f"Alias created: {wrapper}")
+        return
+    if action == "rename":
+        new_dir = rename_profile(args.old_name, args.new_name)
+        print(f"Profile renamed: {args.old_name} -> {args.new_name}")
+        print(f"Path: {new_dir}")
+        return
+    if action == "export":
+        output = args.output or f"{args.profile_name}.tar.gz"
+        print(export_profile(args.profile_name, output))
+        return
+    if action == "import":
+        print(import_profile(args.archive, name=getattr(args, "import_name", None)))
+        return
+    if action == "describe":
+        from hermes_cli import profile_describer
+        from hermes_cli import profiles as profiles_mod
+
+        text = getattr(args, "text", None)
+        name = getattr(args, "profile_name", None)
+        if text:
+            profiles_mod.write_profile_meta(
+                get_profile_dir(name),
+                description=text,
+                description_auto=False,
+            )
+            print(f"Description updated for '{name}'.")
+            return
+        if getattr(args, "auto", False):
+            targets = (
+                profile_describer.list_describable_profiles(missing_only=True)
+                if getattr(args, "all_missing", False)
+                else [name]
+            )
+            for target in targets:
+                outcome = profile_describer.describe_profile(
+                    target,
+                    overwrite=bool(getattr(args, "overwrite", False)),
+                )
+                if outcome.ok:
+                    print(f"Described '{outcome.profile_name}': {outcome.description}")
+                else:
+                    print(f"profile describe {outcome.profile_name}: {outcome.reason}", file=sys.stderr)
+            return
+        meta = profiles_mod.read_profile_meta(get_profile_dir(name))
+        print(meta.get("description") or f"(no description set for '{name}')")
+        return
+    if action in {"install", "update", "info"}:
+        from hermes_cli import profile_distribution
+
+        if action == "install":
+            plan = profile_distribution.install_distribution(
+                args.source,
+                name=getattr(args, "install_name", None),
+                force=bool(getattr(args, "force", False)),
+                create_alias=bool(getattr(args, "alias", False)),
+            )
+            print(f"Installed '{plan.manifest.name}' v{plan.manifest.version}")
+            return
+        if action == "update":
+            plan = profile_distribution.update_distribution(
+                args.profile_name,
+                force_config=bool(getattr(args, "force_config", False)),
+            )
+            print(f"Updated '{plan.manifest.name}' -> v{plan.manifest.version}")
+            return
+        print(profile_distribution.describe_distribution(args.profile_name))
+        return
+    raise SystemExit(f"Unknown profile action: {action}")
+
+
+def cmd_completion(args, parser=None):
+    from hermes_cli.completion import generate_bash, generate_fish, generate_zsh
+
+    shell = getattr(args, "shell", "bash")
+    if shell == "zsh":
+        print(generate_zsh(parser))
+    elif shell == "fish":
+        print(generate_fish(parser))
+    else:
+        print(generate_bash(parser))
+
+
+def cmd_dashboard_register(args):
+    from hermes_cli.dashboard_register import cmd_dashboard_register as _impl
+
+    return _impl(args)
+
+
+def cmd_dashboard(args):
+    if getattr(args, "dashboard_subcommand", None) == "register":
+        return cmd_dashboard_register(args)
+    if getattr(args, "status", False):
+        pids = _find_stale_dashboard_pids()
+        if not pids:
+            print("No hermes dashboard processes running.")
+        else:
+            for pid in pids:
+                print(f"PID {pid}")
+        return
+    if getattr(args, "stop", False):
+        _kill_stale_dashboard_processes(reason="requested via --stop")
+        return
+    web_dir = PROJECT_ROOT / "web"
+    if not getattr(args, "skip_build", False):
+        _build_web_ui(web_dir)
+    from hermes_cli.web_server import start_server
+
+    return start_server(
+        host=getattr(args, "host", "127.0.0.1"),
+        port=getattr(args, "port", 9119),
+        open_browser=not getattr(args, "no_open", False),
+        allow_public=bool(getattr(args, "insecure", False)),
+        initial_profile=getattr(args, "open_profile", ""),
+    )
+
+
+def cmd_logs(args):
+    from hermes_cli.logs import list_logs, tail_log
+
+    log_name = getattr(args, "log_name", "agent") or "agent"
+    if log_name == "list":
+        list_logs()
+        return
+    tail_log(
+        log_name,
+        num_lines=getattr(args, "lines", 50),
+        follow=getattr(args, "follow", False),
+        level=getattr(args, "level", None),
+        session=getattr(args, "session", None),
+        since=getattr(args, "since", None),
+        component=getattr(args, "component", None),
+    )
+
+
+def cmd_prompt_size(args):
+    from hermes_cli.prompt_size import cmd_prompt_size as _impl
+
+    return _impl(args)
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -11129,6 +11469,8 @@ def main():
     # =========================================================================
     # gateway + proxy commands  (parsers built in hermes_cli/subcommands/gateway.py)
     # =========================================================================
+    from hermes_cli.gateway_enroll import cmd_gateway_enroll
+
     build_gateway_parser(
         subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy, cmd_gateway_enroll=cmd_gateway_enroll
     )
@@ -12022,4 +12364,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
