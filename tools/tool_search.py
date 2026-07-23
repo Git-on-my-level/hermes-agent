@@ -115,9 +115,12 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-# Session-gated GUI toolsets: off ``_HERMES_CORE_TOOLS`` so non-GUI clients never pay
-# their schema; once enabled they stay direct unless the deferral list names them.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+# Explicitly enabled toolsets: off ``_HERMES_CORE_TOOLS`` so sessions that never enable them
+# don't pay their schema; once enabled they stay direct unless the deferral list names them.
+# ``desktop_ui``/``project`` are session-gated GUI surfaces; ``messaging`` is an operator's
+# per-platform opt-in, and hiding a capability someone deliberately granted behind the
+# tool-search bridge would just cost a round trip to rediscover it.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "messaging"})
 
 # Event-triggered core tools deferred BY DEFAULT (a catalog stub suffices); the ``defer``
 # config replaces this wholesale ([] = everything eager). POST-rename names. ``clarify``

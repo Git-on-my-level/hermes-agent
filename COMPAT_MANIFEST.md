@@ -3397,7 +3397,6 @@ to the public equivalent or the new module. Test monkeypatch seams are likewise 
 
 | name | kind | new location |
 |---|---|---|
-| `SEND_MESSAGE_SCHEMA` | restored-def | `(deleted; BASE body restored)` |
 | `re` | import | `re` |
 | `redact_sensitive_text` | moved-lazy | `agent.redact` |
 | `time` | import | `time` |

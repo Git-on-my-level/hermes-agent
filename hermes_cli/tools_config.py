@@ -70,6 +70,7 @@ CONFIGURABLE_TOOLSETS = [
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
+    ("messaging",       "📨 Outbound Messaging (opt-in)", "send messages or reactions across platforms (outbound side effects)"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
@@ -89,9 +90,10 @@ def gui_toolset_label(label: str) -> str:
     return text
 
 
-# OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
-# auto-enables when xAI creds exist (mirrors HASS_TOKEN → homeassistant); its check_fn still gates the schema.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+# OFF by default for new installs (the checklist won't pre-select them). x_search auto-enables when xAI
+# creds exist (mirrors HASS_TOKEN → homeassistant); its check_fn still gates the schema. ``messaging`` is
+# not in _HERMES_CORE_TOOLS at all: an outbound send is a side effect an operator opts into per platform.
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "messaging", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
 
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.
