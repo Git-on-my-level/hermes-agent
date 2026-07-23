@@ -114,6 +114,13 @@ TOOLSETS = {
         "trigger scheduled tasks",
         ["cronjob_manage"],
     ),
+    # Outbound sends are a side effect, so this is its own explicit opt-in toolset rather
+    # than part of _HERMES_CORE_TOOLS: no platform gets it until an operator enables it
+    # (`hermes tools`, or `platform_toolsets`). The tool's check_fn still gates reachability.
+    "messaging": _ts(
+        "Outbound cross-platform messaging (explicit opt-in; sends messages or reactions)",
+        ["send_message"],
+    ),
     "file": _ts(
         "File manipulation tools: read, write, patch (with fuzzy matching), and "
         "search (content + files)",
@@ -177,9 +184,10 @@ TOOLSETS = {
         posture=True,
     ),
 
-    # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
-    # there is deliberately no agent-callable send_message tool. hermes-acp is the
-    # coding posture minus the interactive clarify UI.
+    # Full Hermes toolsets (CLI + messaging platforms). All share the core tools; the
+    # agent-callable send_message tool is deliberately outside that set, in the explicit
+    # per-platform `messaging` opt-in above, because it has outbound cross-platform side
+    # effects. hermes-acp is the coding posture minus the interactive clarify UI.
     "hermes-acp": _ts(
         "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
         "messaging, audio, or clarify UI",

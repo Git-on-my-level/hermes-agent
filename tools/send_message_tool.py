@@ -17,11 +17,13 @@ from tools.send_message_senders import (
     _adapter_media_method, _error, _live_adapter, _media_caption_split, _plugin_standalone_sender,
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
-# (the agent must not fire cross-platform messages on its own); cron delivery, the
-# ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the helpers.
+# NOTE: ``send_message`` is an agent-callable model tool only through the default-off
+# ``messaging`` toolset (see the registration at the bottom of this module) — no platform
+# exposes it until an operator opts in. The send engine here stays the shared transport for
+# cron delivery, the ``hermes send`` CLI, the kanban notifier and the opt-in MCP server,
+# which import the helpers directly and do not depend on the registry entry.
 
 
 def prepare_send_message_platforms() -> None:
@@ -527,13 +529,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     return last_result
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import re  # noqa: F401,E402
-import time  # noqa: F401,E402
-
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
@@ -573,6 +568,58 @@ SEND_MESSAGE_SCHEMA = {
     }
 }
 
+
+# --- Registry ---
+
+def _check_send_message():
+    """Gate ``send_message`` on a reachable delivery path: a running gateway (or a live
+    messaging session, which implies one).
+
+    Also passes for kanban workers — the dispatcher sets ``HERMES_KANBAN_TASK`` on every
+    spawned worker, but those workers run with the assignee profile's ``HERMES_HOME``, which
+    has no ``gateway.pid``, so the gateway-running check would fail even though the parent
+    gateway is alive. Honoring the env var lets workers deliver rich content directly to the
+    originating chat (paired with ``kanban_complete`` for the short notifier summary).
+
+    This answers reachability only. Whether the tool is *offered* at all is the ``messaging``
+    toolset's job: it is default-off on every platform and must be enabled explicitly.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    # check_fn results are TTL-cached process-wide, so this must not depend on WHICH session
+    # is asking. It doesn't: the only process that serves many sessions is the gateway, and
+    # there the get_running_pid() check below is already True for every one of them. This
+    # branch only widens the answer for a single-session surface (TUI/desktop backend)
+    # driving a standalone sender without a local gateway pid file.
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if platform and platform != "local":
+        return True
+    try:
+        # cleanup_stale=False: building a tool schema must not delete a pid file as a side
+        # effect. The returned pid is verified against the live process either way.
+        from gateway.status import get_running_pid
+        return get_running_pid(cleanup_stale=False) is not None
+    except Exception:
+        return False
+
+
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import re  # noqa: F401,E402
+import time  # noqa: F401,E402
 
 _PLUGIN_COMPAT_LAZY = {
     'redact_sensitive_text': ('agent.redact', 'redact_sensitive_text'),

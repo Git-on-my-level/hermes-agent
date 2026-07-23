@@ -165,6 +165,14 @@ Tools for driving desktop [Projects](../user-guide/cli.md) — named, multi-fold
 |------|-------------|----------------------|
 | `memory` | Save important information to persistent memory that survives across sessions. Your memory appears in your system prompt at session start -- it's how you remember things about the user and your environment between conversations. WHEN TO SA… | — |
 
+## `messaging` toolset
+
+Default-off on every platform — enable it explicitly with `hermes tools` (or `platform_toolsets`) for the platform that should expose it. See [Toolsets Reference](/reference/toolsets-reference#messaging).
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `send_message` | Send a message to a connected messaging platform, list available targets, or attach/retract an emoji reaction. Outbound side effects. | Running gateway (or a live messaging session) |
+
 ## `session_search` toolset
 
 | Tool | Description | Requires environment |

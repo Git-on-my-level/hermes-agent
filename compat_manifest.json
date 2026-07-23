@@ -10672,12 +10672,6 @@
   },
   {
    "facade": "tools.send_message_tool",
-   "name": "SEND_MESSAGE_SCHEMA",
-   "kind": "restored-def",
-   "target": "(deleted; BASE body restored)"
-  },
-  {
-   "facade": "tools.send_message_tool",
    "name": "re",
    "kind": "import",
    "target": "re"
