@@ -3500,19 +3500,40 @@ def _launchctl_label_supervising_process(label: str) -> bool:
     return result.returncode == 0 and _parse_launchd_pid_from_list_output(result.stdout) is not None
 
 
+def _launchctl_domain_supervising_process(domain: str, label: str) -> bool:
+    """True when launchd registers ``domain/label`` AND runs a process for it.
+
+    ``launchctl list <label>`` is not domain-scoped: it resolves the label from the caller's
+    execution context, so mid-reload it can report a stale same-label job in *another* launchd
+    domain while the domain we just booted out is still unloaded. A bootstrap retry that stops
+    there leaves the gateway unsupervised the moment the stale copy disappears — KeepAlive
+    belongs to the domain/label pair we bootstrapped, not to whatever the caller's context
+    resolves. ``launchctl print <domain>/<label>`` names that exact pair; a positive pid is
+    still required, because print (like list) also succeeds for a registered-but-not-running
+    definition.
+    """
+    try:
+        loaded, pid = _launchd_print_service_pid(domain, label)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return loaded and pid is not None
+
+
 def _retry_launchctl_bootstrap_until_registered(
     domain: str, plist_path, label: str, *, deadline: float
 ) -> bool:
-    """Retry ``_launchctl_bootstrap`` until the label supervises a process or ``deadline`` passes. Under
-    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short."""
+    """Retry ``_launchctl_bootstrap`` until ``domain/label`` supervises a process or ``deadline``
+    passes. Under load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is
+    too short. The confirmation is domain-scoped so a stale same-label job in another launchd domain
+    cannot end the retry loop on a job this reload is not managing."""
     attempt = 0
     while True:
         attempt += 1
         try:
             _launchctl_bootstrap(domain, plist_path, label, timeout=30)
-            if _launchctl_label_supervising_process(label):
+            if _launchctl_domain_supervising_process(domain, label):
                 return True
-            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
+            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl print)"
         except subprocess.CalledProcessError as exc:
             outcome = f"failed (rc={exc.returncode}) for {domain}/{label}"
         except subprocess.TimeoutExpired:
@@ -3752,7 +3773,7 @@ def _spawn_deferred_launchd_reload(
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    until ``launchctl print <domain>/<label>`` shows a positive pid or the drain budget elapses."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3761,11 +3782,14 @@ def _spawn_deferred_launchd_reload(
     _append_launchd_reload_log(f"Launchd reload helper started for {target}")
 
     _reload_budget = int(_launchd_reload_budget())
-    q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
+    q_target, q_log = shlex.quote(target), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
-    # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
-    # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    # Probe the EXACT domain/label pair being bootstrapped: `launchctl list <label>` resolves the
+    # label from the caller's execution context, so a stale same-label job in another launchd domain
+    # would end the retry loop while the target domain is still unloaded. Require a POSITIVE pid too —
+    # `launchctl print` also exits 0 for a registered-but-not-running definition
+    # (mirrors _parse_launchd_pid_from_print_output).
+    supervised = f"launchctl print {q_target} 2>/dev/null | grep -qE '^[[:space:]]*pid = [1-9][0-9]*[[:space:]]*$'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -3779,10 +3803,10 @@ def _spawn_deferred_launchd_reload(
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
         f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-        f"  if {listed}; then break; fi; "
+        f"  if {supervised}; then break; fi; "
         f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
         f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
+        f"if ! {supervised}; then "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
         f"fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
