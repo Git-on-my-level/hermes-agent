@@ -483,6 +483,15 @@ class TestLaunchdServiceRecovery:
         # otherwise every reload leaks a dead label in launchd.
         submit_label = cmd[cmd.index("-l") + 1]
         assert f"launchctl remove {submit_label}" in script
+        # The registration probe must name the exact domain/label pair being
+        # bootstrapped: a bare `launchctl list <label>` resolves the label from
+        # the caller's context and would accept a stale job in another domain.
+        expected_probe = (
+            f"launchctl print {gateway_cli._launchd_domain()}/"
+            f"{gateway_cli.get_launchd_label()}"
+        )
+        assert expected_probe in script
+        assert "launchctl list" not in script
 
     def test_refresh_defers_reload_even_when_not_a_posix_descendant(self, tmp_path, monkeypatch):
         """The detached helper is used even when the gateway is NOT an ancestor.
@@ -2449,31 +2458,35 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
     """`_retry_launchctl_bootstrap_until_registered` — salvage of #53277.
 
     Covers the three review findings the salvage hardens: retry until the
-    label is actually LISTED (not just a zero bootstrap exit), TimeoutExpired
-    is retried (not escaped leaving the service unloaded), and the retry is
-    bounded by a wall-clock deadline rather than a fixed short window.
+    label is registered in the requested domain (not just a zero bootstrap
+    exit), retry a TimeoutExpired rather than escaping while unloaded, and
+    bound the retry by a wall-clock deadline instead of a fixed short window.
     """
 
     DOMAIN = "gui/501"
     PLIST = "/tmp/ai.hermes.gateway.plist"
     LABEL = "ai.hermes.gateway"
 
-    # `launchctl list <label>` output for a job launchd is actively running.
-    # Success requires a PID here, not just exit 0 — exit 0 alone also covers a
+    # `launchctl print <domain>/<label>` output for a job launchd is actively running.
+    # Success requires a pid here, not just exit 0 — exit 0 alone also covers a
     # registered-but-not-running definition (macOS 26+ `state = not running`).
-    RUNNING_LIST_OUTPUT = '{\n\t"PID" = 4242;\n\t"Label" = "ai.hermes.gateway";\n};'
+    RUNNING_PRINT_OUTPUT = (
+        "ai.hermes.gateway = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n};"
+    )
 
     def test_returns_true_once_label_is_registered(self, monkeypatch):
-        """Success requires launchctl list to confirm a supervised process, not
-        just a zero bootstrap exit."""
-        list_results = iter([1, 0])  # first check: not registered, second: registered
+        """Success requires a domain-scoped launchctl print confirming a
+        supervised process, not just a zero bootstrap exit."""
+        print_results = iter([1, 0])  # first check: not registered, second: registered
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd[:2] == ["launchctl", "list"]:
-                rc = next(list_results)
+            if cmd[:2] == ["launchctl", "print"]:
+                # The probe must name the exact domain/label pair, never a bare label.
+                assert cmd == ["launchctl", "print", f"{self.DOMAIN}/{self.LABEL}"]
+                rc = next(print_results)
                 return SimpleNamespace(
                     returncode=rc,
-                    stdout=self.RUNNING_LIST_OUTPUT if rc == 0 else "",
+                    stdout=self.RUNNING_PRINT_OUTPUT if rc == 0 else "",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2498,12 +2511,12 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
                 if attempts["bootstrap"] == 1:
                     raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 30))
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
-            if cmd[:2] == ["launchctl", "list"]:
+            if cmd[:2] == ["launchctl", "print"]:
                 # registered only after the second (successful) bootstrap
                 ok = attempts["bootstrap"] >= 2
                 return SimpleNamespace(
                     returncode=0 if ok else 1,
-                    stdout=self.RUNNING_LIST_OUTPUT if ok else "",
+                    stdout=self.RUNNING_PRINT_OUTPUT if ok else "",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2517,23 +2530,24 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-    def test_registered_but_not_running_is_not_success(self, monkeypatch):
-        """A definition with no PID must not end the loop.
 
-        `launchctl list` exits 0 for a registered-but-not-running job (macOS
-        26+ `state = not running`), so exit-0 alone would report success for a
-        gateway launchd is not actually running. Verified against live launchd
-        on 2026-08-05.
+    def test_registered_but_not_running_is_not_success(self, monkeypatch):
+        """A definition with no pid must not end the loop.
+
+        `launchctl print <domain>/<label>` exits 0 for a registered-but-not-running
+        job (macOS 26+ `state = not running`), so exit-0 alone would report success
+        for a gateway launchd is not actually running. Verified against live
+        launchd on 2026-08-05.
         """
-        list_calls = {"n": 0}
+        print_calls = {"n": 0}
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd[:2] == ["launchctl", "list"]:
-                list_calls["n"] += 1
-                # Registered (exit 0) but no PID line — never running.
+            if cmd[:2] == ["launchctl", "print"]:
+                print_calls["n"] += 1
+                # Registered in the domain (exit 0) but no pid line — never running.
                 return SimpleNamespace(
                     returncode=0,
-                    stdout='{\n\t"Label" = "ai.hermes.gateway";\n};',
+                    stdout="ai.hermes.gateway = {\n\tstate = not running\n};",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2546,7 +2560,31 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
             deadline=gateway_cli.time.monotonic() - 1,  # already expired
         )
         assert ok is False
-        assert list_calls["n"] >= 1
+        assert print_calls["n"] >= 1
+
+    def test_ignores_a_same_label_registered_in_another_domain(self, monkeypatch):
+        """A stale gui job must not make a user-domain reload look healthy.
+
+        `launchctl list <label>` resolves the label from the caller's execution
+        context, so a leftover registration in a different launchd domain would
+        end the retry loop while the domain this reload bootstrapped is still
+        unloaded — leaving the gateway unsupervised once the stale copy goes.
+        """
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=3, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert (
+            gateway_cli._launchctl_domain_supervising_process(self.DOMAIN, self.LABEL)
+            is False
+        )
+        assert calls == [["launchctl", "print", f"{self.DOMAIN}/{self.LABEL}"]]
 
 
 class TestTimeoutStopSecCoversCronFloor:
