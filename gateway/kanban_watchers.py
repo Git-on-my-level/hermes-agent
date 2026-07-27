@@ -404,10 +404,6 @@ class GatewayKanbanWatchersMixin:
                             d.get("old_cursor", 0),
                             board_slug,
                         )
-                        await asyncio.to_thread(
-                            self._kanban_attention,
-                            sub, d["cursor"], "adapter disconnected after notification claim", board_slug,
-                        )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""

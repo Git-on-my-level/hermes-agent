@@ -512,6 +512,7 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     makes this test FAIL (the default adapter receives the delivery).
     """
     db_path = tmp_path / "profile-no-fallback.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
@@ -552,9 +553,17 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert other_adapter.sent == [], (
         f"beta's discord adapter must not receive a telegram sub; got {other_adapter.sent!r}"
     )
-    # The claim is rewound (adapter resolved to None → treated as disconnected),
-    # so the event is still unseen and will deliver once beta's adapter connects.
+    # The precise profile adapter is unavailable during an ordinary reconnect
+    # window. The claim must rewind without escalating the known platform, so
+    # the event is still unseen and will deliver once beta's adapter connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert sub["delivery_state"] == "pending"
+    assert sub["delivery_attempt_count"] == 0
 
 
 def test_notifier_claims_platform_only_a_secondary_profile_owns(tmp_path, monkeypatch):
