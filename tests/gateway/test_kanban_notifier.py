@@ -239,6 +239,20 @@ class FailingAdapter:
         raise RuntimeError("simulated send failure")
 
 
+class FailCompletedOnceAdapter(RecordingAdapter):
+    """Deliver a preceding terminal event, then fail the completion once."""
+
+    def __init__(self):
+        super().__init__()
+        self._failed_completed = False
+
+    async def send(self, chat_id, text, metadata=None):
+        if " done" in text and not self._failed_completed:
+            self._failed_completed = True
+            raise RuntimeError("completed event temporarily failed")
+        await super().send(chat_id, text, metadata)
+
+
 def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     """A raising adapter rewinds the claim so the next tick can retry.
 
@@ -262,6 +276,95 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_notifier_retries_only_failed_tail_after_partial_batch_success(tmp_path, monkeypatch):
+    """A successful earlier event is never replayed after a later failure.
+
+    This is a real SQLite persistence-chain regression: two events are created
+    under a temporary HERMES_HOME, a fresh watcher sends ``crashed`` then fails
+    ``completed``, and a later watcher retry must send only ``completed``.
+    """
+    db_path = tmp_path / "partial-batch.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="two terminal events", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed")
+        kb.complete_task(conn, tid, summary="tail completion")
+    finally:
+        conn.close()
+
+    adapter = FailCompletedOnceAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [delivery["text"] for delivery in adapter.sent]
+    assert sum("worker crashed" in text for text in texts) == 1
+    assert sum(" done" in text for text in texts) == 1
+
+
+def test_notifier_marks_unknown_persisted_platform_attention_required(tmp_path, monkeypatch):
+    """A malformed platform has a durable no-attempt outcome and stays unseen."""
+    db_path = tmp_path / "unknown-platform.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="unknown platform", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="removed-platform", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="must remain inspectable")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, tid)
+        _, events = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="removed-platform", chat_id="chat-1",
+            kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
+        )
+    finally:
+        conn.close()
+
+    assert sub["delivery_state"] == "attention_required"
+    assert sub["delivery_attempt_count"] == 0
+    assert "unknown platform adapter" in sub["delivery_last_error"]
+    assert [event.kind for event in events] == ["completed"]
+
+
+def test_notifier_keeps_known_disconnected_platform_pending(tmp_path, monkeypatch):
+    """Ordinary startup/reconnect must not create attention-record noise."""
+    db_path = tmp_path / "known-disconnected.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert sub["delivery_state"] == "pending"
+    assert sub["delivery_attempt_count"] == 0
+    assert [event.kind for event in _unseen_terminal_events(tid)] == ["completed"]
 
 
 class ReportedFailureAdapter:

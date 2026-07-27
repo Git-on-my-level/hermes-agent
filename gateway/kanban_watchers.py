@@ -177,17 +177,10 @@ class GatewayKanbanWatchersMixin:
         # task is genuinely done lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
-        # consecutive send failures the sub is dropped so we don't spin
-        # against a dead chat every 5 seconds forever.
-        # Raised from 3 to 12 (~60s at the 5s tick cadence): now that a
-        # reported SendResult(success=False) also lands here (see the
-        # delivery loop below), a transient Telegram/API outage of a few
-        # ticks must NOT permanently unsubscribe a live review-gate channel.
-        # A genuinely dead chat still drops, just ~60s later — a fine trade
-        # for an unattended gate where a false drop means silent work pileup.
-        MAX_SEND_FAILURES = 12
+        # Failed delivery obligations stay on the subscription row. A
+        # gateway-local counter both vanished after restart and eventually
+        # deleted the only durable record that a terminal notification failed.
+        MAX_SEND_FAILURES = 3
         sub_fail_counts: dict[tuple, int] = getattr(
             self, "_kanban_sub_fail_counts", {}
         )
@@ -227,8 +220,10 @@ class GatewayKanbanWatchersMixin:
                             for platform in _profile_adapter_map.keys()
                         )
                     if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        # A known adapter may simply still be reconnecting;
+                        # inspect persisted origins so only malformed ones
+                        # become durable attention records.
+                        logger.debug("kanban notifier: no connected adapters; checking persisted origins")
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -307,6 +302,37 @@ class GatewayKanbanWatchersMixin:
                                             )
                                             continue
                                     platform = (sub.get("platform") or "").lower()
+                                    try:
+                                        _Platform(platform)
+                                    except ValueError:
+                                        old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            platform=sub["platform"],
+                                            chat_id=sub["chat_id"],
+                                            thread_id=sub.get("thread_id") or "",
+                                            kinds=TERMINAL_KINDS,
+                                        )
+                                        if events:
+                                            _kb.rewind_notify_cursor(
+                                                conn,
+                                                task_id=sub["task_id"],
+                                                platform=sub["platform"],
+                                                chat_id=sub["chat_id"],
+                                                thread_id=sub.get("thread_id") or "",
+                                                claimed_cursor=cursor,
+                                                old_cursor=old_cursor,
+                                            )
+                                            _kb.mark_notify_delivery_attention_required(
+                                                conn,
+                                                task_id=sub["task_id"],
+                                                platform=sub["platform"],
+                                                chat_id=sub["chat_id"],
+                                                thread_id=sub.get("thread_id") or "",
+                                                event_id=cursor,
+                                                reason=f"unknown platform adapter: {platform or '<empty>'}",
+                                            )
+                                        continue
                                     if platform not in active_platforms:
                                         logger.debug(
                                             "kanban notifier: subscription for %s on %s skipped; adapter not connected",
@@ -354,15 +380,7 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
+                    plat = _Platform(platform_str)
                     sub_profile = sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
                     # (gateway/authz_mixin.py::_authorization_adapter): a stamped
@@ -385,6 +403,10 @@ class GatewayKanbanWatchersMixin:
                             d["cursor"],
                             d.get("old_cursor", 0),
                             board_slug,
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_attention,
+                            sub, d["cursor"], "adapter disconnected after notification claim", board_slug,
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
@@ -563,11 +585,19 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
+                            # Persist each successful send before attempting a
+                            # later event. A failed tail can then rewind only
+                            # its own single-event claim, never this success.
+                            await asyncio.to_thread(
+                                self._kanban_delivery_confirmed,
+                                sub, ev.id, board_slug,
+                            )
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
+                            fails = await asyncio.to_thread(
+                                self._kanban_delivery_failed,
+                                sub, ev.id, str(exc), board_slug,
+                            )
                             logger.warning(
                                 "kanban notifier: send failed for %s on %s "
                                 "(attempt %d/%d): %s",
@@ -576,19 +606,18 @@ class GatewayKanbanWatchersMixin:
                             )
                             if fails >= MAX_SEND_FAILURES:
                                 logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
+                                    "kanban notifier: delivery for %s on %s requires attention "
+                                    "after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
-                            else:
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub, d["cursor"], d.get("old_cursor", 0), board_slug,
+                            )
+                            if fails >= MAX_SEND_FAILURES:
                                 await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
+                                    self._kanban_attention,
+                                    sub, d["cursor"], str(exc), board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
                             # a later tick can retry. After too many failures,
@@ -764,7 +793,7 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
-                        if task_terminal:
+                        if task_terminal and d["events"][-1].kind in {"completed", "archived"}:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
@@ -831,6 +860,51 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_failed(
+        self, sub: dict, event_id: int, error: str, board: Optional[str] = None,
+    ) -> int:
+        """Persist an adapter-send failure on its source subscription."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.record_notify_delivery_failure(
+                conn, task_id=sub["task_id"], platform=sub["platform"],
+                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                event_id=event_id, error=error,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_attention(
+        self, sub: dict, event_id: int, reason: str, board: Optional[str] = None,
+    ) -> None:
+        """Persist a no-send or exhausted-delivery attention outcome."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.mark_notify_delivery_attention_required(
+                conn, task_id=sub["task_id"], platform=sub["platform"],
+                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                event_id=event_id, reason=reason,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_delivery_confirmed(
+        self, sub: dict, event_id: int, board: Optional[str] = None,
+    ) -> None:
+        """Durably consume one event only after its adapter send succeeded."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.confirm_notify_delivery(
+                conn, task_id=sub["task_id"], platform=sub["platform"],
+                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                event_id=event_id,
             )
         finally:
             conn.close()
