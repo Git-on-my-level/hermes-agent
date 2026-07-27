@@ -67,7 +67,6 @@ from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
-    make_stream_delta_cb,
     make_thinking_cb,
     make_tool_progress_cb,
 )
@@ -1695,13 +1694,12 @@ class HermesACPAgent(acp.Agent):
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
             message_cb = make_message_cb(conn, session_id, loop)
-            raw_stream_delta_cb = make_stream_delta_cb(conn, session_id, loop)
 
             def stream_delta_cb(text: str) -> None:
                 nonlocal streamed_message
                 if text:
                     streamed_message = True
-                raw_stream_delta_cb(text)
+                message_cb(text)
 
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
             try:

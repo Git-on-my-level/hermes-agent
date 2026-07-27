@@ -45,14 +45,11 @@ document.
 
 ## Reviewed upstream synchronization
 
-First inspect `scripts/update-prod-branch.sh`; it is the existing additive
-sync primitive, not a fire-and-forget command. Its declared model is
-`origin/main` as upstream, `fork/main` as the clean mirror, and `fork/prod` as
-the integration branch. It performs explicit per-remote fetches, rebases local
-`main`, may rescue `fork/prod`-only commits, merges into `prod`, and pushes.
-Therefore run it only in a dedicated reviewed lifecycle after an exact-SHA
-preflight and a deliberate dry-run/review; never from a feature worktree or as
-an unattended repair.
+There is deliberately no repository-resident sync script in this candidate.
+The former `scripts/update-prod-branch.sh` was retired because it could
+fetch/rebase/push and assumed a different remote model. This documented,
+reviewed procedure is the replacement: execute any remote update only in a
+separately approved lifecycle, never from a feature worktree or unattended.
 
 For a large sync:
 
@@ -77,8 +74,8 @@ behavior, not an M4-only fork feature.
 
 Before starting source work, repeat the preflight commands above, inspect
 `git status --short`, compare the intended runtime branch with `fork/main`,
-and read `scripts/update-prod-branch.sh` before proposing a sync. Escalate when
-the divergence is material, the remote convention differs, or the intended
+and re-read this procedure before proposing a sync. Escalate when the
+divergence is material, the remote convention differs, or the intended
 baseline is unclear; do not repair it in the background.
 
 ## Documentation verification
