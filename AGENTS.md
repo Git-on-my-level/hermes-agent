@@ -2,6 +2,11 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+> **Fork maintenance is mandatory for source, sync, and deployment work.**
+> Read [FORK.md](FORK.md) before changing remotes, baselines, branches, or
+> deployment source; its safety rules apply even when working from a task
+> worktree.
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
