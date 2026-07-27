@@ -1307,6 +1307,13 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+    delivery_last_error TEXT,
+    delivery_event_id INTEGER,
+    delivery_updated_at INTEGER,
+    delivery_previous_cursor INTEGER,
+    delivery_claimed_at INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2455,6 +2462,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        for column, definition in (
+            ("delivery_state", "delivery_state TEXT NOT NULL DEFAULT 'pending'"),
+            ("delivery_attempt_count", "delivery_attempt_count INTEGER NOT NULL DEFAULT 0"),
+            ("delivery_last_error", "delivery_last_error TEXT"),
+            ("delivery_event_id", "delivery_event_id INTEGER"),
+            ("delivery_updated_at", "delivery_updated_at INTEGER"),
+            ("delivery_previous_cursor", "delivery_previous_cursor INTEGER"),
+            ("delivery_claimed_at", "delivery_claimed_at INTEGER"),
+        ):
+            if column not in notify_cols:
+                _add_column_if_missing(conn, "kanban_notify_subs", column, definition)
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2580,6 +2598,10 @@ _REBUILD_SPECS = {
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " delivery_state TEXT NOT NULL DEFAULT 'pending',"
+        " delivery_attempt_count INTEGER NOT NULL DEFAULT 0,"
+        " delivery_last_error TEXT, delivery_event_id INTEGER, delivery_updated_at INTEGER,"
+        " delivery_previous_cursor INTEGER, delivery_claimed_at INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -9584,6 +9606,86 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
+def record_notify_delivery_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    error: str,
+    attention_required: bool = False,
+) -> int:
+    """Persist a failed terminal notification without consuming its event."""
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_attempt_count FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0
+        attempts = int(row["delivery_attempt_count"] or 0) + (0 if attention_required else 1)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_state = ?, "
+            "delivery_attempt_count = ?, delivery_last_error = ?, "
+            "delivery_event_id = ?, delivery_updated_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                "attention_required" if attention_required else "pending",
+                attempts, str(error)[:1000], int(event_id), now,
+                task_id, platform, chat_id, thread_id or "",
+            ),
+        )
+    return attempts
+
+
+def mark_notify_delivery_attention_required(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    reason: str,
+) -> int:
+    """Persist a no-attempt or exhausted terminal obligation for review."""
+    return record_notify_delivery_failure(
+        conn, task_id=task_id, platform=platform, chat_id=chat_id,
+        thread_id=thread_id, event_id=event_id, error=reason,
+        attention_required=True,
+    )
+
+
+def confirm_notify_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+) -> bool:
+    """Acknowledge one adapter-confirmed event and clear its claim state."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ?, delivery_state = 'pending', "
+            "delivery_attempt_count = 0, delivery_last_error = NULL, "
+            "delivery_event_id = NULL, delivery_previous_cursor = NULL, "
+            "delivery_claimed_at = NULL, delivery_updated_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id >= ?",
+            (
+                int(event_id), int(time.time()), task_id, platform, chat_id,
+                thread_id or "", int(event_id),
+            ),
+        )
+    return cur.rowcount > 0
+
+
 def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -9658,12 +9760,31 @@ def claim_unseen_events_for_sub(
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
+            "SELECT last_event_id, delivery_state, delivery_previous_cursor, delivery_claimed_at "
+            "FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
             return 0, 0, []
+        if row["delivery_state"] == "attention_required":
+            cursor = int(row["last_event_id"])
+            return cursor, cursor, []
+        if row["delivery_state"] == "in_flight":
+            claimed_at = int(row["delivery_claimed_at"] or 0)
+            if claimed_at and int(time.time()) - claimed_at < 60:
+                cursor = int(row["last_event_id"])
+                return cursor, cursor, []
+            prior = int(row["delivery_previous_cursor"] or 0)
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ?, "
+                "delivery_state = 'attention_required', "
+                "delivery_last_error = 'notifier claim expired before adapter send confirmation', "
+                "delivery_updated_at = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (prior, int(time.time()), task_id, platform, chat_id, thread_id or ""),
+            )
+            return prior, prior, []
         old_cursor = int(row["last_event_id"])
         new_cursor, events = unseen_events_for_sub(
             conn,
@@ -9675,11 +9796,20 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
+        # Claim one event only: successful sends become a durable cursor
+        # acknowledgement before a later event can be attempted.
+        events = [events[0]]
+        new_cursor = int(events[0].id)
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, delivery_state = 'in_flight', "
+            "delivery_event_id = ?, delivery_previous_cursor = ?, delivery_claimed_at = ?, "
+            "delivery_updated_at = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            (
+                int(new_cursor), int(new_cursor), int(old_cursor), int(time.time()), int(time.time()),
+                task_id, platform, chat_id, thread_id or "", int(old_cursor),
+            ),
         )
         return old_cursor, new_cursor, events
 
@@ -9695,9 +9825,11 @@ def advance_notify_cursor(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, delivery_state = 'pending', "
+            "delivery_event_id = NULL, delivery_previous_cursor = NULL, "
+            "delivery_claimed_at = NULL, delivery_updated_at = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            (int(new_cursor), int(time.time()), task_id, platform, chat_id, thread_id or ""),
         )
 
 
@@ -9719,11 +9851,13 @@ def rewind_notify_cursor(
     """
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, delivery_state = 'pending', "
+            "delivery_event_id = NULL, delivery_previous_cursor = NULL, "
+            "delivery_claimed_at = NULL, delivery_updated_at = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
             (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(old_cursor), int(time.time()), task_id, platform, chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
         )
