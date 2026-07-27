@@ -6,9 +6,13 @@ description: "A practical guide to setting up and using Hermes voice mode across
 
 # Use Voice Mode with Hermes
 
-This guide is the practical companion to the [Voice Mode feature reference](/docs/user-guide/features/voice-mode).
+This guide is the practical companion to the [Voice Mode feature reference](/user-guide/features/voice-mode).
 
 If the feature page explains what voice mode can do, this guide shows how to actually use it well.
+
+:::tip
+[Nous Portal](/integrations/nous-portal) bundles both the LLM and TTS through one OAuth — voice mode works end-to-end with no extra credentials.
+:::
 
 ## What voice mode is good for
 
@@ -57,19 +61,19 @@ If that is not solid yet, fix text mode first.
 ### CLI microphone + playback
 
 ```bash
-pip install "hermes-agent[voice]"
+cd ~/.hermes/hermes-agent && uv pip install -e ".[voice]"
 ```
 
 ### Messaging platforms
 
 ```bash
-pip install "hermes-agent[messaging]"
+cd ~/.hermes/hermes-agent && uv pip install -e ".[messaging]"
 ```
 
 ### Premium ElevenLabs TTS
 
 ```bash
-pip install "hermes-agent[tts-premium]"
+cd ~/.hermes/hermes-agent && uv pip install -e ".[tts-premium]"
 ```
 
 ### Local NeuTTS (optional)
@@ -81,7 +85,7 @@ python -m pip install -U neutts[all]
 ### Everything
 
 ```bash
-pip install "hermes-agent[all]"
+cd ~/.hermes/hermes-agent && uv pip install -e ".[all]"
 ```
 
 ## Step 3: install system dependencies
@@ -440,7 +444,7 @@ By default, the bot needs an `@mention` in Discord server text channels unless c
 If you want the shortest path to success:
 
 1. get text Hermes working
-2. install `hermes-agent[voice]`
+2. run `hermes setup voice` to enable voice support
 3. use CLI voice mode with local STT + Edge TTS
 4. then enable `/voice on` in Telegram or Discord
 5. only after that, try Discord VC mode
@@ -449,8 +453,8 @@ That progression keeps the debugging surface small.
 
 ## Where to read next
 
-- [Voice Mode feature reference](/docs/user-guide/features/voice-mode)
-- [Messaging Gateway](/docs/user-guide/messaging)
-- [Discord setup](/docs/user-guide/messaging/discord)
-- [Telegram setup](/docs/user-guide/messaging/telegram)
-- [Configuration](/docs/user-guide/configuration)
+- [Voice Mode feature reference](/user-guide/features/voice-mode)
+- [Messaging Gateway](/user-guide/messaging)
+- [Discord setup](/user-guide/messaging/discord)
+- [Telegram setup](/user-guide/messaging/telegram)
+- [Configuration](/user-guide/configuration)

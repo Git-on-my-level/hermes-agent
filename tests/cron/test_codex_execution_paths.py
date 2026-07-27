@@ -74,7 +74,6 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         self._cleanup_task_resources = lambda task_id: None
         self._persist_session = lambda messages, history=None: None
         self._save_trajectory = lambda messages, user_message, completed: None
-        self._save_session_log = lambda messages: None
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         type(self).refresh_attempts += 1
@@ -99,7 +98,7 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
+        lambda requested=None, **kwargs: {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
             "base_url": "https://chatgpt.com/backend-api/codex",

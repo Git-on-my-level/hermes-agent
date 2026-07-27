@@ -19,11 +19,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import (
     GatewayConfig,
-    HomeChannel,
     Platform,
     PlatformConfig,
 )
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 
 
@@ -332,6 +331,8 @@ class TestGitHubCommentDelivery:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         # Delivery info is retained after send() so interim status messages

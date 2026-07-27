@@ -1,6 +1,8 @@
 import { parseSlashCommand } from '../domain/slash.js'
 import type { SlashExecResponse } from '../gatewayTypes.js'
 import { asCommandDispatch, rpcErrorMessage } from '../lib/rpc.js'
+import { launchWidget } from '../sdk/host.js'
+import { getWidgetApp } from '../sdk/registry.js'
 
 import type { SlashHandlerContext } from './interfaces.js'
 import { findSlashCommand } from './slash/registry.js'
@@ -45,25 +47,88 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
       return true
     }
 
-    if (catalog?.canon) {
-      const needle = `/${parsed.name}`.toLowerCase()
+    // Registry-first fallback: widget apps registered AFTER the static
+    // command table was built (user widgets from $HERMES_HOME/tui-widgets,
+    // /widgets-reload) dispatch straight off the live registry.
+    if (getWidgetApp(parsed.name)) {
+      const err = launchWidget(parsed.name, parsed.arg)
 
-      const matches = [
-        ...new Set(
-          Object.entries(catalog.canon)
-            .filter(([alias]) => alias.startsWith(needle))
-            .map(([, canon]) => canon)
-        )
-      ]
-
-      if (matches.length === 1 && matches[0]!.toLowerCase() !== needle) {
-        return handler(`${matches[0]}${argTail}`)
+      if (err) {
+        sys(err)
       }
 
-      if (matches.length > 1) {
-        sys(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
+      return true
+    }
 
-        return true
+    if (catalog?.canon) {
+      const needle = `/${parsed.name}`.toLowerCase()
+      const exact = Object.entries(catalog.canon).find(([alias]) => alias.toLowerCase() === needle)?.[1]
+
+      if (exact) {
+        if (exact.toLowerCase() !== needle) {
+          return handler(`${exact}${argTail}`)
+        }
+      } else {
+        const matches = [
+          ...new Set(
+            Object.entries(catalog.canon)
+              .filter(([alias]) => alias.startsWith(needle))
+              .map(([, canon]) => canon)
+          )
+        ]
+
+        if (matches.length === 1 && matches[0]!.toLowerCase() !== needle) {
+          return handler(`${matches[0]}${argTail}`)
+        }
+
+        if (matches.length > 1) {
+          sys(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
+
+          return true
+        }
+      }
+    }
+
+    const handleDispatch = (raw: unknown): void => {
+      const d = asCommandDispatch(raw)
+
+      if (!d) {
+        return sys('error: invalid response: command.dispatch')
+      }
+
+      if (d.type === 'exec' || d.type === 'plugin') {
+        return sys(d.output || '(no output)')
+      }
+
+      if (d.type === 'alias') {
+        return void handler(`/${d.target}${argTail}`)
+      }
+
+      if (d.type === 'skill') {
+        sys(`⚡ loading skill: ${d.name}`)
+
+        return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: skill payload missing message`)
+      }
+
+      if (d.type === 'send') {
+        if (d.notice?.trim()) {
+          sys(d.notice)
+        }
+
+        return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: empty message`)
+      }
+
+      if (d.type === 'prefill') {
+        // /undo returns prefill: drop the backed-up message text into
+        // the composer so the user can edit and resubmit, instead of
+        // submitting it immediately like 'send'.
+        if (d.notice?.trim()) {
+          sys(d.notice)
+        }
+
+        if (d.message) {
+          ctx.composer.setInput(d.message)
+        }
       }
     }
 
@@ -71,6 +136,10 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
       .then(r => {
         if (stale()) {
           return
+        }
+
+        if (asCommandDispatch(r)) {
+          return handleDispatch(r)
         }
 
         const body = r?.output || `/${parsed.name}: no output`
@@ -86,29 +155,7 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
               return
             }
 
-            const d = asCommandDispatch(raw)
-
-            if (!d) {
-              return sys('error: invalid response: command.dispatch')
-            }
-
-            if (d.type === 'exec' || d.type === 'plugin') {
-              return sys(d.output || '(no output)')
-            }
-
-            if (d.type === 'alias') {
-              return handler(`/${d.target}${argTail}`)
-            }
-
-            if (d.type === 'skill') {
-              sys(`⚡ loading skill: ${d.name}`)
-
-              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: skill payload missing message`)
-            }
-
-            if (d.type === 'send') {
-              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: empty message`)
-            }
+            handleDispatch(raw)
           })
           .catch(guardedErr)
       })

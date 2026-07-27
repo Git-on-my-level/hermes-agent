@@ -10,7 +10,7 @@ import sys
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
-import pytest
+import cli as cli_mod
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -144,6 +144,21 @@ class TestDisplayResumedHistory:
 
         assert "You are a helpful assistant" not in output
 
+    def test_timeline_markers_render_as_events_not_user_input(self):
+        cli = _make_cli()
+        cli.conversation_history = [
+            {"role": "user", "content": "opaque model context", "display_kind": "model_switch"},
+            {"role": "user", "content": "opaque delegation context", "display_kind": "async_delegation_complete"},
+            {"role": "user", "content": "opaque hidden context", "display_kind": "hidden"},
+        ]
+
+        output = self._capture_display(cli)
+
+        assert "◈ model changed" in output
+        assert "◈ background delegation completed" in output
+        assert "You:" not in output
+        assert "opaque" not in output
+
     def test_tool_messages_hidden(self):
         cli = _make_cli()
         cli.conversation_history = _tool_call_history()
@@ -154,13 +169,33 @@ class TestDisplayResumedHistory:
         assert "Page content" not in output
 
     def test_tool_calls_shown_as_summary(self):
-        cli = _make_cli()
+        # Disable tool-only skip so the summary line is rendered for this fixture.
+        cli = _make_cli(config_overrides={"display": {"resume_skip_tool_only": False}})
         cli.conversation_history = _tool_call_history()
-        output = self._capture_display(cli)
+        import cli as _cli_mod
+        # CLI_CONFIG is read at call-time inside _display_resumed_history, so
+        # apply the override for the duration of the capture, not just at init.
+        with patch.dict(_cli_mod.__dict__, {"CLI_CONFIG": {
+            "display": {"resume_skip_tool_only": False, "resume_display": "full"}
+        }}):
+            output = self._capture_display(cli)
 
         assert "2 tool calls" in output
         assert "web_search" in output
         assert "web_extract" in output
+
+    def test_tool_only_message_skipped_by_default(self):
+        """Assistant messages with only tool_calls (no text) are skipped when
+        resume_skip_tool_only=True (the default). The summary line is hidden.
+        """
+        cli = _make_cli()
+        cli.conversation_history = _tool_call_history()
+        output = self._capture_display(cli)
+
+        # The tool-only assistant entry should be skipped
+        assert "2 tool calls" not in output
+        # The final text reply should still appear
+        assert "Here are some great Python tutorials" in output
 
     def test_long_user_message_truncated(self):
         cli = _make_cli()
@@ -285,6 +320,21 @@ class TestDisplayResumedHistory:
         output = self._capture_display(cli)
 
         assert "Previous Conversation" in output
+
+    def test_panel_is_stored_as_resize_aware_history_entry(self):
+        cli = _make_cli()
+        cli.conversation_history = _simple_history()
+        cli_mod._configure_output_history(True, 10)
+        cli_mod._clear_output_history()
+
+        try:
+            output = self._capture_display(cli)
+
+            assert "Previous Conversation" in output
+            assert len(cli_mod._OUTPUT_HISTORY) == 1
+            assert callable(cli_mod._OUTPUT_HISTORY[0])
+        finally:
+            cli_mod._configure_output_history(True, 200)
 
     def test_assistant_with_no_content_no_tools_skipped(self):
         """Assistant messages with no visible output (e.g. pure reasoning)
@@ -521,8 +571,7 @@ class TestPreloadResumedSession:
     def test_returns_false_when_session_has_no_messages(self):
         cli = _make_cli(resume="empty_session")
         mock_db = MagicMock()
-        mock_db.get_session.return_value = {"id": "empty_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = []
+        mock_db.get_resume_conversations.return_value = ([], [])
         cli._session_db = mock_db
 
         buf = StringIO()
@@ -538,7 +587,7 @@ class TestPreloadResumedSession:
         messages = _simple_history()
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
-        mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.get_resume_conversations.return_value = (messages, messages)
         cli._session_db = mock_db
 
         buf = StringIO()
@@ -558,7 +607,7 @@ class TestPreloadResumedSession:
         messages = [{"role": "user", "content": "hi"}]
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.get_resume_conversations.return_value = (messages, messages)
         mock_conn = MagicMock()
         mock_db._conn = mock_conn
         cli._session_db = mock_db
@@ -582,7 +631,7 @@ class TestPreloadResumedSession:
         ]
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "one_msg_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.get_resume_conversations.return_value = (messages, messages)
         mock_db._conn = MagicMock()
         cli._session_db = mock_db
 
@@ -593,6 +642,89 @@ class TestPreloadResumedSession:
         output = buf.getvalue()
         assert "1 user message," in output
         assert "1 user messages" not in output
+
+
+# ── Tests for _handle_resume_command recap display ───────────────────
+
+
+class TestHandleResumeCommandRecap:
+    """In-session /resume should show the same recap panel as startup resume."""
+
+    def test_resume_command_displays_recap_when_messages_restored(self):
+        cli = _make_cli()
+        cli.session_id = "current_session"
+        messages = _simple_history()
+
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "target_session", "title": "Test Session"}
+        mock_db.get_resume_conversations.return_value = (messages, messages)
+        # resolve_resume_session_id passes the id through when no compression chain.
+        mock_db.resolve_resume_session_id.return_value = "target_session"
+        cli._session_db = mock_db
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="target_session"),
+            patch.object(cli, "_display_resumed_history") as display_mock,
+        ):
+            cli._handle_resume_command("/resume test session")
+
+        assert cli.session_id == "target_session"
+        assert cli.conversation_history == messages
+        assert cli._resume_display_history == messages
+        mock_db.end_session.assert_called_once_with("current_session", "resumed_other")
+        mock_db.reopen_session.assert_called_once_with("target_session")
+        display_mock.assert_called_once_with()
+
+    def test_resume_command_skips_recap_when_session_has_no_messages(self):
+        cli = _make_cli()
+        cli.session_id = "current_session"
+
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "target_session", "title": None}
+        mock_db.get_resume_conversations.return_value = ([], [])
+        mock_db.resolve_resume_session_id.return_value = "target_session"
+        cli._session_db = mock_db
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="target_session"),
+            patch.object(cli, "_display_resumed_history") as display_mock,
+        ):
+            cli._handle_resume_command("/resume target_session")
+
+        display_mock.assert_not_called()
+
+    def test_resume_command_replaces_stale_display_history(self):
+        """In-session /resume B after startup --resume A must show B's recap,
+        not A's. The _resume_display_history attribute set by startup resume
+        must be replaced, not retained."""
+        cli = _make_cli(resume="session_a")
+        cli.session_id = "session_a"
+        # Simulate startup --resume A having populated both projections.
+        messages_a = [{"role": "user", "content": "from session A"}]
+        cli.conversation_history = messages_a
+        cli._resume_display_history = messages_a
+
+        messages_b = [{"role": "user", "content": "from session B"}]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "session_b", "title": "Session B"}
+        mock_db.get_resume_conversations.return_value = (messages_b, messages_b)
+        mock_db.resolve_resume_session_id.return_value = "session_b"
+        cli._session_db = mock_db
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="session_b"),
+            patch.object(cli, "_display_resumed_history") as display_mock,
+        ):
+            cli._handle_resume_command("/resume session_b")
+
+        assert cli.session_id == "session_b"
+        assert cli.conversation_history == messages_b
+        # The stale A display history must have been replaced by B's.
+        assert cli._resume_display_history == messages_b
+        assert "from session A" not in [
+            m.get("content", "") for m in cli._resume_display_history
+        ]
+        display_mock.assert_called_once_with()
 
 
 # ── Integration: _init_agent skips when preloaded ────────────────────
@@ -634,7 +766,6 @@ class TestResumeDisplayConfig:
 
     def test_cli_defaults_have_resume_display(self):
         """cli.py load_cli_config defaults include resume_display."""
-        import cli as _cli_mod
         from cli import load_cli_config
 
         with (
@@ -645,3 +776,47 @@ class TestResumeDisplayConfig:
 
         display = config.get("display", {})
         assert display.get("resume_display") == "full"
+
+
+class TestResumeDisplaySanitization:
+    """Stored history replayed by /resume must not carry raw terminal
+    escapes or control chars (openai/codex#31494 bug class)."""
+
+    def _capture_display(self, cli_obj):
+        buf = StringIO()
+        cli_obj.console.file = buf
+        cli_obj._display_resumed_history()
+        return buf.getvalue()
+
+    def test_escape_sequences_stripped_from_user_and_assistant(self):
+        cli = _make_cli()
+        cli.conversation_history = [
+            {"role": "user", "content": "hi \x1b[2J\x1b]0;pwned\x07 there"},
+            {"role": "assistant", "content": "ok \x9b31m fine\x07"},
+        ]
+        output = self._capture_display(cli)
+        # Rich adds its own SGR styling escapes when force_terminal is on;
+        # what must NOT survive are the injected non-SGR sequences.
+        assert "\x1b[2J" not in output
+        assert "\x1b]0;pwned" not in output
+        assert "\x9b" not in output
+        assert "\x07" not in output
+        assert "hi" in output and "there" in output
+        assert "fine" in output
+
+    def test_multimodal_text_part_sanitized(self):
+        cli = _make_cli()
+        cli.conversation_history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look \x1b[3J\x1b[H at this"},
+                    {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                ],
+            },
+            {"role": "assistant", "content": "sure"},
+        ]
+        output = self._capture_display(cli)
+        assert "\x1b[3J" not in output
+        assert "\x1b[H" not in output
+        assert "[image]" in output

@@ -33,10 +33,10 @@ It intentionally excludes things that do not fit typical editor UX, such as mess
 
 ## Installation
 
-Install Hermes normally, then add the ACP extra:
+Install Hermes normally, then add the ACP extra from the install checkout:
 
 ```bash
-pip install -e '.[acp]'
+cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'
 ```
 
 This installs the `agent-client-protocol` dependency and enables:
@@ -63,28 +63,65 @@ python -m acp_adapter
 
 Hermes logs to stderr so stdout remains reserved for ACP JSON-RPC traffic.
 
+For non-interactive checks:
+
+```bash
+hermes acp --version
+hermes acp --check
+```
+
+### Browser tools (optional)
+
+Browser tools (`browser_navigate`, `browser_click`, etc.) depend on the
+`agent-browser` npm package and Chromium, which aren't part of the Python
+wheel. Install them with:
+
+```bash
+hermes acp --setup-browser           # interactive (prompts before ~400 MB download)
+hermes acp --setup-browser --yes     # accept the download non-interactively
+```
+
+This is the standalone command. The terminal-auth flow (`hermes acp --setup`) also offers the browser bootstrap as a follow-up question after model selection, so most users never need to run `--setup-browser` directly.
+
+What it does:
+
+- Installs Node.js 22 LTS into `~/.hermes/node/` if missing
+- `npm install -g agent-browser @askjo/camofox-browser` into that prefix (no sudo needed — `npm`'s `--prefix` points at the user-writable Hermes-managed Node)
+- Installs Playwright Chromium, or uses a detected system Chrome/Chromium when available
+
+The bootstrap is idempotent — re-running it is fast and skips work that's already done.
+
 ## Editor setup
 
 ### VS Code
 
-Install an ACP client extension, then point it at the repo's `acp_registry/` directory.
+Install the [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client) extension.
 
-Example settings snippet:
+To connect:
+
+1. Open the ACP Client panel from the Activity Bar.
+2. Select **Hermes Agent** from the built-in agent list.
+3. Connect and start chatting.
+
+If you want to define Hermes manually, add it through VS Code settings under `acp.agents`:
 
 ```json
 {
-  "acpClient.agents": [
-    {
-      "name": "hermes-agent",
-      "registryDir": "/path/to/hermes-agent/acp_registry"
+  "acp.agents": {
+    "Hermes Agent": {
+      "command": "hermes",
+      "args": ["acp"]
     }
-  ]
+  }
 }
 ```
 
 ### Zed
 
-Example settings snippet:
+Configure Hermes as a custom agent server in Zed settings:
+
+1. Open the Agent Panel.
+2. Add a custom agent server with the following configuration:
 
 ```json
 {
@@ -92,33 +129,21 @@ Example settings snippet:
     "hermes-agent": {
       "type": "custom",
       "command": "hermes",
-      "args": ["acp"],
-    },
-  },
+      "args": ["acp"]
+    }
+  }
 }
 ```
 
+3. Start a new Hermes external-agent thread.
+
+Prerequisites:
+
+- Configure Hermes provider credentials first with `hermes model`, or set them in `~/.hermes/.env` / `~/.hermes/config.yaml`.
+
 ### JetBrains
 
-Use an ACP-compatible plugin and point it at:
-
-```text
-/path/to/hermes-agent/acp_registry
-```
-
-## Registry manifest
-
-The ACP registry manifest lives at:
-
-```text
-acp_registry/agent.json
-```
-
-It advertises a command-based agent whose launch command is:
-
-```text
-hermes acp
-```
+Use an ACP-compatible plugin and point it at `hermes acp` or `hermes-acp`.
 
 ## Configuration and credentials
 
@@ -129,7 +154,29 @@ ACP mode uses the same Hermes configuration as the CLI:
 - `~/.hermes/skills/`
 - `~/.hermes/state.db`
 
-Provider resolution uses Hermes' normal runtime resolver, so ACP inherits the currently configured provider and credentials.
+Provider resolution uses Hermes' normal runtime resolver, so ACP inherits the currently configured provider and credentials. Hermes also advertises a terminal auth method (`--setup`) for first-run ACP clients; this opens Hermes' interactive model/provider setup.
+
+## Host integration
+
+These variables are set by an **ACP host process** (an editor or another agent
+harness) on the Hermes subprocess it spawns. They are not user configuration —
+do not set them by hand in `.env` or `config.yaml`.
+
+| Variable | Value | Effect |
+|----------|-------|--------|
+| `HERMES_ACP_SKIP_CONFIGURED_MCP` | `1` | Skip starting the **globally configured** MCP servers from `config.yaml` before the ACP JSON-RPC loop begins. |
+
+Hermes normally starts every MCP server configured in `config.yaml` before it
+enters the ACP JSON-RPC loop. A host that owns MCP itself — passing the
+session's servers explicitly through `session/new` — does not need that global
+startup, and an unrelated slow or interactive MCP server would otherwise delay
+`initialize`. Setting the marker to exactly `1` lets such a host skip it.
+
+Only the global `config.yaml` discovery is skipped. **MCP servers supplied by
+the ACP session through `session/new` are still registered**, so a host loses
+no capability it asked for. Any other value (unset, empty, `0`, `false`) keeps
+the default behavior, so an unrelated truthy-looking string cannot silently
+disable MCP.
 
 ## Session behavior
 
@@ -159,35 +206,51 @@ Dangerous terminal commands can be routed back to the editor as approval prompts
 
 On timeout or error, the approval bridge denies the request.
 
+### Session-scoped edit auto-approval
+
+ACP exposes a third tier between *allow once* and *allow always*: **Allow for session**. Picking it from the editor's permission prompt records the approval inside the current ACP session only — every subsequent matching command in that session goes through without prompting, but a new ACP session (or restarting the editor) resets the slate and re-prompts the first time.
+
+| Option | Editor label | Scope | Persisted across restarts |
+|---|---|---|---|
+| `allow_once` | Allow once | This one tool call | No |
+| `allow_session` | Allow for session | All matching calls in this ACP session | No — cleared when the session ends |
+| `allow_always` | Allow always | All future sessions | Yes (written to the Hermes permanent allowlist) |
+| `deny` | Deny | This one tool call | No |
+
+`allow_session` is the right default for an editor workflow where you trust an agent for the duration of a task but don't want to grant a long-lived allowlist entry. The safety trade-off is straightforward: the broader the scope, the less the editor will interrupt you, and the more damage a misbehaving agent (or prompt injection) can do before you notice. Start with `allow_once` for unfamiliar commands; promote to `allow_session` once you've seen the agent run the same pattern correctly a few times; reserve `allow_always` for truly idempotent commands you trust forever (e.g. `git status`).
+
+The ACP bridge maps these options onto Hermes' internal approval semantics — `allow_always` writes a permanent allowlist entry the same way the CLI does, while `allow_session` only affects the in-process approval cache for the current ACP session.
+
 ## Troubleshooting
 
 ### ACP agent does not appear in the editor
 
 Check:
 
-- the editor is pointed at the correct `acp_registry/` path
-- Hermes is installed and on your PATH
-- the ACP extra is installed (`pip install -e '.[acp]'`)
+- For manual/local development, verify the custom `agent_servers` command points to `hermes acp`.
+- Hermes is installed and on your PATH.
+- The ACP extra is installed (`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`).
 
 ### ACP starts but immediately errors
 
 Try these checks:
 
 ```bash
+hermes acp --version
+hermes acp --check
 hermes doctor
 hermes status
-hermes acp
 ```
 
 ### Missing credentials
 
-ACP mode does not have its own login flow. It uses Hermes' existing provider setup. Configure credentials with:
+ACP mode uses Hermes' existing provider setup. Configure credentials with:
 
 ```bash
 hermes model
 ```
 
-or by editing `~/.hermes/.env`.
+or by editing `~/.hermes/.env`. The terminal auth flow (`hermes acp --setup`) can also trigger the interactive provider/model setup.
 
 ## See also
 

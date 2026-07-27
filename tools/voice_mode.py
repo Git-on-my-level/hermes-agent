@@ -6,7 +6,7 @@ sounddevice or system audio players.
 
 Dependencies (optional):
     pip install sounddevice numpy
-    or: pip install hermes-agent[voice]
+    or: uv sync --extra voice
 """
 
 import logging
@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import wave
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +72,10 @@ def _termux_api_app_installed() -> bool:
         result = subprocess.run(
             ["pm", "list", "packages", "com.termux.api"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=5,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
         return "package:com.termux.api" in (result.stdout or "")
     except Exception:
@@ -83,6 +84,59 @@ def _termux_api_app_installed() -> bool:
 
 def _termux_voice_capture_available() -> bool:
     return _termux_microphone_command() is not None and _termux_api_app_installed()
+
+
+def _pulse_socket_reachable() -> bool:
+    """Return True if a PulseAudio/PipeWire socket is reachable on disk.
+
+    Covers the common case where a sound server runs locally (e.g. on a
+    remote SSH host) without ``PULSE_SERVER``/``PIPEWIRE_REMOTE`` being set --
+    the client just connects to the default socket under the runtime dir.
+    We look at ``PULSE_SERVER`` unix paths, ``PULSE_RUNTIME_PATH``, and
+    ``XDG_RUNTIME_DIR`` for a ``pulse/native`` or ``pipewire-0`` socket
+    (issue #35622).
+    """
+    import socket
+    import stat
+
+    candidates: List[str] = []
+
+    pulse_server = os.environ.get('PULSE_SERVER', '')
+    # PULSE_SERVER may be "unix:/path", "unix:/path;..." or a bare path.
+    for part in pulse_server.split(';'):
+        part = part.strip()
+        if part.startswith('unix:'):
+            candidates.append(part[len('unix:'):])
+
+    pulse_runtime = os.environ.get('PULSE_RUNTIME_PATH')
+    if pulse_runtime:
+        candidates.append(os.path.join(pulse_runtime, 'native'))
+
+    xdg_runtime = os.environ.get('XDG_RUNTIME_DIR')
+    if xdg_runtime:
+        candidates.append(os.path.join(xdg_runtime, 'pulse', 'native'))
+        candidates.append(os.path.join(xdg_runtime, 'pipewire-0'))
+
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            if not stat.S_ISSOCK(os.stat(path).st_mode):
+                continue
+        except OSError:
+            continue
+        # Confirm the socket actually accepts a connection -- a stale socket
+        # file left by a dead server should not count as reachable.
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(0.5)
+            sock.connect(path)
+            return True
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return False
 
 
 def detect_audio_environment() -> dict:
@@ -97,20 +151,49 @@ def detect_audio_environment() -> dict:
     termux_mic_cmd = _termux_microphone_command()
     termux_app_installed = _termux_api_app_installed()
     termux_capture = bool(termux_mic_cmd and termux_app_installed)
+    has_forwarded_audio = bool(
+        os.environ.get('PULSE_SERVER')
+        or os.environ.get('PIPEWIRE_REMOTE')
+        or _pulse_socket_reachable()
+    )
 
-    # SSH detection
+    # SSH detection -- normally no audio devices, but honor a reachable
+    # sound server (PulseAudio/PipeWire socket or forwarding env vars), which
+    # works fine over SSH (issue #35622).
     if any(os.environ.get(v) for v in ('SSH_CLIENT', 'SSH_TTY', 'SSH_CONNECTION')):
-        warnings.append("Running over SSH -- no audio devices available")
+        if has_forwarded_audio:
+            notices.append("Running over SSH with a reachable PulseAudio/PipeWire sound server")
+        else:
+            warnings.append(
+                "Running over SSH -- no audio devices available.\n"
+                "  If a sound server (PulseAudio/PipeWire) is running on this host,\n"
+                "  point Hermes at it, e.g.:\n"
+                "    export XDG_RUNTIME_DIR=/run/user/$(id -u)\n"
+                "    # or: export PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native"
+            )
 
-    # Docker/Podman container detection
+    # Docker/Podman container detection — honor host audio forwarding.
+    # When the user mounts a PulseAudio/PipeWire socket into the container
+    # and points PULSE_SERVER / PIPEWIRE_REMOTE at it, audio works fine
+    # (issue #21203).  Only block when no forwarding is configured.
     from hermes_constants import is_container
     if is_container():
-        warnings.append("Running inside Docker container -- no audio devices")
+        if has_forwarded_audio:
+            notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
+        else:
+            warnings.append(
+                "Running inside container (Docker/Podman/LXC) -- no audio devices.\n"
+                "  Forward host audio with one of (substitute $XDG_RUNTIME_DIR for your runtime dir,\n"
+                "  typically /run/user/$UID):\n"
+                "    PulseAudio:  -v $XDG_RUNTIME_DIR/pulse/native:$XDG_RUNTIME_DIR/pulse/native \\\n"
+                "                 -e PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native\n"
+                "    PipeWire:    -e PIPEWIRE_REMOTE=$XDG_RUNTIME_DIR/pipewire-0"
+            )
 
     # WSL detection — PulseAudio bridge makes audio work in WSL.
     # Only block if PULSE_SERVER is not configured.
     try:
-        with open('/proc/version', 'r') as f:
+        with open('/proc/version', 'r', encoding="utf-8") as f:
             if 'microsoft' in f.read().lower():
                 if os.environ.get('PULSE_SERVER'):
                     notices.append("Running in WSL with PulseAudio bridge")
@@ -130,15 +213,22 @@ def detect_audio_environment() -> dict:
         try:
             devices = sd.query_devices()
             if not devices:
-                if termux_capture:
+                if has_forwarded_audio:
+                    notices.append(
+                        "No PortAudio devices detected but host audio forwarding is configured -- continuing"
+                    )
+                elif termux_capture:
                     notices.append("No PortAudio devices detected, but Termux:API microphone capture is available")
                 else:
                     warnings.append("No audio input/output devices detected")
         except Exception:
             # In WSL with PulseAudio, device queries can fail even though
-            # recording/playback works fine. Don't block if PULSE_SERVER is set.
-            if os.environ.get('PULSE_SERVER'):
-                notices.append("Audio device query failed but PULSE_SERVER is set -- continuing")
+            # recording/playback works fine. Don't block if host audio
+            # forwarding is configured.
+            if has_forwarded_audio:
+                notices.append(
+                    "Audio device query failed but host audio forwarding is configured -- continuing"
+                )
             elif termux_capture:
                 notices.append("PortAudio device query failed, but Termux:API microphone capture is available")
             else:
@@ -299,7 +389,7 @@ class TermuxAudioRecorder:
             "-c", str(CHANNELS),
         ]
         try:
-            subprocess.run(command, capture_output=True, text=True, timeout=15, check=True)
+            subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15, check=True, stdin=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             details = (e.stderr or e.stdout or str(e)).strip()
             raise RuntimeError(f"Termux microphone start failed: {details}") from e
@@ -316,7 +406,7 @@ class TermuxAudioRecorder:
         mic_cmd = _termux_microphone_command()
         if not mic_cmd:
             return
-        subprocess.run([mic_cmd, "-q"], capture_output=True, text=True, timeout=15, check=False)
+        subprocess.run([mic_cmd, "-q"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15, check=False, stdin=subprocess.DEVNULL)
 
     def stop(self) -> Optional[str]:
         with self._lock:
@@ -456,8 +546,7 @@ class AudioRecorder:
             # Compute RMS for level display and silence detection
             rms = int(np.sqrt(np.mean(indata.astype(np.float64) ** 2)))
             self._current_rms = rms
-            if rms > self._peak_rms:
-                self._peak_rms = rms
+            self._peak_rms = max(self._peak_rms, rms)
 
             # Silence detection
             if self._on_silence_stop is not None:
@@ -799,16 +888,133 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
     Returns:
         Dict with ``success``, ``transcript``, and optionally ``error``.
     """
-    from tools.transcription_tools import transcribe_audio
+    from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
 
-    result = transcribe_audio(wav_path, model=model)
+    if _should_chunk_for_transcription(wav_path, MAX_FILE_SIZE):
+        result = _transcribe_wav_in_chunks(wav_path, model=model, max_file_size=MAX_FILE_SIZE)
+    else:
+        result = transcribe_audio(wav_path, model=model)
 
     # Filter out Whisper hallucinations (common on silent/near-silent audio)
     if result.get("success") and is_whisper_hallucination(result.get("transcript", "")):
         logger.info("Filtered Whisper hallucination: %r", result["transcript"])
         return {"success": True, "transcript": "", "filtered": True}
 
+    # Providers that flag no_speech (empty transcript) failed to hear words,
+    # not to transcribe — treat like silence so the voice loop re-listens
+    # quietly instead of surfacing "Transcription failed".
+    if result.get("no_speech"):
+        return {"success": True, "transcript": "", "no_speech": True}
+
     return result
+
+
+def _should_chunk_for_transcription(file_path: str, max_file_size: int) -> bool:
+    """Return whether a CLI WAV recording needs to be split before STT."""
+    if not file_path.lower().endswith(".wav"):
+        return False
+    try:
+        return os.path.getsize(file_path) > max_file_size
+    except OSError:
+        return False
+
+
+def _transcribe_wav_in_chunks(
+    wav_path: str,
+    *,
+    model: Optional[str],
+    max_file_size: int,
+) -> Dict[str, Any]:
+    """Split an oversized WAV into provider-sized chunks and join transcripts."""
+    from tools.transcription_tools import transcribe_audio
+
+    chunk_paths: List[str] = []
+    transcripts: List[str] = []
+
+    try:
+        chunk_paths = _split_wav_for_transcription(wav_path, max_file_size=max_file_size)
+        if not chunk_paths:
+            return {"success": False, "transcript": "", "error": "No audio chunks were created"}
+
+        logger.info("Transcribing oversized WAV in %d chunks: %s", len(chunk_paths), wav_path)
+        for index, chunk_path in enumerate(chunk_paths, start=1):
+            result = transcribe_audio(chunk_path, model=model)
+            if not result.get("success"):
+                error = result.get("error", "Unknown transcription error")
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"Chunk {index}/{len(chunk_paths)} failed: {error}",
+                }
+
+            transcript = result.get("transcript", "").strip()
+            if transcript and not is_whisper_hallucination(transcript):
+                transcripts.append(transcript)
+
+        return {
+            "success": True,
+            "transcript": " ".join(transcripts).strip(),
+            "provider": result.get("provider"),
+            "chunks": len(chunk_paths),
+        }
+    except Exception as e:
+        logger.error("Chunked transcription failed for %s: %s", wav_path, e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Chunked transcription failed: {e}"}
+    finally:
+        for chunk_path in chunk_paths:
+            try:
+                if os.path.isfile(chunk_path):
+                    os.unlink(chunk_path)
+            except OSError:
+                pass
+
+
+def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[str]:
+    """Write WAV chunks small enough to pass the shared STT file-size gate."""
+    os.makedirs(_TEMP_DIR, exist_ok=True)
+    chunk_paths: List[str] = []
+    header_reserve = 64 * 1024
+
+    with wave.open(wav_path, "rb") as source:
+        params = source.getparams()
+        block_align = max(1, params.nchannels * params.sampwidth)
+        max_data_bytes = max_file_size - header_reserve
+        if max_data_bytes < block_align:
+            raise ValueError("STT max_file_size is too small for WAV chunking")
+
+        frames_per_chunk = max(1, max_data_bytes // block_align)
+        index = 0
+        while True:
+            frames = source.readframes(frames_per_chunk)
+            if not frames:
+                break
+
+            index += 1
+            temp = tempfile.NamedTemporaryFile(
+                prefix=f"{os.path.splitext(os.path.basename(wav_path))[0]}_chunk{index:03d}_",
+                suffix=".wav",
+                dir=_TEMP_DIR,
+                delete=False,
+            )
+            chunk_path = temp.name
+            temp.close()
+
+            try:
+                with wave.open(chunk_path, "wb") as chunk:
+                    chunk.setnchannels(params.nchannels)
+                    chunk.setsampwidth(params.sampwidth)
+                    chunk.setframerate(params.framerate)
+                    chunk.setcomptype(params.comptype, params.compname)
+                    chunk.writeframes(frames)
+                chunk_paths.append(chunk_path)
+            except Exception:
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+                raise
+
+    return chunk_paths
 
 
 # ============================================================================
@@ -896,7 +1102,7 @@ def play_audio_file(file_path: str) -> bool:
         exe = shutil.which(cmd[0])
         if exe:
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
                 with _playback_lock:
                     _active_playback = proc
                 proc.wait(timeout=300)
@@ -916,6 +1122,94 @@ def play_audio_file(file_path: str) -> bool:
 
     logger.warning("No audio player available for %s", file_path)
     return False
+
+
+# ============================================================================
+# Barge-in — detect the user speaking over TTS playback
+# ============================================================================
+def listen_for_speech(
+    should_stop: Callable[[], bool],
+    threshold: Optional[int] = None,
+    sustained_ms: int = 300,
+    calibration_ms: int = 400,
+    capture: bool = False,
+    on_trigger: Optional[Callable[[], None]] = None,
+    pre_roll_ms: int = 1200,
+    endpoint_silence_ms: int = 1250,
+    max_utterance_ms: int = 30_000,
+):
+    """Block until sustained speech is heard on the mic, or *should_stop*.
+
+    Barge-in monitor: run in a side thread while TTS is playing. Without
+    *capture* it returns ``True`` when the user started talking (cut playback).
+    With ``capture=True`` it ALSO records the interruption — a rolling
+    *pre_roll_ms* buffer means the utterance is kept from its first syllable,
+    not from the moment detection tripped — and keeps rolling until the user
+    goes quiet for *endpoint_silence_ms*, then returns the WAV path (or
+    ``None`` if speech never tripped). *on_trigger* fires at the moment of
+    detection so the caller can stop playback while capture continues.
+
+    The noise floor is calibrated from the first *calibration_ms* of input —
+    playback is already audible then, so speaker bleed is baked into the
+    floor and only louder-than-playback speech trips the trigger. Requiring
+    *sustained_ms* of consecutive above-threshold blocks filters out coughs,
+    keyboard thumps, and playback transients.
+    """
+    try:
+        sd, np = _import_audio()
+    except (ImportError, OSError):
+        return None if capture else False
+
+    from collections import deque
+
+    block = int(SAMPLE_RATE * 0.03)  # 30ms blocks
+    calib_blocks = max(1, calibration_ms // 30)
+    trip_blocks = max(1, sustained_ms // 30)
+    endpoint_blocks = max(1, endpoint_silence_ms // 30)
+    max_blocks = max(1, max_utterance_ms // 30)
+    floor_samples: List[float] = []
+    pre_roll: deque = deque(maxlen=max(1, pre_roll_ms // 30))
+    consecutive = 0
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=block) as stream:
+            while not should_stop():
+                data, _ = stream.read(block)
+                rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
+                if capture:
+                    pre_roll.append(data.copy())
+                if len(floor_samples) < calib_blocks:
+                    floor_samples.append(rms)
+                    continue
+                trigger = max(float(threshold or SILENCE_RMS_THRESHOLD * 2), float(np.median(floor_samples)) * 3.5)
+                consecutive = consecutive + 1 if rms >= trigger else 0
+                if consecutive < trip_blocks:
+                    continue
+
+                # Tripped — the user is talking over playback.
+                if on_trigger:
+                    try:
+                        on_trigger()
+                    except Exception as e:
+                        logger.debug("Barge-in trigger callback failed: %s", e)
+                if not capture:
+                    return True
+
+                # Keep rolling until the user goes quiet. Playback is stopped
+                # now, so plain silence endpointing (recorder threshold) works.
+                frames: List[Any] = list(pre_roll)
+                quiet = 0
+                for _ in range(max_blocks):
+                    data, _ = stream.read(block)
+                    frames.append(data.copy())
+                    rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
+                    quiet = quiet + 1 if rms < SILENCE_RMS_THRESHOLD else 0
+                    if quiet >= endpoint_blocks:
+                        break
+                return AudioRecorder._write_wav(np.concatenate(frames, axis=0))
+    except Exception as e:
+        logger.debug("Barge-in listener failed: %s", e)
+    return None if capture else False
 
 
 # ============================================================================
@@ -965,7 +1259,8 @@ def check_voice_requirements() -> Dict[str, Any]:
         details_parts.append("STT provider: OK (OpenAI)")
     else:
         details_parts.append(
-            "STT provider: MISSING (pip install faster-whisper, "
+            "STT provider: MISSING (uv pip install faster-whisper — "
+            "`pip install faster-whisper` also works if pip is on PATH, "
             "or set GROQ_API_KEY / VOICE_TOOLS_OPENAI_KEY)"
         )
 

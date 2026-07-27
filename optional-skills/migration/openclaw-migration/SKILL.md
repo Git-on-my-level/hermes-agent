@@ -1,9 +1,10 @@
 ---
 name: openclaw-migration
-description: Migrate a user's OpenClaw customization footprint into Hermes Agent. Imports Hermes-compatible memories, SOUL.md, command allowlists, user skills, and selected workspace assets from ~/.openclaw, then reports exactly what could not be migrated and why.
+description: Import an OpenClaw setup (memories, skills) into Hermes.
 version: 1.0.0
 author: Hermes Agent (Nous Research)
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [Migration, OpenClaw, Hermes, Memory, Persona, Import]
@@ -37,7 +38,7 @@ It uses `scripts/openclaw_to_hermes.py` to:
 - import `SOUL.md` into the Hermes home directory as `SOUL.md`
 - transform OpenClaw `MEMORY.md` and `USER.md` into Hermes memory entries
 - merge OpenClaw command approval patterns into Hermes `command_allowlist`
-- migrate Hermes-compatible messaging settings such as `TELEGRAM_ALLOWED_USERS` and `MESSAGING_CWD`
+- migrate Hermes-compatible messaging settings such as `TELEGRAM_ALLOWED_USERS`, and map OpenClaw workspace settings to Hermes working-directory configuration
 - copy OpenClaw skills into `~/.hermes/skills/openclaw-imports/`
 - optionally copy the OpenClaw workspace instructions file into a chosen Hermes workspace
 - mirror compatible workspace assets such as `workspace/tts/` into `~/.hermes/tts/`

@@ -251,3 +251,186 @@ class TestAuxiliaryClientIntegration:
         monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
         result = aux._try_nous()
         assert result == (None, None)
+
+
+class TestIsGenuineNousRateLimit:
+    """Tell a real account-level 429 apart from an upstream-capacity 429.
+
+    Nous Portal multiplexes upstreams (DeepSeek, Kimi, MiMo, Hermes).
+    A 429 from an upstream out of capacity should NOT trip the
+    cross-session breaker; a real user-quota 429 should.
+    """
+
+    def test_exhausted_hourly_bucket_in_429_headers_is_genuine(self):
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        headers = {
+            "x-ratelimit-limit-requests-1h": "800",
+            "x-ratelimit-remaining-requests-1h": "0",
+            "x-ratelimit-reset-requests-1h": "3100",
+            "x-ratelimit-limit-requests": "200",
+            "x-ratelimit-remaining-requests": "198",
+            "x-ratelimit-reset-requests": "40",
+        }
+        assert is_genuine_nous_rate_limit(headers=headers) is True
+
+    def test_exhausted_tokens_bucket_is_genuine(self):
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        headers = {
+            "x-ratelimit-limit-tokens": "800000",
+            "x-ratelimit-remaining-tokens": "0",
+            "x-ratelimit-reset-tokens": "45",  # < 60s threshold -> not genuine
+            "x-ratelimit-limit-tokens-1h": "8000000",
+            "x-ratelimit-remaining-tokens-1h": "0",
+            "x-ratelimit-reset-tokens-1h": "1800",  # >= 60s threshold -> genuine
+        }
+        assert is_genuine_nous_rate_limit(headers=headers) is True
+
+    def test_healthy_headers_on_429_are_upstream_capacity(self):
+        # Classic upstream-capacity symptom: Nous edge reports plenty of
+        # headroom on every bucket, but returns 429 anyway because
+        # upstream (DeepSeek / Kimi / ...) is out of capacity.
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        headers = {
+            "x-ratelimit-limit-requests": "200",
+            "x-ratelimit-remaining-requests": "198",
+            "x-ratelimit-reset-requests": "40",
+            "x-ratelimit-limit-requests-1h": "800",
+            "x-ratelimit-remaining-requests-1h": "750",
+            "x-ratelimit-reset-requests-1h": "3100",
+            "x-ratelimit-limit-tokens": "800000",
+            "x-ratelimit-remaining-tokens": "790000",
+            "x-ratelimit-reset-tokens": "40",
+            "x-ratelimit-limit-tokens-1h": "8000000",
+            "x-ratelimit-remaining-tokens-1h": "7800000",
+            "x-ratelimit-reset-tokens-1h": "3100",
+        }
+        assert is_genuine_nous_rate_limit(headers=headers) is False
+
+    def test_bare_429_with_no_headers_is_upstream(self):
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        assert is_genuine_nous_rate_limit(headers=None) is False
+        assert is_genuine_nous_rate_limit(headers={}) is False
+        assert is_genuine_nous_rate_limit(
+            headers={"content-type": "application/json"}
+        ) is False
+
+    def test_exhausted_bucket_with_short_reset_is_not_genuine(self):
+        # remaining == 0 but reset in < 60s: almost certainly a
+        # secondary per-minute throttle that will clear immediately --
+        # not worth tripping the cross-session breaker.
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        headers = {
+            "x-ratelimit-limit-requests": "200",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "30",
+        }
+        assert is_genuine_nous_rate_limit(headers=headers) is False
+
+    def test_last_known_state_with_exhausted_bucket_triggers_genuine(self):
+        # Headers on the 429 lack rate-limit info, but the previous
+        # successful response already showed the hourly bucket
+        # exhausted -- the 429 is almost certainly that limit
+        # continuing.
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+        from agent.rate_limit_tracker import parse_rate_limit_headers
+
+        prior_headers = {
+            "x-ratelimit-limit-requests-1h": "800",
+            "x-ratelimit-remaining-requests-1h": "0",
+            "x-ratelimit-reset-requests-1h": "2000",
+            "x-ratelimit-limit-requests": "200",
+            "x-ratelimit-remaining-requests": "100",
+            "x-ratelimit-reset-requests": "30",
+            "x-ratelimit-limit-tokens": "800000",
+            "x-ratelimit-remaining-tokens": "700000",
+            "x-ratelimit-reset-tokens": "30",
+            "x-ratelimit-limit-tokens-1h": "8000000",
+            "x-ratelimit-remaining-tokens-1h": "7000000",
+            "x-ratelimit-reset-tokens-1h": "2000",
+        }
+        last_state = parse_rate_limit_headers(prior_headers, provider="nous")
+        assert is_genuine_nous_rate_limit(
+            headers=None, last_known_state=last_state
+        ) is True
+
+    def test_last_known_state_all_healthy_stays_upstream(self):
+        # Prior state was healthy; bare 429 arrives; should be treated
+        # as upstream capacity.
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+        from agent.rate_limit_tracker import parse_rate_limit_headers
+
+        prior_headers = {
+            "x-ratelimit-limit-requests-1h": "800",
+            "x-ratelimit-remaining-requests-1h": "750",
+            "x-ratelimit-reset-requests-1h": "2000",
+            "x-ratelimit-limit-requests": "200",
+            "x-ratelimit-remaining-requests": "180",
+            "x-ratelimit-reset-requests": "30",
+            "x-ratelimit-limit-tokens": "800000",
+            "x-ratelimit-remaining-tokens": "790000",
+            "x-ratelimit-reset-tokens": "30",
+            "x-ratelimit-limit-tokens-1h": "8000000",
+            "x-ratelimit-remaining-tokens-1h": "7900000",
+            "x-ratelimit-reset-tokens-1h": "2000",
+        }
+        last_state = parse_rate_limit_headers(prior_headers, provider="nous")
+        assert is_genuine_nous_rate_limit(
+            headers=None, last_known_state=last_state
+        ) is False
+
+    def test_none_last_state_and_no_headers_is_upstream(self):
+        from agent.nous_rate_guard import is_genuine_nous_rate_limit
+
+        assert is_genuine_nous_rate_limit(
+            headers=None, last_known_state=None
+        ) is False
+
+
+class TestRateGuardStateEncoding:
+    """Regression for #18637: the cross-session rate-limit state file was
+    opened without ``encoding="utf-8"`` on both the atomic write (os.fdopen)
+    and the read. On Windows Chinese locales the platform default decoder
+    raises on UTF-8 bytes written by a peer process, silently losing the
+    rate-limit guard and re-enabling the retry amplification the module was
+    built to prevent.
+    """
+
+    def test_read_uses_utf8_under_non_utf8_locale(self, rate_guard_env, monkeypatch):
+        import builtins
+
+        from agent.nous_rate_guard import nous_rate_limit_remaining, _state_path
+
+        path = _state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # State JSON written with a UTF-8 provider label. Python's json
+        # module itself escapes non-ASCII by default, but a peer writer
+        # (or human) using ensure_ascii=False produces raw UTF-8 bytes,
+        # which is what this guards against.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                '{"reset_at": %d, "provider": "中文", "recorded_at": 0}'
+                % (int(time.time()) + 3600)
+            )
+
+        real_open = builtins.open
+
+        def guarded_open(file, mode="r", *args, **kwargs):
+            try:
+                is_target = str(file) == str(path)
+            except Exception:
+                is_target = False
+            if is_target and "b" not in mode and kwargs.get("encoding") != "utf-8":
+                raise UnicodeDecodeError(
+                    "gbk", b"\x94", 0, 1, "illegal multibyte sequence"
+                )
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", guarded_open)
+
+        remaining = nous_rate_limit_remaining()
+        assert remaining is not None and remaining > 0

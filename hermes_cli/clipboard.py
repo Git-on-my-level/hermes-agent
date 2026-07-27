@@ -22,6 +22,7 @@ from pathlib import Path
 from hermes_constants import is_wsl as _is_wsl
 
 logger = logging.getLogger(__name__)
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def save_clipboard_image(dest: Path) -> bool:
@@ -66,7 +67,7 @@ def _macos_has_image() -> bool:
     try:
         info = subprocess.run(
             ["osascript", "-e", "clipboard info"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
         )
         return "«class PNGf»" in info.stdout or "«class TIFF»" in info.stdout
     except Exception:
@@ -108,7 +109,7 @@ def _macos_osascript(dest: Path) -> bool:
     try:
         r = subprocess.run(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if r.returncode == 0 and "fail" not in r.stdout and dest.exists() and dest.stat().st_size > 0:
             return True
@@ -199,7 +200,7 @@ _POWERSHELL_EXTRACT_IMAGE_SCRIPTS = (
 def _run_powershell(exe: str, script: str, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(
         [exe, "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
     )
 
 
@@ -257,7 +258,7 @@ def _find_powershell() -> str | None:
         try:
             r = subprocess.run(
                 [name, "-NoProfile", "-NonInteractive", "-Command", "echo ok"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
             if r.returncode == 0 and "ok" in r.stdout:
                 return name
@@ -332,7 +333,7 @@ def _wayland_has_image() -> bool:
     try:
         r = subprocess.run(
             ["wl-paste", "--list-types"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
         )
         return r.returncode == 0 and any(
             t.startswith("image/") for t in r.stdout.splitlines()
@@ -350,7 +351,7 @@ def _wayland_save(dest: Path) -> bool:
         # Check available MIME types
         types_r = subprocess.run(
             ["wl-paste", "--list-types"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
         )
         if types_r.returncode != 0:
             return False
@@ -378,10 +379,13 @@ def _wayland_save(dest: Path) -> bool:
             dest.unlink(missing_ok=True)
             return False
 
-        # BMP needs conversion to PNG (common in WSLg where only BMP
-        # is bridged from Windows clipboard via RDP).
-        if mime == "image/bmp":
-            return _convert_to_png(dest)
+        # save_clipboard_image() promises a PNG output path. Wayland can offer
+        # JPEG/GIF/WebP/BMP payloads, so normalize every non-PNG result before
+        # returning success.
+        if mime != "image/png":
+            if not _convert_to_png(dest) or not _is_png_file(dest):
+                dest.unlink(missing_ok=True)
+                return False
 
         return True
 
@@ -433,6 +437,15 @@ def _convert_to_png(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
+def _is_png_file(path: Path) -> bool:
+    """Return True when *path* starts with the PNG file signature."""
+    try:
+        with path.open("rb") as f:
+            return f.read(len(_PNG_SIGNATURE)) == _PNG_SIGNATURE
+    except OSError:
+        return False
+
+
 # ── X11 (xclip) ─────────────────────────────────────────────────────────
 
 def _xclip_has_image() -> bool:
@@ -440,7 +453,7 @@ def _xclip_has_image() -> bool:
     try:
         r = subprocess.run(
             ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
         )
         return r.returncode == 0 and "image/png" in r.stdout
     except FileNotFoundError:
@@ -456,7 +469,7 @@ def _xclip_save(dest: Path) -> bool:
     try:
         targets = subprocess.run(
             ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
         )
         if "image/png" not in targets.stdout:
             return False

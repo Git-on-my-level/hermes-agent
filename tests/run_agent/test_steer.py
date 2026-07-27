@@ -11,6 +11,7 @@ import threading
 
 import pytest
 
+from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
 
 
@@ -22,6 +23,24 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+    agent._model_request_active = threading.Event()
+    agent._executing_tools = False
+    agent._execution_thread_id = None
+    agent._interrupt_thread_signal_pending = False
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent._tool_worker_threads = None
+    agent._tool_worker_threads_lock = None
+    agent._current_streamed_reasoning_text = ""
+    agent._current_streamed_assistant_text = ""
+    agent._stream_needs_break = False
+    agent._strip_think_blocks = lambda content: content
+    agent.quiet_mode = True
+    agent.api_mode = "chat_completions"
     return agent
 
 
@@ -71,6 +90,161 @@ class TestSteerDrain:
         assert agent._drain_pending_steer() is None
 
 
+class TestActiveTurnRedirect:
+    def test_rejects_when_no_turn_is_active(self):
+        agent = _bare_agent()
+        assert agent.redirect("change course") is False
+        assert agent._pending_redirect is None
+
+    def test_cancels_only_an_active_model_request(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+
+        assert agent.redirect("use Postgres") is True
+        assert agent._pending_redirect == "use Postgres"
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message is None
+
+    def test_multiple_redirects_preserve_message_boundaries(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+
+        assert agent.redirect("first correction") is True
+        assert agent.redirect("second correction") is True
+        assert agent._pending_redirect == (
+            "first correction\n\n"
+            "[Additional user correction]\n"
+            "second correction"
+        )
+
+    def test_hard_interrupt_wins_over_new_redirect(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._interrupt_requested = True
+
+        assert agent.redirect("too late") is False
+        assert agent._pending_redirect is None
+
+    def test_hidden_reasoning_is_not_checkpointed(self):
+        agent = _bare_agent()
+        agent.reasoning_callback = None
+        agent._current_streamed_reasoning_text = ""
+
+        agent._fire_reasoning_delta("private provider thinking")
+
+        assert agent._current_streamed_reasoning_text == ""
+
+    def test_response_completion_before_redirect_lock_rejects_correction(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        started = threading.Event()
+        outcome = {}
+
+        def redirect():
+            started.set()
+            outcome["accepted"] = agent.redirect("late correction")
+
+        with agent._pending_redirect_lock:
+            worker = threading.Thread(target=redirect)
+            worker.start()
+            assert started.wait(timeout=1)
+            # Mirrors conversation_loop clearing the request-active marker
+            # under this same lock before redirect can commit its slot.
+            agent._model_request_active.clear()
+        worker.join(timeout=1)
+
+        assert outcome["accepted"] is False
+        assert agent._pending_redirect is None
+
+    def test_hard_stop_wins_concurrent_redirect(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        start = threading.Barrier(3)
+        outcome = {}
+
+        def redirect():
+            start.wait()
+            outcome["redirect"] = agent.redirect("change course")
+
+        def hard_stop():
+            start.wait()
+            agent.interrupt("stop requested")
+
+        redirect_thread = threading.Thread(target=redirect)
+        stop_thread = threading.Thread(target=hard_stop)
+        redirect_thread.start()
+        stop_thread.start()
+        start.wait()
+        redirect_thread.join(timeout=1)
+        stop_thread.join(timeout=1)
+
+        assert redirect_thread.is_alive() is False
+        assert stop_thread.is_alive() is False
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "stop requested"
+        assert agent._pending_redirect is None
+
+    def test_codex_app_server_hard_stop_reaches_native_session(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_interrupt": lambda self: calls.append("interrupt")},
+        )()
+
+        agent.interrupt()
+
+        assert calls == ["interrupt"]
+
+    def test_codex_app_server_redirect_rejects_after_hard_stop(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._interrupt_requested = True
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: calls.append(text) or True},
+        )()
+
+        assert agent.redirect("too late") is False
+        assert calls == []
+
+    def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
+        agent = _bare_agent()
+        agent._executing_tools = True
+
+        assert agent.redirect("also check migrations") is True
+        assert agent._pending_redirect is None
+        assert agent._pending_steer == "also check migrations"
+        assert agent._interrupt_requested is False
+
+
+class TestActiveTurnRedirectCheckpoint:
+    def test_assistant_tail_puts_correction_last(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        agent._current_streamed_reasoning_text = "Shown reasoning."
+        agent._current_streamed_assistant_text = "Visible draft."
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "committed assistant item"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "Use Postgres instead.")
+
+        assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"].endswith("Use Postgres instead.")
+        assert sum(1 for m in messages if m["role"] == "assistant") == 1
+        assert "Shown reasoning." in messages[-1]["content"]
+        assert "Visible draft." in messages[-1]["content"]
+        assert "Context from the interrupted assistant response" in messages[-1]["content"]
+
+
 class TestSteerInjection:
     def test_appends_to_last_tool_result(self):
         agent = _bare_agent()
@@ -85,7 +259,7 @@ class TestSteerInjection:
         # The LAST tool result is modified; earlier ones are untouched.
         assert messages[2]["content"] == "ls output A"
         assert "ls output B" in messages[3]["content"]
-        assert "User guidance:" in messages[3]["content"]
+        assert STEER_MARKER_OPEN in messages[3]["content"]
         assert "please also check auth.log" in messages[3]["content"]
         # And pending_steer is consumed.
         assert agent._pending_steer is None
@@ -107,18 +281,19 @@ class TestSteerInjection:
         # Steer should remain pending (nothing to drain into)
         assert agent._pending_steer == "steer"
 
-    def test_marker_labels_text_as_user_guidance(self):
-        """The injection marker must label the appended text as user
-        guidance so the model attributes it to the user rather than
-        confusing it with tool output.  This is the cache-safe way to
-        signal provenance without violating message-role alternation.
+    def test_marker_labels_text_as_out_of_band_user_message(self):
+        """The injection marker must attribute the appended text to the user
+        via the explicit out-of-band marker (which the system prompt tells the
+        model to trust) — otherwise the model reads it as untrusted tool output
+        and refuses it as suspected prompt injection.  Cache-safe: it only
+        rewrites existing tool content, never the message-role sequence.
         """
         agent = _bare_agent()
         agent.steer("stop after next step")
         messages = [{"role": "tool", "content": "x", "tool_call_id": "1"}]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
         content = messages[-1]["content"]
-        assert "User guidance:" in content
+        assert STEER_MARKER_OPEN in content
         assert "stop after next step" in content
 
     def test_multimodal_content_list_preserved(self):
@@ -194,10 +369,12 @@ class TestSteerClearedOnInterrupt:
         agent._tool_worker_threads_lock = None
 
         agent.steer("will be dropped")
+        agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"
 
         agent.clear_interrupt()
         assert agent._pending_steer is None
+        assert agent._pending_redirect is None
 
 
 class TestPreApiCallSteerDrain:
@@ -227,9 +404,9 @@ class TestPreApiCallSteerDrain:
         # Inject into last tool msg (mirrors the new code in run_conversation)
         for _si in range(len(messages) - 1, -1, -1):
             if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += f"\n\nUser guidance: {_pre_api_steer}"
+                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
                 break
-        assert "User guidance:" in messages[-1]["content"]
+        assert STEER_MARKER_OPEN in messages[-1]["content"]
         assert "focus on error handling" in messages[-1]["content"]
         assert agent._pending_steer is None
 
@@ -271,9 +448,26 @@ class TestPreApiCallSteerDrain:
         assert _pre_api_steer is not None
         for _si in range(len(messages) - 1, -1, -1):
             if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += f"\n\nUser guidance: {_pre_api_steer}"
+                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
                 break
         assert "change approach" in messages[2]["content"]
+
+
+class TestSteerMarkerContract:
+    def test_system_prompt_note_describes_the_real_marker(self):
+        """The system-prompt note tells the model which marker to trust; it
+        must reference the exact open/close the injector emits, or the model
+        trusts a marker that never appears (and vice-versa)."""
+        from agent.prompt_builder import STEER_CHANNEL_NOTE, STEER_MARKER_CLOSE
+
+        emitted = format_steer_marker("hi")
+        assert STEER_MARKER_OPEN in emitted and STEER_MARKER_CLOSE in emitted
+        assert STEER_MARKER_OPEN in STEER_CHANNEL_NOTE and STEER_MARKER_CLOSE in STEER_CHANNEL_NOTE
+
+    def test_marker_no_longer_uses_the_distrusted_label(self):
+        """Regression: the bare 'User guidance:' line read as tool content and
+        got refused as injection — it must not come back."""
+        assert "User guidance:" not in format_steer_marker("hi")
 
 
 class TestSteerCommandRegistry:
@@ -281,7 +475,7 @@ class TestSteerCommandRegistry:
         """The /steer slash command must be registered so it reaches all
         platforms (CLI, gateway, TUI autocomplete, Telegram/Slack menus).
         """
-        from hermes_cli.commands import resolve_command, ACTIVE_SESSION_BYPASS_COMMANDS
+        from hermes_cli.commands import resolve_command
 
         cmd = resolve_command("steer")
         assert cmd is not None
