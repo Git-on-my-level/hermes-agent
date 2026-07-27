@@ -51,11 +51,21 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
     )
     update_parser.add_argument(
+        "--remote",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Git remote to update from (default: updates.remote in config, "
+            "else origin). Example: --remote fork"
+        ),
+    )
+    update_parser.add_argument(
         "--branch",
         default=None,
         metavar="NAME",
         help=(
-            "Update against this branch instead of the default (main). "
+            "Update against this branch instead of the default "
+            "(updates.branch in config, else main). "
             "If the local checkout is on a different branch, hermes will "
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."

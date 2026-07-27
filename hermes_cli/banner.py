@@ -197,32 +197,56 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _update_channel_ref() -> tuple[str, str]:
+    """Return configured update ``(remote, branch)``, default origin/main."""
+    remote, branch = "origin", "main"
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("updates") or {}
+        if isinstance(cfg, dict):
+            r = str(cfg.get("remote") or "").strip()
+            b = str(cfg.get("branch") or "").strip()
+            if r:
+                remote = r
+            if b:
+                branch = b
+    except Exception:
+        pass
+    return remote or "origin", branch or "main"
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+    """Count commits behind the configured update channel in a local checkout."""
+    remote, branch = _update_channel_ref()
+    remote_ref = f"{remote}/{branch}"
+
+    # Stock origin/main on an official SSH remote: compare via ls-remote to
+    # NousResearch main (avoids needing a full fetch of every fork ref).
+    if remote == "origin" and branch == "main":
+        origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+        if _is_official_ssh_remote(origin_url):
+            head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+            checked = _check_via_rev(head_rev) if head_rev else None
+            if checked == UPDATE_AVAILABLE_NO_COUNT:
+                return 1
+            return checked
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
     # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # `rev-list --count HEAD..<remote>/<branch>` would report a huge bogus
+    # "behind" number. Detect shallow up front: fetch with --depth 1 to
+    # preserve the boundary and compare tip SHAs instead of counting. Full
+    # clones keep the exact count path unchanged.
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
+        fetch_args = ["git", "fetch"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
-        fetch_args.append("--quiet")
+        fetch_args += [remote, branch, "--quiet"]
         subprocess.run(
             fetch_args,
             capture_output=True, timeout=10,
@@ -232,13 +256,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # No history to count across the shallow boundary. Prefer FETCH_HEAD
+        # (just updated by the fetch above) and fall back to remote_ref.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", remote_ref], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -246,7 +269,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{remote_ref}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -256,6 +279,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     except Exception:
         pass
     return None
+
 
 
 def check_for_updates() -> Optional[int]:

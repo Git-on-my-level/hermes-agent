@@ -3447,6 +3447,13 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # Default git remote/branch for `hermes update`, `hermes update --check`,
+        # and the startup update banner. Official installs leave these as
+        # origin/main. Fleet installs that track a personal fork set e.g.
+        # remote: fork, branch: prod — then /update fast-forwards that tip
+        # without any fork-specific update engine.
+        "remote": "origin",
+        "branch": "main",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

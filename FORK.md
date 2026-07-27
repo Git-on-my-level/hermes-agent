@@ -85,3 +85,23 @@ Run this from the repository root after editing these guardrails:
 ```bash
 test -f FORK.md && rg -F 'FORK.md' AGENTS.md && git diff --check
 ```
+
+
+## Deploy channel (`hermes update` / `/update`)
+
+Runtime agents on this fork should track the reviewed deploy tip, not raw
+upstream `main`:
+
+```yaml
+# ~/.hermes/config.yaml  (host-local)
+updates:
+  remote: fork
+  branch: prod
+```
+
+With that set, `hermes update`, `hermes update --check`, and `/update` all
+fast-forward `fork/prod`. Upstream synchronization into the fork remains a
+separate maintainer step; agents never merge upstream themselves.
+
+Override for one shot: `hermes update --remote origin --branch main`.
+

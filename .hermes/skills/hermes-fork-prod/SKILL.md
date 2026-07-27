@@ -22,13 +22,23 @@ The fork uses this structure:
 
 ## What deploy agents should run
 
-Deploy agents should run from `prod` and update with:
+Set the host-local update channel once:
+
+```yaml
+# ~/.hermes/config.yaml
+updates:
+  remote: fork
+  branch: prod
+```
+
+Then deploy agents simply run:
 
 ```bash
 hermes update
 ```
 
-On the `prod` branch, Hermes is patched so `hermes update` pulls from `fork/prod` instead of `origin/main`.
+`/update` uses the same channel. Do **not** patch `hermes update` internals for fork routing — config is enough.
+
 
 ## Fresh install
 
