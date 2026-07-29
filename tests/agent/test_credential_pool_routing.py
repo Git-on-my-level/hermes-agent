@@ -183,6 +183,7 @@ class TestPoolRotationCycle:
             return None
 
         pool.mark_exhausted_and_rotate = MagicMock(side_effect=rotate)
+        pool.entries = MagicMock(return_value=entries)
         agent._credential_pool = pool
         agent._swap_credential = MagicMock()
         agent.log_prefix = ""
@@ -214,7 +215,7 @@ class TestPoolRotationCycle:
         agent._swap_credential.assert_called_once_with(entries[1])
 
     def test_pool_exhaustion_returns_false(self):
-        """When all credentials exhausted, recovery should return False."""
+        """Single-key pools keep the same credential for patient retry (no quarantine)."""
         agent, pool, _ = self._make_agent_with_pool(1)
         # First 429 sets flag
         _, has_retried = agent._recover_with_credential_pool(
@@ -222,11 +223,14 @@ class TestPoolRotationCycle:
         )
         assert has_retried is True
 
-        # Second 429 tries to rotate but pool is exhausted (only 1 entry)
-        recovered, _ = agent._recover_with_credential_pool(
+        # Second 429 must NOT mark the only key exhausted — same-credential
+        # patient backoff (Z.AI/GLM) owns the retry budget.
+        recovered, has_retried = agent._recover_with_credential_pool(
             status_code=429, has_retried_429=True
         )
         assert recovered is False
+        assert has_retried is True
+        pool.mark_exhausted_and_rotate.assert_not_called()
 
     def test_402_immediate_rotation(self):
         """402 (billing) should immediately rotate, no retry-first."""

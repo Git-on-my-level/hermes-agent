@@ -4368,14 +4368,23 @@ class TestCredentialPoolRecovery:
 
 
     def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
-        next_entry = SimpleNamespace(label="secondary")
+        next_entry = SimpleNamespace(
+            label="secondary", id="cred-2", runtime_api_key="secondary-key", last_status=None
+        )
+        primary = SimpleNamespace(
+            label="primary",
+            id="cred-1",
+            runtime_api_key=agent.api_key,
+            last_status=None,
+        )
 
         class _Pool:
             def current(self):
-                return SimpleNamespace(label="primary")
+                return primary
 
             def entries(self):
-                return []
+                # Multi-key pool: rotation is meaningful after the first retry.
+                return [primary, next_entry]
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
@@ -4403,6 +4412,43 @@ class TestCredentialPoolRecovery:
         assert recovered is True
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_recover_with_pool_single_key_keeps_same_credential_on_repeated_429(self, agent):
+        """Single-key pools must not quarantine the only credential on 429."""
+        primary = SimpleNamespace(
+            label="primary",
+            id="cred-1",
+            runtime_api_key=agent.api_key,
+            last_status=None,
+        )
+
+        class _Pool:
+            def current(self):
+                return primary
+
+            def entries(self):
+                return [primary]
+
+            def mark_exhausted_and_rotate(self, **kwargs):
+                raise AssertionError("single-key pool must not mark exhausted on rate limit")
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+        )
+        assert recovered is False
+        assert retry_same is True
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+        )
+        assert recovered is False
+        assert retry_same is True
+        agent._swap_credential.assert_not_called()
 
 
 
@@ -4445,7 +4491,46 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "usage_limit_reached"
         assert context["message"] == "The usage limit has been reached"
 
+    def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
+        next_entry = SimpleNamespace(
+            label="secondary", id="cred-2", runtime_api_key="secondary-key", last_status=None
+        )
+        primary = SimpleNamespace(
+            label="primary",
+            id="cred-1",
+            runtime_api_key=agent.api_key,
+            last_status=None,
+        )
+        captured = {}
 
+        class _Pool:
+            def current(self):
+                return primary
+
+            def entries(self):
+                return [primary, next_entry]
+
+            def mark_exhausted_and_rotate(
+                self, *, status_code, error_context=None, api_key_hint=None
+            ):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                captured["api_key_hint"] = api_key_hint
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+            error_context={"reason": "device_code_exhausted", "reset_at": "2026-04-12T10:30:00Z"},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reason"] == "device_code_exhausted"
 
 
 class TestMaxTokensParam:
@@ -5712,5 +5797,4 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
 
