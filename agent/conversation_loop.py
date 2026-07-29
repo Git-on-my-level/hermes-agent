@@ -4124,21 +4124,28 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
-                # Z.AI Coding Plan GLM-5.2 overload 429s classify as
-                # `overloaded` (to spare the credential pool), but `overloaded`
-                # is excluded from `is_rate_limited` — the gate for the adaptive
-                # Z.AI backoff below. Detect the overload directly so its
-                # long-backoff schedule runs, and raise the retry ceiling so the
-                # long tier (30/60/90/120s) is reachable. See
-                # zai_coding_overload_retry_ceiling() for the ceiling rationale.
+                # Z.AI/GLM transient 429s (rate-limit, overload, opaque throttle
+                # on coding or paas for any GLM model incl. glm-5v-turbo) need
+                # multi-minute same-credential patience. They may classify as
+                # `overloaded` (spares the credential pool) or `rate_limit`;
+                # detect the class directly so the adaptive long-backoff
+                # schedule runs, raise the retry ceiling so the long tier
+                # (30/60/90/120s) is reachable, and suppress eager fallback so
+                # a temporary throttle does not abandon GLM before waiting.
+                # See zai_coding_overload_retry_ceiling() for the ceiling
+                # rationale. Hard quota/billing is excluded by the classifier.
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
-                    is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    (is_rate_limited and not _is_zai_coding_overload)
+                    or (
+                        _is_transport_failure
+                        and not _is_zai_coding_overload
+                        and retry_count >= 2
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5173,14 +5180,22 @@ def run_conversation(
                 if is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
-                        _policy_note = " (Z.AI Coding overload adaptive long backoff)"
+                        _policy_note = " (Z.AI/GLM adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
-                        _policy_note = " (Z.AI Coding overload short retry)"
-                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
-                    _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
-                    # Normal retries are buffered to avoid noisy transient chatter. Long
-                    # Z.AI Coding waits are different: they can last minutes, so surface
-                    # progress immediately instead of making the TUI look frozen.
+                        _policy_note = " (Z.AI/GLM short retry)"
+                    _wait_reason = (
+                        "Provider overloaded"
+                        if _is_zai_coding_overload and not is_rate_limited
+                        else "Rate limited"
+                    )
+                    _rate_limit_status = (
+                        f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s "
+                        f"(attempt {retry_count + 1}/{max_retries}){_policy_note}..."
+                    )
+                    # Normal retries are buffered to avoid noisy transient chatter.
+                    # Long Z.AI/GLM waits can last minutes — surface progress
+                    # immediately instead of making the TUI/gateway look frozen.
+                    # Prefer a single quiet status update over per-retry spam.
                     if _backoff_policy == "zai_coding_overload_long":
                         agent._emit_status(_rate_limit_status)
                     else:
