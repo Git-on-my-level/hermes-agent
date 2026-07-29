@@ -166,7 +166,8 @@ def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
     # The shallow fetch must preserve the boundary (--depth 1), not unshallow.
-    assert ["git", "fetch", "origin", "--depth", "1", "--quiet"] in calls
+    # Order matches banner._check_via_local_git: git fetch [--depth 1] <remote> <branch> --quiet
+    assert ["git", "fetch", "--depth", "1", "origin", "main", "--quiet"] in calls
 
 
 def test_check_via_local_git_shallow_clone_up_to_date(tmp_path):
