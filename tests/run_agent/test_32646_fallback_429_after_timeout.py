@@ -1,24 +1,12 @@
-"""Regression test for #32646: fallback_providers not activated when
-HTTP 429 follows a successful primary-transport recovery.
+"""Regression tests for #32646 + SCA-242 around post-recovery 429s.
 
-Reproduces the (timeout x N -> recover -> 429 -> no fallback) sequence
-reported against zai/glm-5.1 -> zai/glm-4.7 on the Telegram gateway.
+#32646: fallback_providers must remain usable after primary-transport
+recovery resets a burned fallback-chain index.
 
-Scenario:
-  1. ``_try_recover_primary_transport()`` succeeds after 3 timeouts and
-     resets ``retry_count = 0`` so the rebuilt primary client gets one
-     more attempt.
-  2. The next attempt hits HTTP 429.
-  3. Before this fix, an eager-fallback attempt that lost its race with
-     a concurrent session mutating the on-disk credential pool could
-     leave ``_fallback_index`` advanced past the chain length without
-     setting ``_fallback_activated`` to True.  The subsequent 429s then
-     short-circuited the eager-fallback gate (``_fallback_index >=
-     len(_fallback_chain)``), so the retry budget burned on the primary
-     model with no fallback ever attempted.
-  4. The fix resets ``_fallback_index`` / ``_fallback_activated`` /
-     ``TurnRetryState.has_retried_429`` after transport recovery so the post-recovery
-     429 always gets a fresh fallback-chain attempt.
+SCA-242: Z.AI/GLM transient 429s prefer multi-minute same-credential
+patience over eager fallback / user re-send. Eager fallback is suppressed
+during that patient window; once the extended retry ceiling is exhausted,
+the reset fallback chain from #32646 must still activate.
 """
 
 from __future__ import annotations
@@ -219,15 +207,14 @@ class TestFallbackChainResetOnTransportRecovery:
         )
         assert retry_state.primary_recovery_attempted is True
 
-    def test_run_conversation_fallbacks_on_429_after_timeout_recovery(self):
-        """Full loop regression for #32646.
+    def test_run_conversation_patient_retry_on_429_after_timeout_recovery(self):
+        """Post-recovery Z.AI/GLM 429s wait same-credential first (SCA-242).
 
-        Start the turn with the fallback chain already burned, matching
-        the stale state reported in the issue. Two transient timeouts
-        exhaust the retry loop and trigger primary transport recovery.
-        The next primary attempt returns 429. The conversation loop must
-        reset the stale fallback-chain state during recovery so that the
-        post-recovery 429 activates the configured fallback provider.
+        Start with a burned fallback chain so transport recovery must reset
+        it (#32646). Two timeouts trigger primary recovery; the next attempt
+        is HTTP 429. For Z.AI/GLM that must enter the patient same-credential
+        schedule rather than eagerly abandoning to fallback — a temporary
+        throttle should not force a model switch (or user re-send).
         """
         fb_chain = [
             {
@@ -251,6 +238,79 @@ class TestFallbackChainResetOnTransportRecovery:
                 raise ReadTimeout("read timed out")
             if attempt == 3:
                 raise RateLimitError()
+            return _mock_response("Recovered on primary after patient retry")
+
+        mock_fb_client = MagicMock()
+        mock_fb_client.api_key = "primary-key-abcdef12"
+        mock_fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+        mock_fb_client._custom_headers = None
+        mock_fb_client.default_headers = None
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.conversation_loop.time.sleep"),
+            patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "glm-4.7"),
+            ) as mock_resolve,
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered on primary after patient retry"
+        assert calls == [
+            ("zai", "glm-5.1"),
+            ("zai", "glm-5.1"),
+            ("zai", "glm-5.1"),
+            ("zai", "glm-5.1"),
+        ]
+        mock_resolve.assert_not_called()
+        assert agent._fallback_activated is False
+        assert agent.model == "glm-5.1"
+
+    def test_run_conversation_fallbacks_after_zai_patient_budget_exhausted(self):
+        """#32646 + SCA-242: after patient Z.AI/GLM 429 budget exhausts,
+        the reset fallback chain must still activate.
+
+        Same burned-chain + timeout-recovery setup as above, but every
+        post-recovery primary attempt keeps 429'ing until the extended
+        Z.AI/GLM retry ceiling is spent. Fallback must then fire — proving
+        transport recovery re-opened the chain even though eager fallback
+        is suppressed during the patient window.
+        """
+        fb_chain = [
+            {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+            }
+        ]
+        agent = _make_agent_with_fallback(fb_chain)
+        agent._api_max_retries = 2
+
+        calls = []
+
+        def fake_api_call(api_kwargs):
+            calls.append((agent.provider, agent.model))
+            attempt = len(calls)
+            if attempt == 1:
+                agent._fallback_index = len(agent._fallback_chain)
+                agent._fallback_activated = False
+            if attempt <= 2:
+                raise ReadTimeout("read timed out")
+            if agent.model == "glm-5.1":
+                raise RateLimitError()
             return _mock_response("Recovered via fallback")
 
         mock_fb_client = MagicMock()
@@ -266,6 +326,11 @@ class TestFallbackChainResetOnTransportRecovery:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.conversation_loop.time.sleep"),
+            patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+            patch(
+                "agent.retry_utils.jittered_backoff", return_value=0.0
+            ),
             patch(
                 "agent.auxiliary_client.resolve_provider_client",
                 return_value=(mock_fb_client, "glm-4.7"),
@@ -280,12 +345,9 @@ class TestFallbackChainResetOnTransportRecovery:
 
         assert result["completed"] is True
         assert result["final_response"] == "Recovered via fallback"
-        assert calls == [
-            ("zai", "glm-5.1"),
-            ("zai", "glm-5.1"),
-            ("zai", "glm-5.1"),
-            ("zai", "glm-4.7"),
-        ]
+        assert ("zai", "glm-5.1") in calls
+        assert calls[-1] == ("zai", "glm-4.7")
+        assert sum(1 for c in calls if c == ("zai", "glm-5.1")) >= 4
         mock_resolve.assert_called_once()
         assert agent._fallback_activated is True
         assert agent.model == "glm-4.7"

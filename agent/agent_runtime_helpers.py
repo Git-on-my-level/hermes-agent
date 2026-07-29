@@ -1072,6 +1072,24 @@ def recover_with_credential_pool(
             )
         if not has_retried_429 and not usage_limit_reached:
             return False, True
+        # Single-credential pools have nowhere to rotate. Calling
+        # mark_exhausted_and_rotate here would quarantine the only key and
+        # collapse the patient same-credential backoff path (esp. Z.AI/GLM
+        # transient 429s that need multi-minute waits). Keep retrying the
+        # same key; the conversation loop owns the retry budget.
+        # If ``entries()`` is unavailable (legacy mocks / older pools), fall
+        # through to the rotate attempt so multi-key behavior is unchanged.
+        _pool_size = None
+        try:
+            _pool_size = len(pool.entries())
+        except Exception:
+            _pool_size = None
+        if _pool_size is not None and _pool_size <= 1:
+            _ra().logger.info(
+                "Credential rate-limited with single-key pool — "
+                "keeping same credential for patient retry (no rotation)"
+            )
+            return False, True
         rotate_status = status_code if status_code is not None else 429
         next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:

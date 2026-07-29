@@ -5,7 +5,12 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    is_zai_glm_transient_throttle_error,
+    jittered_backoff,
+)
 
 
 def test_backoff_is_exponential():
@@ -131,28 +136,85 @@ def _zai_overload_error():
     )
 
 
-def test_zai_coding_overload_classifier_is_narrow():
+def _zai_rate_limit_error():
+    return SimpleNamespace(
+        status_code=429,
+        body={
+            "error": {
+                "code": "1302",
+                "message": "Rate limit exceeded, please try again later",
+            }
+        },
+    )
+
+
+def _zai_hard_quota_error():
+    return SimpleNamespace(
+        status_code=429,
+        body={"error": {"code": "1113", "message": "Insufficient balance"}},
+    )
+
+
+def test_zai_glm_transient_covers_coding_and_paas_and_vision_models():
     err = _zai_overload_error()
-    assert is_zai_coding_overload_error(
+    assert is_zai_glm_transient_throttle_error(
         base_url="https://api.z.ai/api/coding/paas/v4",
         model="glm-5.2",
         error=err,
     )
-
-    assert not is_zai_coding_overload_error(
+    assert is_zai_glm_transient_throttle_error(
         base_url="https://api.z.ai/api/paas/v4",
         model="glm-5.2",
         error=err,
     )
-    assert not is_zai_coding_overload_error(
+    assert is_zai_glm_transient_throttle_error(
+        base_url="https://api.z.ai/api/paas/v4",
+        model="glm-5v-turbo",
+        error=_zai_rate_limit_error(),
+    )
+    assert is_zai_glm_transient_throttle_error(
         base_url="https://api.z.ai/api/coding/paas/v4",
+        model="zai/glm-5v-turbo",
+        error=_zai_rate_limit_error(),
+    )
+    # Legacy alias tracks the broadened classifier.
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/paas/v4",
         model="glm-5.1",
         error=err,
     )
-    assert not is_zai_coding_overload_error(
+
+
+def test_zai_glm_transient_rejects_non_zai_and_hard_quota():
+    err = _zai_overload_error()
+    assert not is_zai_glm_transient_throttle_error(
+        base_url="https://openrouter.ai/api/v1",
+        model="glm-5.2",
+        error=err,
+    )
+    assert not is_zai_glm_transient_throttle_error(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="claude-sonnet-4",
+        error=err,
+    )
+    assert not is_zai_glm_transient_throttle_error(
         base_url="https://api.z.ai/api/coding/paas/v4",
         model="glm-5.2",
-        error=SimpleNamespace(status_code=429, body={"error": {"code": "1113", "message": "Insufficient balance"}}),
+        error=_zai_hard_quota_error(),
+    )
+    assert not is_zai_glm_transient_throttle_error(
+        base_url="https://api.z.ai/api/paas/v4",
+        model="glm-5v-turbo",
+        error=SimpleNamespace(status_code=500, body={"error": {"message": "rate limit"}}),
+    )
+
+
+def test_zai_glm_transient_opaque_429_is_patient():
+    """Opaque 429 bodies (no billing signal) still get multi-minute patience."""
+    assert is_zai_glm_transient_throttle_error(
+        base_url="https://api.z.ai/api/paas/v4",
+        model="glm-5v-turbo",
+        error=SimpleNamespace(status_code=429, body={}),
     )
 
 
@@ -179,6 +241,25 @@ def test_zai_coding_overload_backoff_keeps_first_retries_short(monkeypatch):
     )
     assert wait == 9.0
     assert policy == "zai_coding_overload_short"
+
+
+def test_zai_glm_rate_limit_backoff_grows_for_vision_model(monkeypatch):
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    err = _zai_rate_limit_error()
+
+    waits = []
+    for attempt in range(4, 10):
+        wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://api.z.ai/api/paas/v4",
+            model="glm-5v-turbo",
+            error=err,
+            default_wait=10.0,
+        )
+        waits.append(wait)
+        assert policy == "zai_coding_overload_long"
+
+    assert waits == [30.0, 60.0, 90.0, 120.0, 120.0, 120.0]
 
 
 def test_zai_coding_overload_backoff_grows_after_short_retries(monkeypatch):
@@ -212,17 +293,32 @@ def test_non_zai_backoff_returns_default_wait():
     assert policy is None
 
 
+def test_hard_quota_does_not_get_adaptive_long_backoff(monkeypatch):
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    wait, policy = adaptive_rate_limit_backoff(
+        8,
+        base_url="https://api.z.ai/api/paas/v4",
+        model="glm-5v-turbo",
+        error=_zai_hard_quota_error(),
+        default_wait=4.0,
+    )
+    assert wait == 4.0
+    assert policy is None
+
+
 def test_zai_overload_retry_ceiling_exceeds_short_attempts():
     """Invariant: the ceiling must sit above the short-retry threshold, or the
     long-backoff tier is unreachable and the whole schedule is dead code
     (the original bug: default api_max_retries == short_attempts == 3)."""
     from agent.retry_utils import (
         zai_coding_overload_retry_ceiling,
-        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+        zai_glm_transient_retry_ceiling,
+        _ZAI_GLM_TRANSIENT_LONG_BACKOFF,
     )
 
     short_attempts = 3
     ceiling = zai_coding_overload_retry_ceiling(short_attempts)
+    assert ceiling == zai_glm_transient_retry_ceiling(short_attempts)
     assert ceiling > short_attempts
     # Invariant (not a formula mirror): the loop's give-up check
     # (retry_count >= ceiling) runs *before* the attempt's backoff, so the
@@ -230,7 +326,7 @@ def test_zai_overload_retry_ceiling_exceeds_short_attempts():
     # i.e. the largest attempt the loop still computes backoff for
     # (ceiling - 1) must reach the final long-tier index.
     last_attempt_with_backoff = ceiling - 1
-    assert last_attempt_with_backoff - short_attempts >= len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+    assert last_attempt_with_backoff - short_attempts >= len(_ZAI_GLM_TRANSIENT_LONG_BACKOFF)
 
 
 def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
@@ -240,7 +336,7 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
     from agent.retry_utils import zai_coding_overload_retry_ceiling
 
-    err = _zai_overload_error()
+    err = _zai_rate_limit_error()
     ceiling = zai_coding_overload_retry_ceiling()
 
     long_waits = []
@@ -248,8 +344,8 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     for attempt in range(1, ceiling):
         _wait, policy = adaptive_rate_limit_backoff(
             attempt,
-            base_url="https://api.z.ai/api/coding/paas/v4",
-            model="glm-5.2",
+            base_url="https://api.z.ai/api/paas/v4",
+            model="glm-5v-turbo",
             error=err,
             default_wait=1.0,
         )
@@ -258,3 +354,24 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 
     assert long_waits, "long-backoff tier never reached within the retry ceiling"
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+def test_patient_schedule_covers_multi_minute_window(monkeypatch):
+    """Short + long tiers should sum to several minutes (OMP-style patience)."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    err = _zai_rate_limit_error()
+    ceiling = zai_coding_overload_retry_ceiling()
+    total = 0.0
+    for attempt in range(1, ceiling):
+        wait, _policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://api.z.ai/api/paas/v4",
+            model="glm-5v-turbo",
+            error=err,
+            default_wait=jittered_backoff(attempt, base_delay=2.0, max_delay=60.0, jitter_ratio=0.0),
+        )
+        total += wait
+    assert total >= 180.0, f"expected >=3 minutes patient budget, got {total}s"
+    assert total <= 600.0, f"expected <=10 minutes patient budget, got {total}s"
