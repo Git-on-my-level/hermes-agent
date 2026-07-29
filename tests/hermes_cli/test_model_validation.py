@@ -654,6 +654,39 @@ class TestValidateApiNotFound:
         assert result.get("corrected_model") is None
         assert "not found" in result["message"]
 
+    def test_curated_catalog_beats_fuzzy_autocorrect_zai_vision(self):
+        """Exact curated hits must not be rewritten to a near live neighbor.
+
+        Z.AI Coding Plan's /models listing omits ``glm-5v-turbo`` while
+        including ``glm-5-turbo`` (~0.956 SequenceMatcher ratio). Fuzzy
+        auto-correction previously stripped the vision ``v``.
+        """
+        zai_live_without_vision = [
+            "glm-5.2",
+            "glm-5.1",
+            "glm-5",
+            "glm-5-turbo",
+            "glm-4.7",
+        ]
+        result = _validate(
+            "glm-5v-turbo", provider="zai", api_models=zai_live_without_vision
+        )
+        assert result["accepted"] is True
+        assert result["recognized"] is True
+        assert result.get("corrected_model") is None
+        assert "Auto-corrected" not in (result.get("message") or "")
+
+    def test_typo_still_autocorrects_when_not_in_curated_catalog(self):
+        """Legitimate typos against the live listing still auto-correct."""
+        result = _validate(
+            "glm-5-turbi",
+            provider="zai",
+            api_models=["glm-5.2", "glm-5-turbo", "glm-4.7"],
+        )
+        assert result["accepted"] is True
+        assert result.get("corrected_model") == "glm-5-turbo"
+        assert "Auto-corrected" in result["message"]
+
 
 # -- validate — API unreachable — soft-accept via catalog or warning --------
 

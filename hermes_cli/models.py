@@ -4357,6 +4357,39 @@ def fetch_ollama_cloud_models(
     return []
 
 
+def _accept_exact_curated_model(
+    requested: str,
+    requested_for_lookup: str,
+    normalized: str,
+    *,
+    missing_from_live: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Accept *requested* when it exactly matches the provider's curated catalog.
+
+    Must run **before** fuzzy ``get_close_matches`` auto-correction against a
+    live ``/models`` listing.  Providers sometimes omit valid IDs from that
+    listing (e.g. Z.AI Coding Plan omits ``glm-5v-turbo`` while listing
+    ``glm-5-turbo``); SequenceMatcher then rewrites the vision slug to the
+    non-vision neighbor (~0.956 similarity).  An exact curated hit wins.
+    """
+    if not _model_in_provider_catalog(
+        requested_for_lookup.lower(), _provider_keys(normalized)
+    ):
+        return None
+    message = None
+    if missing_from_live:
+        message = (
+            f"Note: `{requested}` was not found in the live /v1/models listing "
+            f"but exists in the curated catalog — accepted."
+        )
+    return {
+        "accepted": True,
+        "persist": True,
+        "recognized": True,
+        "message": message,
+    }
+
+
 def validate_requested_model(
     model_name: str,
     provider: Optional[str],
@@ -4471,6 +4504,12 @@ def validate_requested_model(
                     "recognized": True,
                     "message": None,
                 }
+
+            curated_hit = _accept_exact_curated_model(
+                requested, requested_for_lookup, normalized, missing_from_live=True
+            )
+            if curated_hit is not None:
+                return curated_hit
 
             # Auto-correct if the top match is very similar (e.g. typo)
             auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
@@ -4660,6 +4699,11 @@ def validate_requested_model(
                     "recognized": True,
                     "message": None,
                 }
+            curated_hit = _accept_exact_curated_model(
+                requested, requested_for_lookup, normalized, missing_from_live=True
+            )
+            if curated_hit is not None:
+                return curated_hit
             auto = get_close_matches(requested_for_lookup, anthropic_models, n=1, cutoff=0.9)
             if auto:
                 return {
@@ -4701,6 +4745,11 @@ def validate_requested_model(
                     "recognized": True,
                     "message": None,
                 }
+            curated_hit = _accept_exact_curated_model(
+                requested, requested_for_lookup, normalized, missing_from_live=True
+            )
+            if curated_hit is not None:
+                return curated_hit
             auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
             if auto:
                 return {
@@ -4747,10 +4796,16 @@ def validate_requested_model(
                 "message": None,
             }
         else:
-            # API responded but model is not listed.  Accept anyway —
-            # the user may have access to models not shown in the public
-            # listing (e.g. Z.AI Pro/Max plans can use glm-5 on coding
-            # endpoints even though it's not in /models).  Warn but allow.
+            # API responded but model is not listed.  Prefer an exact curated
+            # catalog hit over fuzzy auto-correction — live /models can omit
+            # valid IDs that have near-neighbors in the listing (e.g. Z.AI
+            # Coding Plan lists glm-5-turbo but not glm-5v-turbo).
+
+            curated_hit = _accept_exact_curated_model(
+                requested, requested_for_lookup, normalized, missing_from_live=True
+            )
+            if curated_hit is not None:
+                return curated_hit
 
             # Auto-correct if the top match is very similar (e.g. typo)
             auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
@@ -4767,24 +4822,6 @@ def validate_requested_model(
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
-
-            # Model not in live /v1/models — check the curated catalog
-            # before rejecting.  Providers may omit models from their live
-            # listing that are still valid (stale cache, partial rollout,
-            # gated previews).  Use the pure-catalog helper (no extra live
-            # fetch) so we only accept models Hermes actually ships.  (#46850)
-            if _model_in_provider_catalog(
-                requested_for_lookup.lower(), _provider_keys(normalized)
-            ):
-                return {
-                    "accepted": True,
-                    "persist": True,
-                    "recognized": True,
-                    "message": (
-                        f"Note: `{requested}` was not found in the live /v1/models listing "
-                        f"but exists in the curated catalog — accepted."
-                    ),
-                }
 
         return {
             "accepted": False,
