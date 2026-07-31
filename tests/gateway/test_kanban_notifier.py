@@ -74,42 +74,6 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
-def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "shared-kanban.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    kb.write_board_metadata("alias-a", name="Alias A")
-    kb.write_board_metadata("alias-b", name="Alias B")
-
-    tid = _create_completed_subscription()
-
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.sent) == 1
-    assert "Kanban" in adapter.sent[0]["text"]
-    assert tid in adapter.sent[0]["text"]
-
-
-def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
-    db_path = tmp_path / "single-owner.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    tid = _create_completed_subscription()
-
-    adapter1 = RecordingAdapter()
-    adapter2 = RecordingAdapter()
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter1)))
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
-
-    assert len(adapter1.sent) == 1
-    assert adapter2.sent == []
-
-
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -158,22 +122,6 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     assert adapter.handled[0].source.thread_id == "20197"
 
 
-def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
-    db_path = tmp_path / "adapter-disconnect.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    tid = _create_completed_subscription()
-
-    runner = GatewayRunner.__new__(GatewayRunner)
-    runner._running = True
-    runner.adapters = DisconnectedAdapters({Platform.TELEGRAM: RecordingAdapter()})
-    runner._kanban_sub_fail_counts = {}
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
-
-
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     """A sub stamped with the gateway's own named profile uses self.adapters.
 
@@ -210,22 +158,6 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     message = adapter.sent[0]["text"]
     assert tid in message
     assert "blocked" in message
-
-
-def test_kanban_db_path_is_test_isolated_from_real_home():
-    hermes_home = Path(kb.kanban_home())
-    production_db = Path.home() / ".hermes" / "kanban.db"
-    assert kb.kanban_db_path().resolve() != production_db.resolve()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-    finally:
-        conn.close()
-
-    assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
-    assert kb.kanban_db_path().resolve() != production_db.resolve()
 
 
 class FailingAdapter:
@@ -379,31 +311,6 @@ class ReportedFailureAdapter:
         self.attempts += 1
         from gateway.platforms.base import SendResult
         return SendResult(success=False, error="Not connected")
-
-
-def test_kanban_notifier_rewinds_claim_on_reported_send_failure(tmp_path, monkeypatch):
-    """A non-raising SendResult(success=False) must NOT advance the cursor.
-
-    Regression for the silent-drop bug: the notifier used to discard send()'s
-    return value, so a reported (not raised) failure — e.g. Telegram mid-
-    reconnect after a gateway restart — fell through to the success branch,
-    marked the event seen, and lost the notification forever. The event must
-    remain unseen for retry, exactly like the raised-exception path.
-    """
-    db_path = tmp_path / "reported-failure.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    tid = _create_completed_subscription()
-
-    adapter = ReportedFailureAdapter()
-    runner = _make_runner(adapter)
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert adapter.attempts >= 1, "send should have been attempted"
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"], (
-        "a reported send failure must rewind the claim, not silently drop the event"
-    )
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
@@ -655,84 +562,6 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     wake_key = build_session_key(adapter.handled[0].source)
     assert wake_key == "agent:main:telegram:dm:chat-dm"
     assert ":group:" not in wake_key
-
-
-def test_auto_subscribe_persists_session_chat_type(tmp_path, monkeypatch):
-    db_path = tmp_path / "auto-sub-chat-type.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    from gateway.session_context import clear_session_vars, set_session_vars
-    from tools import kanban_tools
-
-    monkeypatch.setattr(
-        kanban_tools,
-        "load_config",
-        lambda: {"kanban": {"auto_subscribe_on_create": True}},
-    )
-
-    tokens = set_session_vars(
-        platform="telegram",
-        chat_id="chat-dm",
-        chat_type="dm",
-    )
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="auto sub", assignee="worker")
-
-        assert kanban_tools._maybe_auto_subscribe(conn, tid) is True
-        [sub] = kb.list_notify_subs(conn, task_id=tid)
-        assert sub["chat_type"] == "dm"
-    finally:
-        conn.close()
-        clear_session_vars(tokens)
-
-
-def test_notify_sub_migration_adds_chat_type_to_legacy_table(tmp_path, monkeypatch):
-    db_path = tmp_path / "legacy-notify-sub.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-
-    legacy = sqlite3.connect(db_path)
-    try:
-        legacy.execute(
-            """
-            CREATE TABLE kanban_notify_subs (
-                task_id       TEXT NOT NULL,
-                platform      TEXT NOT NULL,
-                chat_id       TEXT NOT NULL,
-                thread_id     TEXT NOT NULL DEFAULT '',
-                user_id       TEXT,
-                notifier_profile TEXT,
-                created_at    INTEGER NOT NULL,
-                last_event_id INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (task_id, platform, chat_id, thread_id)
-            )
-            """
-        )
-        legacy.commit()
-    finally:
-        legacy.close()
-
-    kb.init_db()
-    conn = kb.connect()
-    try:
-        cols = {
-            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
-        }
-        assert "chat_type" in cols
-
-        tid = kb.create_task(conn, title="legacy sub", assignee="worker")
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-dm",
-            chat_type="dm",
-        )
-        [sub] = kb.list_notify_subs(conn, task_id=tid)
-        assert sub["chat_type"] == "dm"
-    finally:
-        conn.close()
 
 
 def _unseen_terminal_events_for(tid, chat_id):

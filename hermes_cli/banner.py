@@ -40,7 +40,14 @@ def cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's renderer."""
     from prompt_toolkit import print_formatted_text as _pt_print
     from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
-    _pt_print(_PT_ANSI(text))
+    try:
+        _pt_print(_PT_ANSI(text))
+    except Exception:
+        # prompt_toolkit needs a real console. On Windows, a redirected or
+        # absent stdout (pythonw.exe, CI, `hermes ... > file`) raises
+        # NoConsoleScreenBufferError from its Win32Output — display helpers
+        # must never crash the caller over that, so degrade to plain print.
+        print(text)
 
 
 # =========================================================================
@@ -243,6 +250,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
+        # Scope the fetch to the one branch the behind-count compares against.
+        # An unscoped ``git fetch origin`` transfers every remote head (~1,400
+        # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
+        # 10 s timeout on slow links. Use the configured update channel so
+        # fork deployments compare and fetch fork/prod rather than silently
+        # probing origin/main.
         fetch_args = ["git", "fetch"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
