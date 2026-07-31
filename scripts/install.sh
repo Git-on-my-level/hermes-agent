@@ -370,7 +370,10 @@ prompt_yes_no() {
     esac
 
     if [ "$NON_INTERACTIVE" = true ]; then
-        answer=""
+        # Never accept a default action that can cause a child command (such
+        # as sudo or Homebrew) to open its own prompt. Non-interactive mode is
+        # an explicit opt-out from optional installation and setup choices.
+        return 1
     elif [ "$IS_INTERACTIVE" = true ]; then
         read -r -p "$question $prompt_suffix " answer || answer=""
     elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
@@ -1060,6 +1063,23 @@ install_system_packages() {
 
     # Nothing to install — done
     if [ "$need_ripgrep" = false ] && [ "$need_ffmpeg" = false ]; then
+        return 0
+    fi
+
+    # ripgrep and ffmpeg are optional quality-of-life dependencies. A caller
+    # using --non-interactive has opted out of terminal prompts, so do not
+    # invoke Homebrew, sudo, or another package manager that might prompt on
+    # its own behalf. Hermes remains usable without either dependency.
+    if [ "$NON_INTERACTIVE" = true ]; then
+        log_info "Skipping optional system packages (non-interactive install)."
+        if [ "$need_ripgrep" = true ]; then
+            log_warn "ripgrep not installed (file search will use grep fallback)"
+            show_manual_install_hint "ripgrep"
+        fi
+        if [ "$need_ffmpeg" = true ]; then
+            log_warn "ffmpeg not installed (TTS voice messages will be limited)"
+            show_manual_install_hint "ffmpeg"
+        fi
         return 0
     fi
 
@@ -1975,6 +1995,7 @@ copy_config_templates() {
     fi
 
     configure_update_channel
+    migrate_config_non_interactively
 
     # Create SOUL.md if it doesn't exist (global persona file).
     # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py — the
@@ -2042,6 +2063,31 @@ set_config_value("updates.branch", sys.argv[2])
         log_warn "Could not configure the Hermes update channel automatically."
         log_warn "After installation, run: hermes config set updates.remote $DEPLOY_REMOTE"
         log_warn "Then run: hermes config set updates.branch $BRANCH"
+    fi
+}
+
+# A copied template intentionally contains only user-facing settings, so it
+# has no persisted schema stamp. Run the supported migration API once the
+# update channel is in place so first-run diagnostics see a current config
+# without starting the interactive setup wizard or requesting credentials.
+migrate_config_non_interactively() {
+    local hermes_python="python"
+    if [ "$USE_VENV" = true ]; then
+        hermes_python="$INSTALL_DIR/venv/bin/python"
+    fi
+
+    if [ ! -x "$hermes_python" ] && ! command -v "$hermes_python" >/dev/null 2>&1; then
+        log_warn "Could not stamp the Hermes config version (Python unavailable)."
+        return 0
+    fi
+
+    if HERMES_HOME="$HERMES_HOME" "$hermes_python" -c '
+from hermes_cli.config import migrate_config
+migrate_config(interactive=False, quiet=True)
+'; then
+        log_success "Migrated Hermes configuration to the current schema"
+    else
+        log_warn "Could not migrate the Hermes config automatically. Run: hermes config migrate"
     fi
 }
 

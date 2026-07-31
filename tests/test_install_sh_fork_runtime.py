@@ -227,7 +227,51 @@ def test_fork_installer_configures_the_supported_update_channel_without_touching
     )
 
     assert "Configured Hermes updates: fork/prod" in result.stdout, result.stderr
+    assert "Migrated Hermes configuration to the current schema" in result.stdout
     config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    from hermes_cli.config import DEFAULT_CONFIG
+
     assert config["updates"]["remote"] == "fork"
     assert config["updates"]["branch"] == "prod"
+    assert config["_config_version"] == DEFAULT_CONFIG["_config_version"]
     assert env_file.read_text(encoding="utf-8") == "EXISTING_API_KEY=keep-me\n"
+
+
+def test_noninteractive_optional_ffmpeg_check_never_invokes_homebrew(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    brew_log = tmp_path / "brew.log"
+    (shim_dir / "uname").write_text(
+        "#!/bin/sh\nif [ \"$1\" = \"-s\" ]; then echo Darwin; else /usr/bin/uname \"$@\"; fi\n",
+        encoding="utf-8",
+    )
+    (shim_dir / "brew").write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$BREW_LOG\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    for command in (shim_dir / "uname", shim_dir / "brew"):
+        command.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(INSTALL_SH),
+            "--ensure",
+            "ffmpeg",
+            "--non-interactive",
+            "--skip-setup",
+            "--skip-browser",
+        ],
+        env=os.environ
+        | {
+            "PATH": f"{shim_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "BREW_LOG": str(brew_log),
+        },
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "Skipping optional system packages (non-interactive install)." in result.stdout
+    assert not brew_log.exists(), result.stdout + result.stderr
