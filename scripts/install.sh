@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/hermes-agent/prod/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -43,8 +43,15 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+# This fork deliberately deploys reviewed ``prod`` from its own remote while
+# retaining NousResearch as ``origin`` for explicit upstream maintenance.
+# Keep the runtime remote names aligned with FORK.md: origin=upstream,
+# fork=authoritative deploy source.
+FORK_REPO_URL_SSH="git@github.com:Git-on-my-level/hermes-agent.git"
+FORK_REPO_URL_HTTPS="https://github.com/Git-on-my-level/hermes-agent.git"
+UPSTREAM_REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+DEPLOY_REMOTE="fork"
+UPSTREAM_REMOTE="origin"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -71,7 +78,7 @@ USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
-BRANCH="main"
+BRANCH="prod"
 INSTALL_COMMIT=""
 FORCE_COMMIT=false
 ENSURE_DEPS=""
@@ -168,7 +175,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-skills    Start with a blank slate — seed no bundled skills, and"
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
-            echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --branch NAME  Git branch to install (default: prod)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -191,6 +198,9 @@ while [[ $# -gt 0 ]]; do
             echo "  (default /root/.hermes).  This keeps Docker bind-mounted volumes"
             echo "  small and ensures the command is on PATH for all shells."
             echo "  Existing installs at \$HERMES_HOME/hermes-agent are preserved in-place."
+            echo "  This fork installs from Git-on-my-level/hermes-agent and configures"
+            echo "  hermes update to track fork/prod. NousResearch remains origin for"
+            echo "  explicit upstream maintenance."
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
             echo "                   Supported: node, browser, ripgrep, ffmpeg"
             echo "                   Does NOT clone repo or create venv"
@@ -1195,6 +1205,58 @@ show_manual_install_hint() {
 # Installation
 # ============================================================================
 
+remote_url_is_repo() {
+    local remote_url="$1"
+    local owner_repo="$2"
+    case "$remote_url" in
+        *github.com:"$owner_repo"|*github.com/"$owner_repo"|*github.com:"$owner_repo".git|*github.com/"$owner_repo".git)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# A managed checkout must have the remote names described in FORK.md.  Keep an
+# existing SSH transport when it already points at the right repository; only
+# replace a remote whose repository identity is wrong.  This makes a rerun
+# repair legacy upstream-only installs without needlessly discarding a user's
+# working SSH credential path.
+configure_runtime_remotes() {
+    local fork_url=""
+    local origin_url=""
+    fork_url=$(git remote get-url "$DEPLOY_REMOTE" 2>/dev/null || true)
+    origin_url=$(git remote get-url "$UPSTREAM_REMOTE" 2>/dev/null || true)
+
+    if [ -z "$fork_url" ] && remote_url_is_repo "$origin_url" "Git-on-my-level/hermes-agent"; then
+        git remote rename "$UPSTREAM_REMOTE" "$DEPLOY_REMOTE"
+        fork_url=$(git remote get-url "$DEPLOY_REMOTE")
+        origin_url=""
+    fi
+
+    if [ -z "$fork_url" ]; then
+        git remote add "$DEPLOY_REMOTE" "$FORK_REPO_URL_HTTPS"
+    elif ! remote_url_is_repo "$fork_url" "Git-on-my-level/hermes-agent"; then
+        log_warn "Replacing unexpected '$DEPLOY_REMOTE' remote with the managed fork."
+        git remote set-url "$DEPLOY_REMOTE" "$FORK_REPO_URL_HTTPS"
+    fi
+
+    origin_url=$(git remote get-url "$UPSTREAM_REMOTE" 2>/dev/null || true)
+    if [ -z "$origin_url" ]; then
+        git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_REPO_URL_HTTPS"
+    elif ! remote_url_is_repo "$origin_url" "NousResearch/hermes-agent"; then
+        log_warn "Replacing unexpected '$UPSTREAM_REMOTE' remote with NousResearch upstream."
+        git remote set-url "$UPSTREAM_REMOTE" "$UPSTREAM_REPO_URL_HTTPS"
+    fi
+}
+
+set_deploy_branch_upstream() {
+    # Explicitly select fork/<branch>; a clone's initial branch otherwise
+    # keeps tracking its transient origin name after the remote reconciliation.
+    git branch --set-upstream-to="$DEPLOY_REMOTE/$BRANCH" "$BRANCH"
+}
+
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
@@ -1214,6 +1276,8 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
+
+            configure_runtime_remotes
 
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
@@ -1238,20 +1302,22 @@ clone_repo() {
                 autostash_ref="stash@{0}"
             fi
 
-            # Fetch only the target branch. A bare `git fetch origin` pulls
+            # Fetch only the target branch. A bare `git fetch` pulls
             # every ref, and this repo carries thousands of auto-generated
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
-            git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
+            git remote set-branches "$DEPLOY_REMOTE" "$BRANCH" 2>/dev/null || true
+            git fetch "$DEPLOY_REMOTE" "$BRANCH"
             git checkout "$BRANCH"
-            # Managed installs should follow origin/$BRANCH exactly. If the
-            # checkout has diverged (or has local-only commits), ff-only pull
-            # cannot succeed — mirror ``hermes update`` and reset to the
-            # fetched remote so bootstrap/install can recover.
-            if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-                git reset --hard "origin/$BRANCH"
+            set_deploy_branch_upstream
+            # Managed installs should follow $DEPLOY_REMOTE/$BRANCH exactly.
+            # `git pull --ff-only` treats a local-only commit as "Already up to
+            # date", so verify that HEAD is still an ancestor of the deployed
+            # tip before declaring the managed checkout healthy.
+            if ! git pull --ff-only "$DEPLOY_REMOTE" "$BRANCH" \
+                || ! git merge-base --is-ancestor HEAD "$DEPLOY_REMOTE/$BRANCH"; then
+                log_warn "Fast-forward not possible; resetting managed install to $DEPLOY_REMOTE/$BRANCH..."
+                git reset --hard "$DEPLOY_REMOTE/$BRANCH"
             fi
 
             if [ -n "$autostash_ref" ]; then
@@ -1320,12 +1386,12 @@ EOF
         # so SSH fails fast instead of hanging when no key is configured.
         log_info "Trying SSH clone..."
         if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
-           git clone --depth 1 --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+           git clone --depth 1 --branch "$BRANCH" "$FORK_REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
             log_success "Cloned via SSH"
         else
             rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
             log_info "SSH failed, trying HTTPS..."
-            if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+            if git clone --depth 1 --branch "$BRANCH" "$FORK_REPO_URL_HTTPS" "$INSTALL_DIR"; then
                 log_success "Cloned via HTTPS"
             else
                 log_error "Failed to clone repository"
@@ -1335,6 +1401,12 @@ EOF
     fi
 
     cd "$INSTALL_DIR"
+    configure_runtime_remotes
+    # A fresh clone starts with a temporary `origin` remote. Fetch the deploy
+    # ref after reconciliation so the local branch can safely track fork/prod.
+    git remote set-branches "$DEPLOY_REMOTE" "$BRANCH" 2>/dev/null || true
+    git fetch "$DEPLOY_REMOTE" "$BRANCH"
+    set_deploy_branch_upstream
 
     if [ -n "$INSTALL_COMMIT" ]; then
         # A commit pin must never move an existing install BACKWARDS. The
@@ -1346,7 +1418,11 @@ EOF
         # current venv. Only pin when the target is not already an ancestor of
         # HEAD; a fresh clone has no such ancestry and pins normally.
         if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
-            git fetch origin "$INSTALL_COMMIT" || true
+            git fetch "$DEPLOY_REMOTE" "$INSTALL_COMMIT"
+        fi
+        if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
+            log_error "Commit $INSTALL_COMMIT is not available from $DEPLOY_REMOTE."
+            exit 1
         fi
         if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
            && git merge-base --is-ancestor "$INSTALL_COMMIT" HEAD 2>/dev/null \
@@ -1898,6 +1974,8 @@ copy_config_templates() {
         log_info "~/.hermes/config.yaml already exists, keeping it"
     fi
 
+    configure_update_channel
+
     # Create SOUL.md if it doesn't exist (global persona file).
     # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py — the
     # runtime (_ensure_default_soul_md) treats the old comment-only scaffold as
@@ -1934,6 +2012,36 @@ SOUL_EOF
                 log_success "Skills copied to ~/.hermes/skills/"
             fi
         fi
+    fi
+}
+
+# Keep the update policy in config.yaml, not an environment variable: it is
+# non-secret runtime behaviour and Hermes already resolves this exact setting
+# for `hermes update`, `hermes update --check`, and `/update`.
+configure_update_channel() {
+    local hermes_python="python"
+    if [ "$USE_VENV" = true ]; then
+        hermes_python="$INSTALL_DIR/venv/bin/python"
+    fi
+
+    if [ ! -x "$hermes_python" ] && ! command -v "$hermes_python" >/dev/null 2>&1; then
+        log_warn "Could not configure the Hermes update channel (Python unavailable)."
+        log_warn "After installation, run: hermes config set updates.remote $DEPLOY_REMOTE"
+        log_warn "Then run: hermes config set updates.branch $BRANCH"
+        return 0
+    fi
+
+    if HERMES_HOME="$HERMES_HOME" "$hermes_python" -c '
+from hermes_cli.config import set_config_value
+import sys
+set_config_value("updates.remote", sys.argv[1])
+set_config_value("updates.branch", sys.argv[2])
+' "$DEPLOY_REMOTE" "$BRANCH"; then
+        log_success "Configured Hermes updates: $DEPLOY_REMOTE/$BRANCH"
+    else
+        log_warn "Could not configure the Hermes update channel automatically."
+        log_warn "After installation, run: hermes config set updates.remote $DEPLOY_REMOTE"
+        log_warn "Then run: hermes config set updates.branch $BRANCH"
     fi
 }
 
