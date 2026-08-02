@@ -5891,6 +5891,7 @@ class TurnRunner:
                         self._runner._build_stream_consumer_config(
                             ctx.source, _scfg, _adapter,
                             on_missing_cursor="raise",
+                            commentary_mode=ctx.interim_assistant_messages_mode,
                         )
                     )
                     _stream_consumer = GatewayStreamConsumer(
@@ -5916,6 +5917,17 @@ class TurnRunner:
                                     _stts_consumer_ref.on_delta(text)
                     ctx.stream_consumer_holder[0] = _stream_consumer
             except Exception as _sc_err:
+                if (
+                    _want_interim_consumer
+                    and ctx.interim_assistant_messages_mode == "preview"
+                ):
+                    logger.warning(
+                        "Telegram commentary preview unavailable for %s:%s — "
+                        "falling back to separate interim messages: %s",
+                        getattr(ctx.source, "platform", None),
+                        getattr(ctx.source, "chat_id", None),
+                        _sc_err,
+                    )
                 logger.debug("Could not set up stream consumer: %s", _sc_err)
 
         # When text streaming is off but streaming TTS is active,
@@ -29681,6 +29693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
         *,
         on_missing_cursor: str,
+        commentary_mode: str = "separate",
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
         """Build the shared ``StreamConsumerConfig`` and the optional
         Telegram pause-typing closure used by both agent-run paths.
@@ -29751,6 +29764,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             fresh_final_after_seconds=_fresh_final_secs,
             transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            commentary_mode=(
+                commentary_mode
+                if source.platform == Platform.TELEGRAM
+                else "separate"
+            ),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -30398,14 +30416,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
-        interim_assistant_messages_mode = _display_surface_mode(
+        _interim_visibility = _display_surface_mode(
             "interim_assistant_messages",
             default=True,
             require_platform_override_for={Platform.MATTERMOST},
         )
+        interim_assistant_messages_mode = str(
+            resolve_display_setting(
+                user_config,
+                platform_key,
+                "interim_assistant_message_mode",
+                "separate",
+            )
+            or "separate"
+        ).strip().lower()
+        if interim_assistant_messages_mode not in {"separate", "preview"}:
+            interim_assistant_messages_mode = "separate"
+        # Preview compaction is intentionally Telegram-only.  A misplaced
+        # preview value on another platform retains legacy separate delivery.
+        if (
+            interim_assistant_messages_mode == "preview"
+            and source.platform != Platform.TELEGRAM
+        ):
+            interim_assistant_messages_mode = "separate"
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
-            and interim_assistant_messages_mode != "off"
+            and _interim_visibility != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
@@ -30528,6 +30564,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets=disabled_toolsets,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+            interim_assistant_messages_mode=interim_assistant_messages_mode,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
             _voice_ack_fired=_voice_ack_fired,
@@ -31601,7 +31638,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
-                    return result_holder[0] or {"final_response": response, "messages": history}
+                    # This early return hands the completed response back to
+                    # Base for normal final delivery, bypassing the cleanup
+                    # registration below. Snapshot preview IDs now and attach
+                    # their deletion to Base's successful final ACK.
+                    _depth_sc = stream_consumer_holder[0]
+                    if _depth_sc and stream_task:
+                        try:
+                            await asyncio.wait_for(stream_task, timeout=5.0)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            stream_task.cancel()
+                            try:
+                                await stream_task
+                            except asyncio.CancelledError:
+                                pass
+                        except Exception as e:
+                            logger.debug(
+                                "Stream consumer wait at interrupt-depth cap failed: %s",
+                                e,
+                            )
+                    _depth_preview_ids = tuple(
+                        getattr(_depth_sc, "commentary_preview_message_ids", ()) or ()
+                    )
+                    _depth_response = result_holder[0] or {
+                        "final_response": response,
+                        "messages": history,
+                    }
+                    if (
+                        adapter
+                        and source.platform == Platform.TELEGRAM
+                        and _depth_preview_ids
+                        and isinstance(_depth_response, dict)
+                        and not _depth_response.get("failed")
+                        and not _depth_response.get("interrupted")
+                        and (_depth_response.get("final_response") or "").strip()
+                        and hasattr(
+                            adapter,
+                            "register_post_successful_delivery_callback",
+                        )
+                        and getattr(type(adapter), "delete_message", None)
+                        is not BasePlatformAdapter.delete_message
+                    ):
+                        _depth_chat_id = source.chat_id
+
+                        async def _delete_depth_previews() -> None:
+                            for _depth_preview_id in _depth_preview_ids:
+                                try:
+                                    await adapter.delete_message(
+                                        _depth_chat_id,
+                                        _depth_preview_id,
+                                    )
+                                except Exception:
+                                    pass
+
+                        adapter.register_post_successful_delivery_callback(
+                            session_key,
+                            _delete_depth_previews,
+                            generation=run_generation,
+                        )
+                    return _depth_response
 
                 was_interrupted = result.get("interrupted")
                 if not was_interrupted:
@@ -31633,6 +31728,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         first_response,
                         previewed=_previewed,
                     )
+                    _queued_final_delivery_succeeded = _already_streamed
                     # Apply the same predicate as the normal completed-turn path.
                     # This direct queued-send branch predates intentional-silence
                     # filtering, so without this check it leaks the literal marker.
@@ -31660,7 +31756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
+                            _queued_final_result = await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
                                 adapter=adapter,
@@ -31670,8 +31766,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
                             )
+                            _queued_final_delivery_succeeded = bool(
+                                getattr(_queued_final_result, "success", False)
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                    elif first_response:
+                        logger.info(
+                            "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
+                            session_key or "?",
+                        )
+                    # This branch recurses before the normal post-run cleanup
+                    # registration below. Clean the completed first turn's
+                    # preview here, strictly after its explicit final ACK.
+                    _queued_preview_ids = tuple(
+                        getattr(_sc, "commentary_preview_message_ids", ()) or ()
+                    )
+                    if (
+                        _queued_final_delivery_succeeded
+                        and source.platform == Platform.TELEGRAM
+                        and _queued_preview_ids
+                    ):
+                        _queued_delete = getattr(type(adapter), "delete_message", None)
+                        if (
+                            _queued_delete is not None
+                            and _queued_delete is not BasePlatformAdapter.delete_message
+                        ):
+                            for _queued_preview_id in _queued_preview_ids:
+                                try:
+                                    await adapter.delete_message(
+                                        source.chat_id,
+                                        _queued_preview_id,
+                                    )
+                                except Exception:
+                                    pass
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -31894,6 +32022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        _explicit_final_delivery_succeeded = False
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
@@ -32007,17 +32136,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transformed_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transformed_result, "success", False):
+                            response["already_sent"] = True
+                            _explicit_final_delivery_succeeded = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit streamed message %s for session %s to include plugin-transformed content; normal final delivery remains enabled.",
+                                _sc_msg_id,
+                                session_key or "?",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
@@ -32044,6 +32181,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _transformed,
                     len(_final),
                 )
+
+        # Commentary preview cleanup is stricter than legacy progress cleanup:
+        # it runs only after a confirmed final platform ACK. Streamed finals are
+        # already acknowledged here; commentary-only turns defer to the base
+        # adapter's success-gated delivery callback.
+        _commentary_preview_ids = tuple(
+            getattr(_sc, "commentary_preview_message_ids", ()) or ()
+        )
+        if (
+            _commentary_preview_ids
+            and source.platform == Platform.TELEGRAM
+            and isinstance(response, dict)
+            and not response.get("failed")
+            and not response.get("interrupted")
+            and (response.get("final_response") or "").strip()
+        ):
+            _commentary_adapter = getattr(_sc, "adapter", None)
+            _commentary_delete = (
+                getattr(type(_commentary_adapter), "delete_message", None)
+                if _commentary_adapter is not None
+                else None
+            )
+            if (
+                _commentary_adapter is not None
+                and _commentary_delete is not None
+                and _commentary_delete is not BasePlatformAdapter.delete_message
+            ):
+                _commentary_chat_id = source.chat_id
+
+                async def _delete_commentary_previews() -> None:
+                    for _preview_id in _commentary_preview_ids:
+                        try:
+                            await _commentary_adapter.delete_message(
+                                _commentary_chat_id,
+                                _preview_id,
+                            )
+                        except Exception:
+                            pass
+
+                _final_text = response.get("final_response") or ""
+                _previewed = bool(response.get("response_previewed"))
+                if _explicit_final_delivery_succeeded or _stream_confirmed_final_delivery(
+                    _sc,
+                    _final_text,
+                    previewed=_previewed,
+                ):
+                    await _delete_commentary_previews()
+                elif session_key and hasattr(
+                    _commentary_adapter,
+                    "register_post_successful_delivery_callback",
+                ):
+                    _commentary_adapter.register_post_successful_delivery_callback(
+                        session_key,
+                        _delete_commentary_previews,
+                        generation=run_generation,
+                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
