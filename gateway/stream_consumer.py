@@ -154,8 +154,13 @@ class StreamConsumerConfig:
     # Completed interim assistant commentary delivery:
     #   "separate" — one normal message per commentary item (legacy/default)
     #   "preview"  — one editable preview bubble, currently enabled by the
-    #                gateway only for Telegram.
+    #                gateway only for Telegram. Preview mode stacks successive
+    #                commentary into that bubble and can seed a temporary
+    #                "Waiting for …" placeholder until the first real update.
     commentary_mode: str = "separate"
+    # Optional early-turn placeholder for preview mode (e.g.
+    # "Waiting for xai-oauth/grok-4.5/high..."). Empty disables seeding.
+    commentary_waiting_label: str = ""
 
 
 class GatewayStreamConsumer:
@@ -313,6 +318,15 @@ class GatewayStreamConsumer:
         self._commentary_preview_message_id: Optional[str] = None
         self._commentary_preview_last_text = ""
         self._commentary_preview_edit_supported = True
+        # Stacked real commentary entries shown in the single preview bubble.
+        # Placeholder text is never stored here — first real commentary replaces
+        # the waiting label, later entries append.
+        self._commentary_preview_entries: list[str] = []
+        self._commentary_preview_is_placeholder = False
+        self._commentary_waiting_label = str(
+            getattr(config, "commentary_waiting_label", "") or ""
+        ).strip()
+        self._commentary_placeholder_sent = False
 
     def _metadata_for_send(
         self,
@@ -454,6 +468,22 @@ class GatewayStreamConsumer:
         """Queue a completed interim assistant commentary message."""
         if text:
             self._queue.put((_COMMENTARY, text))
+
+    def set_commentary_waiting_label(self, label: str) -> None:
+        """Update the waiting-placeholder label before it has been delivered."""
+        text = str(label or "").strip()
+        if not text:
+            return
+        # Once a placeholder (or real commentary) is on the wire, leave it —
+        # later label tweaks would only thrash edits without user value.
+        if self._commentary_placeholder_sent or self._commentary_preview_entries:
+            return
+        self._commentary_waiting_label = text
+        if hasattr(self, "cfg") and self.cfg is not None:
+            try:
+                self.cfg.commentary_waiting_label = text
+            except Exception:
+                pass
 
     def flush_pending_sync(self, timeout: float = 5.0) -> bool:
         """Block the calling (agent worker) thread until everything queued
@@ -744,6 +774,14 @@ class GatewayStreamConsumer:
                 "Stream consumer using native-draft transport (chat=%s draft_id=%s)",
                 self.chat_id, self._draft_id,
             )
+
+        # Seed the Telegram commentary preview bubble immediately so the user
+        # sees a single silent "Waiting for …" message until real interim text
+        # arrives (edits do not re-notify). Failures are non-fatal.
+        try:
+            await self._maybe_send_waiting_placeholder()
+        except Exception as e:
+            logger.debug("Commentary waiting placeholder failed: %s", e)
 
         try:
             while True:
@@ -1708,7 +1746,13 @@ class GatewayStreamConsumer:
             pass  # best-effort — don't let this block the fallback path
 
     async def _send_commentary(self, text: str) -> bool:
-        """Send a completed interim assistant commentary message."""
+        """Send a completed interim assistant commentary message.
+
+        In preview mode, successive commentary is stacked into one editable
+        bubble (history preserved). A waiting placeholder is replaced by the
+        first real entry. Telegram silent-send already suppresses pings unless
+        ``metadata[\"notify\"]`` is set; finals set notify separately.
+        """
         text = self._clean_for_display(text)
         if not text.strip():
             return False
@@ -1717,74 +1761,174 @@ class GatewayStreamConsumer:
             str(getattr(self.cfg, "commentary_mode", "separate")).lower()
             == "preview"
         )
-        preview_delivery = preview_mode
-        if preview_mode:
-            # Telegram measures the editable-message limit in UTF-16 code
-            # units.  Content that cannot fit in one editable bubble must use
-            # the adapter's existing full-content send/split path; never clip
-            # completed commentary merely to keep it editable.
-            limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
-            len_fn: "Callable[[str], int]" = len
-            if isinstance(self.adapter, _BasePlatformAdapter):
-                try:
-                    limit = self.adapter.max_message_length_for_chat(self.chat_id)
-                    len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
-                except Exception:
-                    pass
-            safe_limit = max(1, int(limit) - 100)
-            if len_fn(text) > safe_limit:
-                preview_delivery = False
-                self._commentary_preview_message_id = None
-                self._commentary_preview_edit_supported = False
+        if not preview_mode:
+            return await self._deliver_commentary_content(
+                text,
+                preview_delivery=False,
+                preview_mode=False,
+                entries=None,
+                is_placeholder=False,
+            )
 
-            if (
-                preview_delivery
-                and self._commentary_preview_message_id
-                and self._commentary_preview_edit_supported
-            ):
-                if text == self._commentary_preview_last_text:
+        # Build stacked body: first real entry replaces any placeholder;
+        # later entries append. Never store the waiting label in the stack.
+        if self._commentary_preview_is_placeholder or not self._commentary_preview_entries:
+            entries = [text]
+        else:
+            # De-dupe exact consecutive repeats (common with status thrash).
+            if self._commentary_preview_entries[-1] == text:
+                return True
+            entries = list(self._commentary_preview_entries) + [text]
+
+        body, entries, fits = self._fit_commentary_stack(entries)
+        if not fits:
+            # Single entry cannot fit an editable bubble — fall back to the
+            # adapter full-content send path for this item only.
+            #
+            # Important: FIFO-rebaseline the stack afterward. If we kept the
+            # prior entries while abandoning editable delivery, the *next*
+            # normal commentary would rebuild old history + new text and
+            # duplicate already-visible content (review on #25).
+            ok = await self._deliver_commentary_content(
+                text,
+                preview_delivery=False,
+                preview_mode=True,
+                entries=None,
+                is_placeholder=False,
+            )
+            self._commentary_preview_entries = []
+            self._commentary_preview_is_placeholder = False
+            # Keep any existing preview bubble id so a later normal entry can
+            # edit it to just the new text (fresh FIFO stack, same bubble).
+            # Always re-enable edits after the out-of-band overlong send.
+            self._commentary_preview_edit_supported = True
+            return ok
+
+        ok = await self._deliver_commentary_content(
+            body,
+            preview_delivery=True,
+            preview_mode=True,
+            entries=entries,
+            is_placeholder=False,
+        )
+        return ok
+
+    def _fit_commentary_stack(
+        self, entries: list[str]
+    ) -> tuple[str, list[str], bool]:
+        """Join stacked commentary and drop oldest entries until under limit.
+
+        Returns ``(body, entries, fits)``. ``fits`` is False only when even the
+        newest single entry exceeds the editable limit.
+        """
+        limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        len_fn: "Callable[[str], int]" = len
+        if isinstance(self.adapter, _BasePlatformAdapter):
+            try:
+                limit = self.adapter.max_message_length_for_chat(self.chat_id)
+                len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
+            except Exception:
+                pass
+        safe_limit = max(1, int(limit) - 100)
+        kept = list(entries)
+        while kept:
+            body = "\n\n".join(kept)
+            if len_fn(body) <= safe_limit:
+                return body, kept, True
+            if len(kept) == 1:
+                return body, kept, False
+            kept.pop(0)
+        return "", [], False
+
+    async def _maybe_send_waiting_placeholder(self) -> bool:
+        """Seed the preview bubble with a waiting label if configured."""
+        if (
+            str(getattr(self.cfg, "commentary_mode", "separate")).lower()
+            != "preview"
+        ):
+            return False
+        label = self._clean_for_display(self._commentary_waiting_label)
+        if not label.strip():
+            return False
+        if self._commentary_placeholder_sent or self._commentary_preview_entries:
+            return False
+        if self._commentary_preview_message_id:
+            return False
+        return await self._deliver_commentary_content(
+            label,
+            preview_delivery=True,
+            preview_mode=True,
+            entries=None,
+            is_placeholder=True,
+        )
+
+    async def _deliver_commentary_content(
+        self,
+        text: str,
+        *,
+        preview_delivery: bool,
+        preview_mode: bool,
+        entries: list[str] | None,
+        is_placeholder: bool,
+    ) -> bool:
+        """Shared send/edit path for commentary preview and separate modes."""
+        if (
+            preview_delivery
+            and self._commentary_preview_message_id
+            and self._commentary_preview_edit_supported
+        ):
+            if text == self._commentary_preview_last_text:
+                return True
+            try:
+                kwargs: dict[str, Any] = {
+                    "chat_id": self.chat_id,
+                    "message_id": self._commentary_preview_message_id,
+                    "content": text,
+                    # Completed commentary should retain Telegram formatting
+                    # (rich -> MarkdownV2 -> plain fallback), not use the raw
+                    # progressive-edit path.
+                    "finalize": True,
+                }
+                metadata = self._metadata_for_send(expect_edits=True)
+                if metadata:
+                    try:
+                        params = inspect.signature(self.adapter.edit_message).parameters
+                        if "metadata" in params or any(
+                            param.kind is inspect.Parameter.VAR_KEYWORD
+                            for param in params.values()
+                        ):
+                            kwargs["metadata"] = metadata
+                    except (TypeError, ValueError):
+                        pass
+                result = await self.adapter.edit_message(**kwargs)
+                if getattr(result, "success", False):
+                    updated_ids = self._track_commentary_preview_result(result)
+                    if len(updated_ids) == 1:
+                        self._commentary_preview_message_id = updated_ids[0]
+                    elif len(updated_ids) > 1:
+                        # Overflow created multiple visible messages, so no
+                        # single bubble can represent the preview anymore.
+                        self._commentary_preview_message_id = None
+                        self._commentary_preview_edit_supported = False
+                    self._commentary_preview_last_text = text
+                    if is_placeholder:
+                        self._commentary_preview_is_placeholder = True
+                        self._commentary_placeholder_sent = True
+                        self._commentary_preview_entries = []
+                    else:
+                        self._commentary_preview_is_placeholder = False
+                        self._commentary_placeholder_sent = True
+                        if entries is not None:
+                            self._commentary_preview_entries = list(entries)
                     return True
-                try:
-                    kwargs: dict[str, Any] = {
-                        "chat_id": self.chat_id,
-                        "message_id": self._commentary_preview_message_id,
-                        "content": text,
-                        # Completed commentary should retain Telegram formatting
-                        # (rich -> MarkdownV2 -> plain fallback), not use the raw
-                        # progressive-edit path.
-                        "finalize": True,
-                    }
-                    metadata = self._metadata_for_send(expect_edits=True)
-                    if metadata:
-                        try:
-                            params = inspect.signature(self.adapter.edit_message).parameters
-                            if "metadata" in params or any(
-                                param.kind is inspect.Parameter.VAR_KEYWORD
-                                for param in params.values()
-                            ):
-                                kwargs["metadata"] = metadata
-                        except (TypeError, ValueError):
-                            pass
-                    result = await self.adapter.edit_message(**kwargs)
-                    if getattr(result, "success", False):
-                        updated_ids = self._track_commentary_preview_result(result)
-                        if len(updated_ids) == 1:
-                            self._commentary_preview_message_id = updated_ids[0]
-                        elif len(updated_ids) > 1:
-                            # Overflow created multiple visible messages, so no
-                            # single bubble can represent the preview anymore.
-                            self._commentary_preview_message_id = None
-                            self._commentary_preview_edit_supported = False
-                        self._commentary_preview_last_text = text
-                        return True
-                except Exception as e:
-                    logger.debug("Commentary preview edit failed: %s", e)
+            except Exception as e:
+                logger.debug("Commentary preview edit failed: %s", e)
 
-                # Preserve the old bubble as a breadcrumb and degrade this
-                # update to a fresh send.  A successful fresh send becomes the
-                # next editable preview; all created IDs remain cleanup-eligible.
-                self._commentary_preview_edit_supported = False
-                self._commentary_preview_message_id = None
+            # Preserve the old bubble as a breadcrumb and degrade this
+            # update to a fresh send.  A successful fresh send becomes the
+            # next editable preview; all created IDs remain cleanup-eligible.
+            self._commentary_preview_edit_supported = False
+            self._commentary_preview_message_id = None
 
         try:
             result = await self.adapter.send(
@@ -1809,6 +1953,15 @@ class GatewayStreamConsumer:
                         self._commentary_preview_message_id = message_ids[0]
                         self._commentary_preview_edit_supported = True
                         self._commentary_preview_last_text = text
+                        if is_placeholder:
+                            self._commentary_preview_is_placeholder = True
+                            self._commentary_placeholder_sent = True
+                            self._commentary_preview_entries = []
+                        else:
+                            self._commentary_preview_is_placeholder = False
+                            self._commentary_placeholder_sent = True
+                            if entries is not None:
+                                self._commentary_preview_entries = list(entries)
                     else:
                         # No ID (or multiple IDs from an adapter split) means
                         # later commentary must stay on the safe fresh-send path.
@@ -1816,15 +1969,17 @@ class GatewayStreamConsumer:
                         self._commentary_preview_edit_supported = False
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
-                # new bubble below.
-                self._notify_new_message()
+                # new bubble below. Skip for pure waiting placeholders so
+                # tool progress is not reset before real work begins.
+                if not is_placeholder:
+                    self._notify_new_message()
                 # Record the exact delivered text so run.py can confirm whether
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
                 # In preview mode commentary is never final-delivery evidence,
                 # even if it happens to equal the final text.  The mode's final
                 # answer must always be delivered separately.
-                if not preview_mode:
+                if not preview_mode and not is_placeholder:
                     self._delivered_commentary_texts.append(text)
             return result.success
         except Exception as e:

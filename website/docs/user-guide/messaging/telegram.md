@@ -1311,7 +1311,7 @@ The Telegram adapter routes recurring agent status callbacks (e.g. "Compressing 
 
 ### Commentary preview mode
 
-Completed assistant commentary uses separate messages by default. To keep long turns compact, opt Telegram into one temporary editable preview:
+Completed assistant commentary uses separate messages by default. To keep long turns compact and avoid notification spam, opt Telegram into one temporary editable preview:
 
 ```yaml
 display:
@@ -1320,7 +1320,13 @@ display:
       interim_assistant_message_mode: preview
 ```
 
-The first commentary sends a normal bot message and later commentary edits that same message. The final answer remains an independent message and is never suppressed merely because commentary was visible. Hermes deletes commentary previews only after Telegram acknowledges the final response; failed or cancelled turns retain them as breadcrumbs. Topic/reply metadata and Telegram's MarkdownV2/rich-to-plain fallbacks are preserved. If an edit is rejected, too old, or rate-limited, Hermes falls back to a fresh preview message. Commentary too long for one editable message uses Telegram's existing full-content send/split path instead of clipping the text. Cleanup deletion is best-effort and cannot remove or delay the final answer.
+In `preview` mode Hermes:
+
+1. Immediately posts a silent **waiting placeholder** shaped like `Waiting for <provider>/<model>/<effort>...` (effort is omitted when unset/disabled).
+2. Replaces that placeholder with the first real interim commentary, then **stacks** later commentary into the same bubble (joined with blank lines) via edits — so history is visible without extra Telegram notifications.
+3. Delivers the final answer as an independent message, then deletes the preview bubble only after Telegram acknowledges that final send.
+
+Failed or cancelled turns retain the preview as a breadcrumb. Topic/reply metadata and Telegram's MarkdownV2/rich-to-plain fallbacks are preserved. If an edit is rejected, too old, or rate-limited, Hermes falls back to a fresh preview message. When stacked history exceeds one editable message, oldest entries are dropped first; a single entry that still cannot fit uses Telegram's existing full-content send/split path instead of clipping. Cleanup deletion is best-effort and cannot remove or delay the final answer.
 
 ## Pin incoming user message during agent turn
 
