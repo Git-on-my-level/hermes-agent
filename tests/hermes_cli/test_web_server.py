@@ -1301,6 +1301,13 @@ class TestBuildSchemaFromConfig:
         assert "node24" in runtime_entry["options"]
         assert "python3.13" in runtime_entry["options"]
         assert len(runtime_entry["options"]) >= 3
+        for path in (
+            "display.interim_assistant_message_mode",
+            "display.platforms.telegram.interim_assistant_message_mode",
+        ):
+            commentary_entry = CONFIG_SCHEMA[path]
+            assert commentary_entry["type"] == "select"
+            assert set(commentary_entry["options"]) == {"separate", "preview"}
 
 
 

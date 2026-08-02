@@ -822,6 +822,17 @@ def _timezone_options() -> List[str]:
 
 
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "display.interim_assistant_message_mode": {
+        "type": "select",
+        "description": "Default interim commentary delivery shape",
+        "options": ["separate", "preview"],
+    },
+    "display.platforms.telegram.interim_assistant_message_mode": {
+        "type": "select",
+        "description": "Telegram interim commentary delivery shape",
+        "options": ["separate", "preview"],
+        "category": "display",
+    },
     "timezone": {
         "type": "select",
         "description": "IANA timezone (e.g. America/New_York). Blank uses the system timezone.",
@@ -1096,6 +1107,13 @@ for _k, _v in CONFIG_SCHEMA.items():
     if _k == "model":
         _ordered_schema["model_context_length"] = _mcl_entry
 CONFIG_SCHEMA = _ordered_schema
+
+# Per-platform display overrides are intentionally sparse in DEFAULT_CONFIG:
+# materializing a Telegram value there would shadow the global value after
+# deep-merge. Expose this supported override as a virtual dashboard field.
+CONFIG_SCHEMA["display.platforms.telegram.interim_assistant_message_mode"] = (
+    _SCHEMA_OVERRIDES["display.platforms.telegram.interim_assistant_message_mode"]
+)
 
 
 def _is_command_provider_block(value: Any) -> bool:

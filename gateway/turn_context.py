@@ -94,6 +94,7 @@ class TurnContext:
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    interim_assistant_messages_mode: str = "separate"
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------

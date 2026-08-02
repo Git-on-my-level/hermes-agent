@@ -950,6 +950,35 @@ class TestInterimAssistantMessageConfig:
 
     def test_default_config_enables_interim_assistant_messages(self):
         assert DEFAULT_CONFIG["display"]["interim_assistant_messages"] is True
+        assert DEFAULT_CONFIG["display"]["interim_assistant_message_mode"] == "separate"
+        assert "interim_assistant_message_mode" not in DEFAULT_CONFIG["display"][
+            "platforms"
+        ]["telegram"]
+
+    def test_loaded_global_commentary_mode_is_not_shadowed_by_platform_defaults(
+        self,
+        tmp_path,
+    ):
+        from gateway.display_config import resolve_display_setting
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"display": {"interim_assistant_message_mode": "preview"}}
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            loaded = load_config()
+
+        assert (
+            resolve_display_setting(
+                loaded,
+                "telegram",
+                "interim_assistant_message_mode",
+            )
+            == "preview"
+        )
 
     def test_migrate_to_v15_adds_interim_assistant_message_gate(self, tmp_path):
         config_path = tmp_path / "config.yaml"

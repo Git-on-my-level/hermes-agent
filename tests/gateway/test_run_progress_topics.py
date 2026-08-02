@@ -115,6 +115,86 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class CommentaryPreviewCaptureAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.deleted = []
+        self._next_id = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._next_id += 1
+        message_id = f"message-{self._next_id}"
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+    async def edit_message(
+        self,
+        chat_id,
+        message_id,
+        content,
+        *,
+        finalize=False,
+        metadata=None,
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.deleted.append({"chat_id": chat_id, "message_id": message_id})
+        return True
+
+
+class CommentaryDeleteFailureAdapter(CommentaryPreviewCaptureAdapter):
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.deleted.append({"chat_id": chat_id, "message_id": message_id})
+        raise RuntimeError("delete unavailable")
+
+
+class CommentaryFinalDeliveryAdapter(CommentaryPreviewCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM, *, final_succeeds=True):
+        super().__init__(platform=platform)
+        self.final_succeeds = final_succeeds
+        self.delivery_events = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.delivery_events.append(("send", content))
+        if "Final answer." in content and not self.final_succeeds:
+            self.sent.append(
+                {
+                    "chat_id": chat_id,
+                    "content": content,
+                    "reply_to": reply_to,
+                    "metadata": metadata,
+                }
+            )
+            return SendResult(success=False, error="final delivery rejected")
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.delivery_events.append(("delete", message_id))
+        return await super().delete_message(chat_id, message_id)
+
+
+class CommentaryQueuedFinalFailureAdapter(CommentaryFinalDeliveryAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform, final_succeeds=False)
+
+
 class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
     """Fail one progress edit transiently, then accept later edits."""
 
@@ -513,6 +593,30 @@ class CommentaryAgent:
         }
 
 
+class CommentaryBurstAgent:
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("Checking the repo.", already_streamed=False)
+            self.interim_assistant_callback("Running targeted tests.", already_streamed=False)
+        return {
+            "final_response": "Final answer.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FailedCommentaryBurstAgent(CommentaryBurstAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        result = super().run_conversation(message, conversation_history, task_id)
+        result["failed"] = True
+        result["error"] = "provider failed"
+        return result
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -675,6 +779,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    event_message_id=None,
 ):
     if config_data:
         import yaml
@@ -720,8 +825,277 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_telegram_preview_mode_uses_editable_commentary_and_defers_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryBurstAgent,
+        session_id="sess-commentary-preview",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        adapter_cls=CommentaryPreviewCaptureAdapter,
+        event_message_id="user-42",
+    )
+
+    assert result.get("already_sent") is not True
+    assert [call["content"] for call in adapter.sent] == ["Checking the repo."]
+    assert [call["content"] for call in adapter.edits] == ["Running targeted tests."]
+    assert adapter.sent[0]["reply_to"] == "user-42"
+    assert adapter.sent[0]["metadata"]["expect_edits"] is True
+    assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
+    assert adapter.edits[0]["message_id"] == "message-1"
+    assert adapter.edits[0]["finalize"] is True
+    session_key = "agent:main:telegram:group:-1001:17585"
+    cleanup = adapter.pop_post_successful_delivery_callback(session_key)
+    assert callable(cleanup)
+    await cleanup()
+    assert adapter.deleted == [{"chat_id": "-1001", "message_id": "message-1"}]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_commentary_delete_failure_does_not_fail_final_result(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryBurstAgent,
+        session_id="sess-commentary-delete-failure",
+        config_data={
+            "display": {
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        adapter_cls=CommentaryDeleteFailureAdapter,
+    )
+
+    session_key = "agent:main:telegram:group:-1001:17585"
+    cleanup = adapter.pop_post_successful_delivery_callback(session_key)
+    assert callable(cleanup)
+    await cleanup()
+
+    assert result["final_response"] == "Final answer."
+    assert result.get("already_sent") is not True
+    assert adapter.deleted == [{"chat_id": "-1001", "message_id": "message-1"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_succeeds", [True, False])
+async def test_base_delivery_sends_independent_final_then_conditionally_cleans_preview(
+    monkeypatch,
+    tmp_path,
+    final_succeeds,
+):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "platforms": {
+                        "telegram": {
+                            "interim_assistant_message_mode": "preview",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CommentaryBurstAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = CommentaryFinalDeliveryAdapter(final_succeeds=final_succeeds)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="user-42",
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+
+    async def handler(inbound):
+        result = await runner._run_agent(
+            message=inbound.text,
+            context_prompt="",
+            history=[],
+            source=inbound.source,
+            session_id=f"sess-final-ack-{final_succeeds}",
+            session_key=session_key,
+            event_message_id=inbound.message_id,
+        )
+        assert result.get("already_sent") is not True
+        return result["final_response"]
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(event, session_key)
+
+    assert adapter.sent[0]["content"] == "Checking the repo."
+    assert any("Final answer." in call["content"] for call in adapter.sent[1:])
+    assert [call["content"] for call in adapter.edits] == [
+        "Running targeted tests.",
+    ]
+    if final_succeeds:
+        assert adapter.deleted == [
+            {"chat_id": "-1001", "message_id": "message-1"},
+        ]
+        assert adapter.delivery_events == [
+            ("send", "Checking the repo."),
+            ("send", "Final answer."),
+            ("delete", "message-1"),
+        ]
+    else:
+        assert adapter.deleted == []
+        assert all(kind != "delete" for kind, _ in adapter.delivery_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_cls", "expected_deleted"),
+    [
+        (CommentaryFinalDeliveryAdapter, True),
+        (CommentaryQueuedFinalFailureAdapter, False),
+    ],
+)
+async def test_queued_followup_cleans_first_preview_only_after_first_final_ack(
+    monkeypatch,
+    tmp_path,
+    adapter_cls,
+    expected_deleted,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryBurstAgent,
+        session_id=f"sess-commentary-queued-{expected_deleted}",
+        pending_text="queued follow-up",
+        config_data={
+            "display": {
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        adapter_cls=adapter_cls,
+        event_message_id="user-42",
+    )
+
+    assert result["final_response"] == "Final answer."
+    assert ("send", "Final answer.") in adapter.delivery_events
+    if expected_deleted:
+        assert adapter.delivery_events.index(("send", "Final answer.")) < (
+            adapter.delivery_events.index(("delete", "message-1"))
+        )
+        assert adapter.deleted == [
+            {"chat_id": "-1001", "message_id": "message-1"},
+        ]
+    else:
+        assert adapter.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_default_and_nontelegram_preview_keep_separate_commentary(
+    monkeypatch,
+    tmp_path,
+):
+    telegram, telegram_result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryBurstAgent,
+        session_id="sess-commentary-default",
+        config_data={"display": {"interim_assistant_messages": True}},
+        adapter_cls=CommentaryPreviewCaptureAdapter,
+    )
+    assert telegram_result.get("already_sent") is not True
+    assert [call["content"] for call in telegram.sent] == [
+        "Checking the repo.",
+        "Running targeted tests.",
+    ]
+    assert telegram.edits == []
+
+    discord, discord_result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryBurstAgent,
+        session_id="sess-commentary-discord-preview",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "platforms": {
+                    "discord": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="dm-1",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CommentaryPreviewCaptureAdapter,
+    )
+    assert discord_result.get("already_sent") is not True
+    assert [call["content"] for call in discord.sent] == [
+        "Checking the repo.",
+        "Running targeted tests.",
+    ]
+    assert discord.edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_failed_turn_retains_commentary_preview(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FailedCommentaryBurstAgent,
+        session_id="sess-commentary-preview-failed",
+        config_data={
+            "display": {
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        adapter_cls=CommentaryPreviewCaptureAdapter,
+    )
+
+    assert result["failed"] is True
+    assert adapter.deleted == []
+    assert adapter._post_successful_delivery_callbacks == {}
 
 
 @pytest.mark.asyncio
@@ -1316,5 +1690,3 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
-
-

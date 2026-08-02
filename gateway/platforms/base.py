@@ -2805,6 +2805,10 @@ class BasePlatformAdapter(ABC):
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        # One-shot callbacks that require a confirmed successful main-response
+        # platform ACK. Unlike the legacy callbacks above, these are discarded
+        # without firing on failed delivery, exceptions, or cancellation.
+        self._post_successful_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
@@ -4889,6 +4893,79 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return entry if callable(entry) else None
 
+    def register_post_successful_delivery_callback(
+        self,
+        session_key: str,
+        callback: Callable,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        """Register work that may run only after a confirmed final-delivery ACK."""
+        if not session_key or not callable(callback):
+            return
+        existing = self._post_successful_delivery_callbacks.get(session_key)
+        if existing is not None:
+            if isinstance(existing, tuple) and len(existing) == 2:
+                existing_gen, existing_cb = existing
+            else:
+                existing_gen, existing_cb = None, existing
+            if (
+                existing_gen is not None
+                and generation is not None
+                and int(generation) < int(existing_gen)
+            ):
+                return
+            if callable(existing_cb) and (
+                existing_gen is None
+                or generation is None
+                or int(existing_gen) == int(generation)
+            ):
+                previous = existing_cb
+                new = callback
+
+                async def _chained_success() -> None:
+                    for cb in (previous, new):
+                        try:
+                            result = cb()
+                            if inspect.isawaitable(result):
+                                await result
+                        except Exception:
+                            logger.debug(
+                                "Successful-delivery callback failed", exc_info=True
+                            )
+
+                callback = _chained_success
+        if generation is None:
+            self._post_successful_delivery_callbacks[session_key] = callback
+        else:
+            self._post_successful_delivery_callbacks[session_key] = (
+                int(generation),
+                callback,
+            )
+
+    def pop_post_successful_delivery_callback(
+        self,
+        session_key: str,
+        *,
+        generation: int | None = None,
+    ) -> Callable | None:
+        """Pop success-gated work, optionally requiring generation ownership."""
+        if not session_key:
+            return None
+        entry = self._post_successful_delivery_callbacks.get(session_key)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple) and len(entry) == 2:
+            entry_generation, callback = entry
+            if generation is not None and int(entry_generation) != int(generation):
+                return None
+            self._post_successful_delivery_callbacks.pop(session_key, None)
+            return callback if callable(callback) else None
+        if generation is not None:
+            return None
+        self._post_successful_delivery_callbacks.pop(session_key, None)
+        return entry if callable(entry) else None
+
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
     # (e.g. Discord adds 👀/✅/❌ reactions).
@@ -6379,6 +6456,23 @@ class BasePlatformAdapter(ABC):
                     if inspect.isawaitable(_post_result):
                         await asyncio.wait_for(
                             _post_result,
+                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                        )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            # Success-only callbacks are always popped at this terminal
+            # boundary so stale cleanup cannot leak into a later turn, but fire
+            # only when the main-response send produced a positive platform ACK.
+            _success_cb = self.pop_post_successful_delivery_callback(
+                session_key,
+                generation=_callback_generation,
+            )
+            if delivery_succeeded and callable(_success_cb):
+                try:
+                    _success_result = _success_cb()
+                    if inspect.isawaitable(_success_result):
+                        await asyncio.wait_for(
+                            _success_result,
                             timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
                         )
                 except (asyncio.TimeoutError, Exception):
