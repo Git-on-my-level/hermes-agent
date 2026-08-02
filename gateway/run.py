@@ -4173,11 +4173,22 @@ class TurnRunner:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._runner._adapter_for_source(ctx.source)
                 if _adapter:
+                    _waiting_label = ""
+                    if (
+                        ctx.source.platform == Platform.TELEGRAM
+                        and ctx.interim_assistant_messages_mode == "preview"
+                    ):
+                        _waiting_label = self._runner._format_commentary_waiting_label(
+                            provider=runtime_kwargs.get("provider"),
+                            model=model,
+                            reasoning_config=reasoning_config,
+                        )
                     _consumer_cfg, _pause_typing_before_finalize = (
                         self._runner._build_stream_consumer_config(
                             ctx.source, _scfg, _adapter,
                             on_missing_cursor="raise",
                             commentary_mode=ctx.interim_assistant_messages_mode,
+                            commentary_waiting_label=_waiting_label,
                         )
                     )
                     _stream_consumer = GatewayStreamConsumer(
@@ -4201,7 +4212,8 @@ class TurnRunner:
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
                                     _stts_consumer_ref.on_delta(text)
-                    ctx.stream_consumer_holder[0] = _stream_consumer
+                    # Defer holder publication until after turn_route so the
+                    # waiting-placeholder label can include the final model.
             except Exception as _sc_err:
                 if (
                     _want_interim_consumer
@@ -4248,6 +4260,28 @@ class TurnRunner:
             )
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+
+        # Finalize waiting-label with turn-routed model/provider, then publish
+        # the consumer so the async run task can seed the placeholder.
+        if (
+            _stream_consumer is not None
+            and ctx.source.platform == Platform.TELEGRAM
+            and ctx.interim_assistant_messages_mode == "preview"
+        ):
+            try:
+                _route_model = turn_route.get("model") or model
+                _route_runtime = turn_route.get("runtime") or runtime_kwargs or {}
+                _stream_consumer.set_commentary_waiting_label(
+                    self._runner._format_commentary_waiting_label(
+                        provider=_route_runtime.get("provider"),
+                        model=_route_model,
+                        reasoning_config=reasoning_config,
+                    )
+                )
+            except Exception:
+                pass
+        if _stream_consumer is not None and ctx.stream_consumer_holder is not None:
+            ctx.stream_consumer_holder[0] = _stream_consumer
 
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
@@ -22638,6 +22672,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         on_missing_cursor: str,
         commentary_mode: str = "separate",
+        commentary_waiting_label: str = "",
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
         """Build the shared ``StreamConsumerConfig`` and the optional
         Telegram pause-typing closure used by both agent-run paths.
@@ -22689,6 +22724,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform == Platform.TELEGRAM
             else 0.0
         )
+        _tg_preview = (
+            source.platform == Platform.TELEGRAM
+            and str(commentary_mode or "").lower() == "preview"
+        )
         _consumer_cfg = StreamConsumerConfig(
             edit_interval=scfg.edit_interval,
             buffer_threshold=scfg.buffer_threshold,
@@ -22702,8 +22741,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if source.platform == Platform.TELEGRAM
                 else "separate"
             ),
+            commentary_waiting_label=(
+                str(commentary_waiting_label or "").strip() if _tg_preview else ""
+            ),
         )
         return _consumer_cfg, _pause_typing_before_finalize
+
+    @staticmethod
+    def _format_commentary_waiting_label(
+        *,
+        provider: Any = None,
+        model: Any = None,
+        reasoning_config: Any = None,
+    ) -> str:
+        """Build ``Waiting for provider/model/effort...`` for preview mode."""
+        parts: list[str] = []
+        provider_s = str(provider or "").strip()
+        model_s = str(model or "").strip()
+        if provider_s:
+            parts.append(provider_s)
+        if model_s:
+            parts.append(model_s)
+        effort_s = ""
+        if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is not False:
+            effort_s = str(reasoning_config.get("effort") or "").strip()
+        if effort_s:
+            parts.append(effort_s)
+        if not parts:
+            return "Waiting for model..."
+        return f"Waiting for {'/'.join(parts)}..."
 
     async def _run_agent_via_proxy(
         self,
