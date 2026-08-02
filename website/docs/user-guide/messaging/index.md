@@ -738,6 +738,7 @@ Telegram is usually a mobile inbox, so the defaults are tuned for that surface:
 - **`tool_progress`** defaults to **`off`** — no per-tool breadcrumb stream filling up the chat.
 - **`busy_ack_detail`** defaults to **`off`** — busy-state acknowledgments and long-running heartbeats stay terse (no `iteration 21/60` debug detail).
 - **`interim_assistant_messages`** stays **on** — real mid-turn assistant commentary (the model literally telling you what it's about to do) is signal, not noise.
+- **`interim_assistant_message_mode`** defaults to **`separate`** — opt Telegram into `preview` to edit one temporary commentary bubble instead.
 - **`long_running_notifications`** stays **on** — a single edit-in-place "⏳ Working — N min" bubble updates every few minutes so you have a heartbeat instead of staring at `typing…` for half an hour.
 
 Opt out of either of the kept-on defaults or opt back into verbose progress per platform:
@@ -753,7 +754,11 @@ display:
       # Or quiet them entirely
       interim_assistant_messages: false
       long_running_notifications: false
+      # Or compact completed commentary into one temporary editable bubble
+      interim_assistant_message_mode: preview
 ```
+
+Telegram preview mode never reuses the final-response message. The final answer is delivered separately, then the temporary preview is deleted only after a successful final delivery. Failed or cancelled turns retain it as a breadcrumb. Telegram formatting, topic/reply routing, and length limits still apply; edit failures safely fall back to fresh commentary messages, and deletion is best-effort.
 
 ### Progress bubble cleanup (opt-in)
 

@@ -1580,6 +1580,7 @@ display:
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
   interim_assistant_messages: true  # Gateway: send natural mid-turn assistant updates as separate messages
+  interim_assistant_message_mode: separate  # Gateway: separate | preview (Telegram-only preview)
   show_commentary: true   # Codex models: deliver commentary-channel progress narration as visible mid-turn updates
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
   personality: ""         # Legacy cosmetic field still surfaced in some summaries
@@ -1738,6 +1739,17 @@ Platforms without an override fall back to the global `tool_progress` value. Val
 Signal is listed as a valid platform key because the setting can be saved per platform, but the current Signal adapter cannot edit sent messages and does not render tool-progress bubbles. Keep Signal `tool_progress` set to `off`; use the CLI or an editing-capable messaging platform if you need to watch each tool call live.
 
 `interim_assistant_messages` is gateway-only. When enabled, Hermes sends completed mid-turn assistant updates as separate chat messages. This is independent from `tool_progress` and does not require gateway streaming.
+
+Telegram can opt into a single editable commentary preview while keeping that visibility gate enabled:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      interim_assistant_message_mode: preview
+```
+
+The default mode is `separate`. In `preview` mode, the first completed commentary sends one editable Telegram message and later commentary edits it. The final answer is always a separate delivery; after Telegram confirms that final delivery, Hermes deletes every preview bubble created during the turn. Agent failure, cancellation, or a failed final send keeps the preview as a breadcrumb. Edit failures fall back to fresh commentary messages, and delete failures never affect the final answer. The mode is Telegram-only; a `preview` value on another platform degrades to `separate`.
 
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
