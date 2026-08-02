@@ -4203,6 +4203,17 @@ class TurnRunner:
                                     _stts_consumer_ref.on_delta(text)
                     ctx.stream_consumer_holder[0] = _stream_consumer
             except Exception as _sc_err:
+                if (
+                    _want_interim_consumer
+                    and ctx.interim_assistant_messages_mode == "preview"
+                ):
+                    logger.warning(
+                        "Telegram commentary preview unavailable for %s:%s — "
+                        "falling back to separate interim messages: %s",
+                        getattr(ctx.source, "platform", None),
+                        getattr(ctx.source, "chat_id", None),
+                        _sc_err,
+                    )
                 logger.debug("Could not set up stream consumer: %s", _sc_err)
 
         # When text streaming is off but streaming TTS is active,

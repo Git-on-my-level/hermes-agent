@@ -860,6 +860,40 @@ async def test_run_agent_telegram_preview_mode_uses_editable_commentary_and_defe
     assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
     assert adapter.edits[0]["message_id"] == "message-1"
     assert adapter.edits[0]["finalize"] is True
+    assert adapter.edits[0]["metadata"]["thread_id"] == "17585"
+    session_key = "agent:main:telegram:group:-1001:17585"
+    cleanup = adapter.pop_post_successful_delivery_callback(session_key)
+    assert callable(cleanup)
+    await cleanup()
+    assert adapter.deleted == [{"chat_id": "-1001", "message_id": "message-1"}]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_telegram_preview_mode_still_delivers_matching_final(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PreviewedResponseAgent,
+        session_id="sess-commentary-preview-matching-final",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        },
+        adapter_cls=CommentaryPreviewCaptureAdapter,
+        event_message_id="user-43",
+    )
+
+    assert result.get("already_sent") is not True
+    assert result["final_response"] == "You're welcome."
+    assert adapter.sent[0]["content"] == "You're welcome."
+    assert adapter.sent[0]["metadata"]["expect_edits"] is True
     session_key = "agent:main:telegram:group:-1001:17585"
     cleanup = adapter.pop_post_successful_delivery_callback(session_key)
     assert callable(cleanup)
