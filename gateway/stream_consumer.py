@@ -1784,15 +1784,25 @@ class GatewayStreamConsumer:
         if not fits:
             # Single entry cannot fit an editable bubble — fall back to the
             # adapter full-content send path for this item only.
-            self._commentary_preview_message_id = None
-            self._commentary_preview_edit_supported = False
-            return await self._deliver_commentary_content(
+            #
+            # Important: FIFO-rebaseline the stack afterward. If we kept the
+            # prior entries while abandoning editable delivery, the *next*
+            # normal commentary would rebuild old history + new text and
+            # duplicate already-visible content (review on #25).
+            ok = await self._deliver_commentary_content(
                 text,
                 preview_delivery=False,
                 preview_mode=True,
                 entries=None,
                 is_placeholder=False,
             )
+            self._commentary_preview_entries = []
+            self._commentary_preview_is_placeholder = False
+            # Keep any existing preview bubble id so a later normal entry can
+            # edit it to just the new text (fresh FIFO stack, same bubble).
+            # Always re-enable edits after the out-of-band overlong send.
+            self._commentary_preview_edit_supported = True
+            return ok
 
         ok = await self._deliver_commentary_content(
             body,

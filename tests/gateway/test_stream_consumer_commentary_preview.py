@@ -246,6 +246,47 @@ async def test_overlong_preview_uses_full_content_send_instead_of_clipping():
 
 
 @pytest.mark.asyncio
+async def test_overlong_fallback_rebaselines_stack_without_duplicating_history():
+    """After an overlong full-content fallback, later commentary must not
+    rebuild/re-send prior stack entries (Codex review on PR #25)."""
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 140  # safe_limit = 40
+    adapter.send = AsyncMock(
+        side_effect=[
+            SimpleNamespace(success=True, message_id="preview-1"),
+            SimpleNamespace(success=True, message_id="overlong-1"),
+            # If stack is not rebaselined, a third send may appear with dupes.
+        ]
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    consumer = _consumer(adapter)
+
+    short_a = "short-A"  # fits
+    overlong = "X" * 80  # alone exceeds safe_limit=40
+    short_b = "short-B"  # should rebaseline into preview bubble alone
+
+    consumer.on_commentary(short_a)
+    consumer.on_commentary(overlong)
+    consumer.on_commentary(short_b)
+    consumer.finish()
+    await consumer.run()
+
+    send_contents = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    edit_contents = [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+
+    assert short_a in send_contents  # initial preview bubble
+    assert overlong in send_contents  # full-content fallback
+    # Next normal entry edits the existing bubble to ONLY short_b — not a
+    # rebuilt "short-A + short-B" or "short-A + overlong + short-B".
+    assert short_b in edit_contents
+    assert not any(short_a in c and short_b in c for c in edit_contents + send_contents)
+    assert not any(overlong in c and short_b in c for c in edit_contents)
+    assert consumer._commentary_preview_entries == [short_b]
+
+
+@pytest.mark.asyncio
 async def test_preview_equal_to_final_is_not_final_delivery_evidence():
     adapter = MagicMock()
     adapter.MAX_MESSAGE_LENGTH = 4096
