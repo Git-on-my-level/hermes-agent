@@ -1309,6 +1309,19 @@ Unknown values log a warning and fall back to `important`.
 
 The Telegram adapter routes recurring agent status callbacks (e.g. "Compressing context…", "Calling tool…") through `send_or_update_status()`, which keeps a `{(chat_id, status_key) → message_id}` cache and **edits the existing bubble** on subsequent emits instead of appending a new one each time. Distinct `status_key` values get their own messages; distinct chats never collide. If the edit fails (e.g. the user deleted the message, or it's older than Telegram allows for edits), the cache entry is dropped and the next emit posts a fresh message and re-caches its ID. No config required — this is the default Telegram behavior. Other adapters that don't implement `send_or_update_status` fall through to plain `send()` unchanged.
 
+### Commentary preview mode
+
+Completed assistant commentary uses separate messages by default. To keep long turns compact, opt Telegram into one temporary editable preview:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      interim_assistant_message_mode: preview
+```
+
+The first commentary sends a normal bot message and later commentary edits that same message. The final answer remains an independent message and is never suppressed merely because commentary was visible. Hermes deletes commentary previews only after Telegram acknowledges the final response; failed or cancelled turns retain them as breadcrumbs. Topic/reply metadata and Telegram's MarkdownV2/rich-to-plain fallbacks are preserved. If an edit is rejected, too old, or rate-limited, Hermes falls back to a fresh preview message. Commentary too long for one editable message uses Telegram's existing full-content send/split path instead of clipping the text. Cleanup deletion is best-effort and cannot remove or delay the final answer.
+
 ## Pin incoming user message during agent turn
 
 When a user sends a message that triggers an agent turn, the Telegram adapter pins that incoming message for the duration of the turn and unpins it when the response is finished — a lightweight visual indicator that the bot is actively working on the message rather than ignoring it. The pin uses `disable_notification=true` to avoid extra pings. No config required.

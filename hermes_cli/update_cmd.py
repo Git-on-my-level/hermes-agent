@@ -3078,7 +3078,37 @@ def _normalize_managed_eol(git_cmd, repo_root):
         all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
         if all_dirty is None or real_dirty is None:
             return None
-        return all_dirty - real_dirty
+        eol_only = all_dirty - real_dirty
+        if eol_only:
+            return eol_only
+        if not all_dirty:
+            return set()
+        # Tree-wide fallback: some git builds list eol-only churn in both diffs
+        # while core.autocrlf=true still keeps status clean.
+        status = subprocess.run(
+            git_cmd + ["status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if (
+            status.returncode == 0
+            and not status.stdout.strip()
+            and real_dirty == all_dirty
+        ):
+            return all_dirty
+        # Per-file fallback: mixed trees where only some paths are eol-only.
+        per_file = set()
+        for path in sorted(all_dirty):
+            ignored = subprocess.run(
+                probe + ["diff", "--ignore-cr-at-eol", "--", path],
+                cwd=repo_root,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if ignored.returncode == 0 and not ignored.stdout.strip():
+                per_file.add(path)
+        return per_file
 
     try:
         effective = subprocess.run(
@@ -3098,15 +3128,20 @@ def _normalize_managed_eol(git_cmd, repo_root):
         if eol_only:
             # Pathspec over stdin, not argv: a fully renormalized checkout is
             # thousands of paths, well past the Windows command-line limit.
-            subprocess.run(
-                probe
-                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
-                cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                check=False,
-            )
+            # Batch so a single stdin payload cannot silently truncate on some
+            # platforms when the tree is very large.
+            _EOL_CHECKOUT_BATCH = 400
+            for batch_start in range(0, len(eol_only), _EOL_CHECKOUT_BATCH):
+                batch = sorted(eol_only)[batch_start:batch_start + _EOL_CHECKOUT_BATCH]
+                subprocess.run(
+                    probe
+                    + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
+                    cwd=repo_root,
+                    input="\0".join(batch),
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    check=False,
+                )
             if _eol_only():
                 # Still dirty — persisting the pin here would only surface churn
                 # we failed to clear. Leave the checkout as we found it.

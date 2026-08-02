@@ -227,6 +227,56 @@ class TestStreamingPerPlatform:
 
 
 # ---------------------------------------------------------------------------
+# Interim commentary delivery mode
+# ---------------------------------------------------------------------------
+
+
+class TestInterimAssistantMessageMode:
+    def test_default_is_backward_compatible_separate(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert (
+            resolve_display_setting({}, "telegram", "interim_assistant_message_mode")
+            == "separate"
+        )
+
+    def test_platform_override_wins_and_is_scoped(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "interim_assistant_message_mode": "separate",
+                "platforms": {
+                    "telegram": {"interim_assistant_message_mode": "preview"},
+                },
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "telegram", "interim_assistant_message_mode"
+            )
+            == "preview"
+        )
+        assert (
+            resolve_display_setting(
+                config, "discord", "interim_assistant_message_mode"
+            )
+            == "separate"
+        )
+
+    def test_invalid_mode_falls_back_to_separate(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"interim_assistant_message_mode": "unknown"}}
+        assert (
+            resolve_display_setting(
+                config, "telegram", "interim_assistant_message_mode"
+            )
+            == "separate"
+        )
+
+
+# ---------------------------------------------------------------------------
 # cleanup_progress — opt-in deletion of temporary progress bubbles
 # ---------------------------------------------------------------------------
 
@@ -300,5 +350,3 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
-

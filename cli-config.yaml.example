@@ -1322,6 +1322,14 @@ display:
   #   false: Only keep/send the final response
   interim_assistant_messages: true
 
+  # Gateway commentary delivery shape. "separate" preserves the default of
+  # one message per completed update. Telegram can opt into one temporary
+  # editable preview with:
+  #   display.platforms.telegram.interim_assistant_message_mode: preview
+  # The final answer remains separate; its successful delivery removes the
+  # preview, while failed or cancelled turns retain it as a breadcrumb.
+  interim_assistant_message_mode: separate
+
   # Gateway-only long-running status heartbeats.
   # When false, the platform does not receive periodic "⏳ Working — N min"
   # notifications even if agent.gateway_notify_interval is non-zero. The

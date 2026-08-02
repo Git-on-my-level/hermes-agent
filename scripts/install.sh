@@ -1244,6 +1244,25 @@ remote_url_is_repo() {
 # repair legacy upstream-only installs without needlessly discarding a user's
 # working SSH credential path.
 configure_runtime_remotes() {
+    # Hermetic installer tests point fork/upstream at local bare repos.
+    if [ -n "${HERMES_INSTALL_FORK_URL:-}" ]; then
+        if git remote get-url "$DEPLOY_REMOTE" >/dev/null 2>&1; then
+            git remote set-url "$DEPLOY_REMOTE" "$HERMES_INSTALL_FORK_URL"
+        else
+            git remote add "$DEPLOY_REMOTE" "$HERMES_INSTALL_FORK_URL"
+        fi
+        if [ -n "${HERMES_INSTALL_UPSTREAM_URL:-}" ]; then
+            if git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+                git remote set-url "$UPSTREAM_REMOTE" "$HERMES_INSTALL_UPSTREAM_URL"
+            else
+                git remote add "$UPSTREAM_REMOTE" "$HERMES_INSTALL_UPSTREAM_URL"
+            fi
+        elif ! git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+            git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_REPO_URL_HTTPS"
+        fi
+        return
+    fi
+
     local fork_url=""
     local origin_url=""
     fork_url=$(git remote get-url "$DEPLOY_REMOTE" 2>/dev/null || true)

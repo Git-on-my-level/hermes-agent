@@ -151,6 +151,11 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    # Completed interim assistant commentary delivery:
+    #   "separate" — one normal message per commentary item (legacy/default)
+    #   "preview"  — one editable preview bubble, currently enabled by the
+    #                gateway only for Telegram.
+    commentary_mode: str = "separate"
 
 
 class GatewayStreamConsumer:
@@ -301,6 +306,13 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
         self._before_finalize_notified = False
+        # Commentary-preview state is deliberately separate from streamed final
+        # response state.  In particular, it must never touch ``_message_id`` or
+        # ``_already_sent`` because commentary is not the turn-final answer.
+        self._commentary_preview_message_ids: list[str] = []
+        self._commentary_preview_message_id: Optional[str] = None
+        self._commentary_preview_last_text = ""
+        self._commentary_preview_edit_supported = True
 
     def _metadata_for_send(
         self,
@@ -342,6 +354,35 @@ class GatewayStreamConsumer:
     def message_id(self) -> str | None:
         """The Discord/chat message ID of the last-sent or edited message."""
         return self._message_id
+
+    @property
+    def commentary_preview_message_ids(self) -> tuple[str, ...]:
+        """Telegram preview bubbles eligible for post-final cleanup."""
+        return tuple(self._commentary_preview_message_ids)
+
+    @staticmethod
+    def _commentary_message_ids_from_result(result: Any) -> tuple[str, ...]:
+        """Return every concrete message ID exposed by a send/edit result."""
+        ids: list[str] = []
+        candidates = [getattr(result, "message_id", None)]
+        candidates.extend(getattr(result, "continuation_message_ids", None) or ())
+        raw = getattr(result, "raw_response", None) or {}
+        if isinstance(raw, dict):
+            candidates.extend(raw.get("message_ids") or ())
+        for message_id in candidates:
+            if message_id and str(message_id) != "__no_edit__":
+                normalized = str(message_id)
+                if normalized not in ids:
+                    ids.append(normalized)
+        return tuple(ids)
+
+    def _track_commentary_preview_result(self, result: Any) -> tuple[str, ...]:
+        """Track every preview bubble created by an adapter fallback/split."""
+        message_ids = self._commentary_message_ids_from_result(result)
+        for message_id in message_ids:
+            if message_id not in self._commentary_preview_message_ids:
+                self._commentary_preview_message_ids.append(message_id)
+        return message_ids
 
     @property
     def final_content_delivered(self) -> bool:
@@ -1671,11 +1712,90 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return False
+
+        preview_mode = (
+            str(getattr(self.cfg, "commentary_mode", "separate")).lower()
+            == "preview"
+        )
+        preview_delivery = preview_mode
+        if preview_mode:
+            # Telegram measures the editable-message limit in UTF-16 code
+            # units.  Content that cannot fit in one editable bubble must use
+            # the adapter's existing full-content send/split path; never clip
+            # completed commentary merely to keep it editable.
+            limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+            len_fn: "Callable[[str], int]" = len
+            if isinstance(self.adapter, _BasePlatformAdapter):
+                try:
+                    limit = self.adapter.max_message_length_for_chat(self.chat_id)
+                    len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
+                except Exception:
+                    pass
+            safe_limit = max(1, int(limit) - 100)
+            if len_fn(text) > safe_limit:
+                preview_delivery = False
+                self._commentary_preview_message_id = None
+                self._commentary_preview_edit_supported = False
+
+            if (
+                preview_delivery
+                and self._commentary_preview_message_id
+                and self._commentary_preview_edit_supported
+            ):
+                if text == self._commentary_preview_last_text:
+                    return True
+                try:
+                    kwargs: dict[str, Any] = {
+                        "chat_id": self.chat_id,
+                        "message_id": self._commentary_preview_message_id,
+                        "content": text,
+                        # Completed commentary should retain Telegram formatting
+                        # (rich -> MarkdownV2 -> plain fallback), not use the raw
+                        # progressive-edit path.
+                        "finalize": True,
+                    }
+                    metadata = self._metadata_for_send(expect_edits=True)
+                    if metadata:
+                        try:
+                            params = inspect.signature(self.adapter.edit_message).parameters
+                            if "metadata" in params or any(
+                                param.kind is inspect.Parameter.VAR_KEYWORD
+                                for param in params.values()
+                            ):
+                                kwargs["metadata"] = metadata
+                        except (TypeError, ValueError):
+                            pass
+                    result = await self.adapter.edit_message(**kwargs)
+                    if getattr(result, "success", False):
+                        updated_ids = self._track_commentary_preview_result(result)
+                        if len(updated_ids) == 1:
+                            self._commentary_preview_message_id = updated_ids[0]
+                        elif len(updated_ids) > 1:
+                            # Overflow created multiple visible messages, so no
+                            # single bubble can represent the preview anymore.
+                            self._commentary_preview_message_id = None
+                            self._commentary_preview_edit_supported = False
+                        self._commentary_preview_last_text = text
+                        return True
+                except Exception as e:
+                    logger.debug("Commentary preview edit failed: %s", e)
+
+                # Preserve the old bubble as a breadcrumb and degrade this
+                # update to a fresh send.  A successful fresh send becomes the
+                # next editable preview; all created IDs remain cleanup-eligible.
+                self._commentary_preview_edit_supported = False
+                self._commentary_preview_message_id = None
+
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                reply_to=self._initial_reply_to_id if preview_delivery else None,
+                metadata=(
+                    self._metadata_for_send(expect_edits=True)
+                    if preview_delivery
+                    else self.metadata
+                ),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1683,6 +1803,17 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                if preview_delivery:
+                    message_ids = self._track_commentary_preview_result(result)
+                    if len(message_ids) == 1:
+                        self._commentary_preview_message_id = message_ids[0]
+                        self._commentary_preview_edit_supported = True
+                        self._commentary_preview_last_text = text
+                    else:
+                        # No ID (or multiple IDs from an adapter split) means
+                        # later commentary must stay on the safe fresh-send path.
+                        self._commentary_preview_message_id = None
+                        self._commentary_preview_edit_supported = False
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
@@ -1690,7 +1821,11 @@ class GatewayStreamConsumer:
                 # Record the exact delivered text so run.py can confirm whether
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
-                self._delivered_commentary_texts.append(text)
+                # In preview mode commentary is never final-delivery evidence,
+                # even if it happens to equal the final text.  The mode's final
+                # answer must always be delivered separately.
+                if not preview_mode:
+                    self._delivered_commentary_texts.append(text)
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
