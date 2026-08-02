@@ -9,14 +9,18 @@ from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 def _consumer(adapter, **kwargs):
+    cfg_kwargs = {
+        "edit_interval": 0.01,
+        "buffer_threshold": 1,
+        "commentary_mode": "preview",
+    }
+    waiting = kwargs.pop("waiting_label", None)
+    if waiting is not None:
+        cfg_kwargs["commentary_waiting_label"] = waiting
     return GatewayStreamConsumer(
         adapter,
         "chat",
-        StreamConsumerConfig(
-            edit_interval=0.01,
-            buffer_threshold=1,
-            commentary_mode="preview",
-        ),
+        StreamConsumerConfig(**cfg_kwargs),
         metadata={"thread_id": "topic-7"},
         initial_reply_to_id="reply-42",
         **kwargs,
@@ -24,7 +28,7 @@ def _consumer(adapter, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_preview_first_send_then_repeated_edits_keep_one_message_id():
+async def test_preview_first_send_then_repeated_edits_stack_history():
     adapter = MagicMock()
     adapter.MAX_MESSAGE_LENGTH = 4096
     adapter.send = AsyncMock(
@@ -55,10 +59,77 @@ async def test_preview_first_send_then_repeated_edits_keep_one_message_id():
         "preview-1",
         "preview-1",
     ]
+    assert [call.kwargs["content"] for call in adapter.edit_message.await_args_list] == [
+        "Checking the repo.\n\nRunning targeted tests.",
+        "Checking the repo.\n\nRunning targeted tests.\n\nReviewing the diff.",
+    ]
     assert all(call.kwargs["finalize"] is True for call in adapter.edit_message.await_args_list)
     assert consumer.commentary_preview_message_ids == ("preview-1",)
     assert consumer.already_sent is False
     assert consumer.final_response_sent is False
+
+
+@pytest.mark.asyncio
+async def test_preview_waiting_placeholder_then_first_commentary_replaces_it():
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    consumer = _consumer(adapter, waiting_label="Waiting for xai-oauth/grok-4.5...")
+
+    consumer.on_commentary("Checking the repo.")
+    consumer.on_commentary("Running targeted tests.")
+    consumer.finish()
+    await consumer.run()
+
+    adapter.send.assert_awaited_once_with(
+        chat_id="chat",
+        content="Waiting for xai-oauth/grok-4.5...",
+        reply_to="reply-42",
+        metadata={
+            "thread_id": "topic-7",
+            "reply_to_message_id": "reply-42",
+            "expect_edits": True,
+        },
+    )
+    assert [call.kwargs["content"] for call in adapter.edit_message.await_args_list] == [
+        "Checking the repo.",
+        "Checking the repo.\n\nRunning targeted tests.",
+    ]
+    assert consumer.commentary_preview_message_ids == ("preview-1",)
+
+
+@pytest.mark.asyncio
+async def test_preview_stack_drops_oldest_with_realistic_limit():
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 120
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    consumer = _consumer(adapter)
+    # safe_limit = 20. Entries of length 12: two joined exceed, so oldest drops.
+    a = "A" * 12
+    b = "B" * 12
+    c = "C" * 12
+
+    consumer.on_commentary(a)
+    consumer.on_commentary(b)
+    consumer.on_commentary(c)
+    consumer.finish()
+    await consumer.run()
+
+    # Final body must end with the newest entry and fit under safe_limit=20.
+    final_body = adapter.edit_message.await_args_list[-1].kwargs["content"]
+    assert final_body.endswith(c)
+    assert len(final_body) <= 20
+    assert a not in final_body or final_body == a  # oldest dropped if needed
 
 
 @pytest.mark.asyncio
@@ -87,7 +158,7 @@ async def test_preview_edit_failure_falls_back_and_tracks_every_breadcrumb():
 
     assert [call.kwargs["content"] for call in adapter.send.await_args_list] == [
         "First.",
-        "Second survives failed edit.",
+        "First.\n\nSecond survives failed edit.",
     ]
     assert adapter.edit_message.await_args_list[-1].kwargs["message_id"] == "preview-2"
     assert consumer.commentary_preview_message_ids == ("preview-1", "preview-2")
@@ -114,7 +185,7 @@ async def test_preview_edit_exception_falls_back_to_fresh_editable_message():
 
     assert [call.kwargs["content"] for call in adapter.send.await_args_list] == [
         "First.",
-        "Second survives the exception.",
+        "First.\n\nSecond survives the exception.",
     ]
     assert consumer.commentary_preview_message_ids == ("preview-1", "preview-2")
 
@@ -175,6 +246,47 @@ async def test_overlong_preview_uses_full_content_send_instead_of_clipping():
 
 
 @pytest.mark.asyncio
+async def test_overlong_fallback_rebaselines_stack_without_duplicating_history():
+    """After an overlong full-content fallback, later commentary must not
+    rebuild/re-send prior stack entries (Codex review on PR #25)."""
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 140  # safe_limit = 40
+    adapter.send = AsyncMock(
+        side_effect=[
+            SimpleNamespace(success=True, message_id="preview-1"),
+            SimpleNamespace(success=True, message_id="overlong-1"),
+            # If stack is not rebaselined, a third send may appear with dupes.
+        ]
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    consumer = _consumer(adapter)
+
+    short_a = "short-A"  # fits
+    overlong = "X" * 80  # alone exceeds safe_limit=40
+    short_b = "short-B"  # should rebaseline into preview bubble alone
+
+    consumer.on_commentary(short_a)
+    consumer.on_commentary(overlong)
+    consumer.on_commentary(short_b)
+    consumer.finish()
+    await consumer.run()
+
+    send_contents = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    edit_contents = [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+
+    assert short_a in send_contents  # initial preview bubble
+    assert overlong in send_contents  # full-content fallback
+    # Next normal entry edits the existing bubble to ONLY short_b — not a
+    # rebuilt "short-A + short-B" or "short-A + overlong + short-B".
+    assert short_b in edit_contents
+    assert not any(short_a in c and short_b in c for c in edit_contents + send_contents)
+    assert not any(overlong in c and short_b in c for c in edit_contents)
+    assert consumer._commentary_preview_entries == [short_b]
+
+
+@pytest.mark.asyncio
 async def test_preview_equal_to_final_is_not_final_delivery_evidence():
     adapter = MagicMock()
     adapter.MAX_MESSAGE_LENGTH = 4096
@@ -190,3 +302,28 @@ async def test_preview_equal_to_final_is_not_final_delivery_evidence():
     assert consumer.has_delivered_text("The final answer.") is False
     assert consumer.already_sent is False
     assert consumer.final_content_delivered is False
+
+
+def test_format_commentary_waiting_label_includes_effort_when_present():
+    from gateway.run import GatewayRunner
+
+    assert (
+        GatewayRunner._format_commentary_waiting_label(
+            provider="xai-oauth",
+            model="grok-4.5",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        == "Waiting for xai-oauth/grok-4.5/high..."
+    )
+    assert (
+        GatewayRunner._format_commentary_waiting_label(
+            provider="openai-codex",
+            model="gpt-5.4",
+            reasoning_config={"enabled": False, "effort": "high"},
+        )
+        == "Waiting for openai-codex/gpt-5.4..."
+    )
+    assert (
+        GatewayRunner._format_commentary_waiting_label()
+        == "Waiting for model..."
+    )
