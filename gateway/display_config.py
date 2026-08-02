@@ -45,6 +45,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Gateway-only assistant/status chatter controls. These default on for
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
+    # Delivery shape for completed interim assistant commentary.  ``preview``
+    # is honored by the gateway only on Telegram; all other platforms retain
+    # legacy separate-message delivery.
+    "interim_assistant_message_mode": "separate",
     "long_running_notifications": True,
     "busy_ack_detail": True,
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
@@ -266,6 +270,13 @@ def _normalise(setting: str, value: Any) -> Any:
         if val in {"true", "1", "yes", "on"}:
             return "all"
         return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+    if setting == "interim_assistant_message_mode":
+        if isinstance(value, str):
+            val = value.strip().lower()
+            if val == "preview":
+                return "preview"
+            return "separate"
+        return "separate"
     if setting in {
         "show_reasoning",
         "streaming",

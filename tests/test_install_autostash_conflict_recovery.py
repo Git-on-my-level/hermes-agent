@@ -34,8 +34,8 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
-    """Create a managed checkout whose autostash conflicts with its origin."""
+def _make_conflicted_managed_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a managed checkout whose autostash conflicts with its fork."""
     seed = tmp_path / "seed"
     seed.mkdir()
     _git(seed, "init")
@@ -44,23 +44,74 @@ def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
     _git(seed, "commit", "-m", "base")
     _git(seed, "branch", "-M", "main")
 
-    remote = tmp_path / "origin.git"
-    _git(tmp_path, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "-u", "origin", "main")
+    fork_remote = tmp_path / "fork.git"
+    _git(tmp_path, "init", "--bare", str(fork_remote))
+    _git(seed, "remote", "add", "fork", str(fork_remote))
+    _git(seed, "push", "-u", "fork", "main")
 
     managed = tmp_path / "hermes-agent"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
+    _git(tmp_path, "clone", "--branch", "main", str(fork_remote), str(managed))
+    _git(managed, "remote", "rename", "origin", "fork")
+
+    upstream_remote = tmp_path / "upstream.git"
+    _git(tmp_path, "init", "--bare", str(upstream_remote))
+    _git(managed, "remote", "add", "origin", str(upstream_remote))
 
     (managed / "tracked.txt").write_text("local edit\n", encoding="utf-8")
 
     upstream = tmp_path / "upstream"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(upstream))
+    _git(tmp_path, "clone", "--branch", "main", str(fork_remote), str(upstream))
+    _git(upstream, "remote", "rename", "origin", "fork")
     (upstream / "tracked.txt").write_text("upstream edit\n", encoding="utf-8")
     _git(upstream, "commit", "-am", "upstream")
-    _git(upstream, "push", "origin", "main")
+    _git(upstream, "push", "fork", "main")
 
-    return managed
+    return managed, fork_remote
+
+
+def _make_clean_autostash_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """Managed checkout with only an untracked local file stashed before update."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init")
+    (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(seed, "add", "tracked.txt")
+    _git(seed, "commit", "-m", "base")
+    _git(seed, "branch", "-M", "main")
+
+    fork_remote = tmp_path / "fork.git"
+    _git(tmp_path, "init", "--bare", str(fork_remote))
+    _git(seed, "remote", "add", "fork", str(fork_remote))
+    _git(seed, "push", "-u", "fork", "main")
+
+    managed = tmp_path / "hermes-agent"
+    _git(tmp_path, "clone", "--branch", "main", str(fork_remote), str(managed))
+    _git(managed, "remote", "rename", "origin", "fork")
+
+    upstream_remote = tmp_path / "upstream.git"
+    _git(tmp_path, "init", "--bare", str(upstream_remote))
+    _git(managed, "remote", "add", "origin", str(upstream_remote))
+
+    (managed / "local-only.txt").write_text("local edit\n", encoding="utf-8")
+
+    upstream = tmp_path / "upstream"
+    _git(tmp_path, "clone", "--branch", "main", str(fork_remote), str(upstream))
+    _git(upstream, "remote", "rename", "origin", "fork")
+    (upstream / "tracked.txt").write_text("upstream edit\n", encoding="utf-8")
+    _git(upstream, "commit", "-am", "upstream")
+    _git(upstream, "push", "fork", "main")
+
+    return managed, fork_remote
+
+
+def _install_test_env(tmp_path: Path, managed: Path, fork_remote: Path) -> dict[str, str]:
+    upstream_remote = tmp_path / "upstream.git"
+    return {
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "HERMES_INSTALL_DIR": str(managed),
+        "HERMES_INSTALL_FORK_URL": str(fork_remote),
+        "HERMES_INSTALL_UPSTREAM_URL": str(upstream_remote),
+    }
 
 
 def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
@@ -86,14 +137,19 @@ def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
 def test_install_sh_repository_stage_recovers_from_autostash_conflict(
     tmp_path: Path,
 ) -> None:
-    managed = _make_conflicted_managed_checkout(tmp_path)
-    env = os.environ | {
-        "HERMES_HOME": str(tmp_path / "hermes-home"),
-        "HERMES_INSTALL_DIR": str(managed),
-    }
+    managed, fork_remote = _make_conflicted_managed_checkout(tmp_path)
+    env = os.environ | _install_test_env(tmp_path, managed, fork_remote)
 
     result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive"],
+        [
+            "bash",
+            str(INSTALL_SH),
+            "--stage",
+            "repository",
+            "--non-interactive",
+            "--branch",
+            "main",
+        ],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -112,7 +168,7 @@ def test_install_sh_repository_stage_recovers_from_autostash_conflict(
 def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
     tmp_path: Path,
 ) -> None:
-    managed = _make_conflicted_managed_checkout(tmp_path)
+    managed, fork_remote = _make_conflicted_managed_checkout(tmp_path)
     result = subprocess.run(
         [
             POWERSHELL,
@@ -149,37 +205,19 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
     The conflict-recovery fix must not regress the normal path — when stash apply
     succeeds cleanly, the stash should be dropped and local changes restored.
     """
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init")
-    (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
-    _git(seed, "add", "tracked.txt")
-    _git(seed, "commit", "-m", "base")
-    _git(seed, "branch", "-M", "main")
+    managed, fork_remote = _make_clean_autostash_checkout(tmp_path)
 
-    remote = tmp_path / "origin.git"
-    _git(tmp_path, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "-u", "origin", "main")
-
-    managed = tmp_path / "hermes-agent"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
-
-    # Local edit on a file upstream will NOT touch — no conflict on apply.
-    (managed / "local-only.txt").write_text("local edit\n", encoding="utf-8")
-
-    upstream = tmp_path / "upstream"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(upstream))
-    (upstream / "tracked.txt").write_text("upstream edit\n", encoding="utf-8")
-    _git(upstream, "commit", "-am", "upstream")
-    _git(upstream, "push", "origin", "main")
-
-    env = os.environ | {
-        "HERMES_HOME": str(tmp_path / "hermes-home"),
-        "HERMES_INSTALL_DIR": str(managed),
-    }
+    env = os.environ | _install_test_env(tmp_path, managed, fork_remote)
     result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive"],
+        [
+            "bash",
+            str(INSTALL_SH),
+            "--stage",
+            "repository",
+            "--non-interactive",
+            "--branch",
+            "main",
+        ],
         cwd=tmp_path,
         env=env,
         capture_output=True,

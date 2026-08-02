@@ -17,7 +17,14 @@ import inspect
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.session import SessionSource
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 class _MinAdapter(BasePlatformAdapter):
@@ -102,3 +109,101 @@ class TestPostDeliveryCallbackAsyncChaining:
         _invoke(cb)
         assert fired == ["sync", "async"]
 
+
+class _DeliveryOutcomeAdapter(_MinAdapter):
+    def __init__(self, *, succeeds: bool):
+        super().__init__(PlatformConfig(enabled=True), Platform.TELEGRAM)
+        self.succeeds = succeeds
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        return SendResult(success=self.succeeds, message_id="final-1" if self.succeeds else None)
+
+
+def _event():
+    return MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm"),
+        message_id="user-1",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succeeds", [True, False])
+async def test_success_only_callback_follows_final_delivery_ack(succeeds):
+    adapter = _DeliveryOutcomeAdapter(succeeds=succeeds)
+    fired = []
+
+    async def handler(event):
+        return "final answer"
+
+    adapter.set_message_handler(handler)
+    adapter.register_post_successful_delivery_callback(
+        "session",
+        lambda: fired.append("cleanup"),
+    )
+
+    await adapter._process_message_background(_event(), "session")
+
+    assert fired == (["cleanup"] if succeeds else [])
+    assert "session" not in adapter._post_successful_delivery_callbacks
+
+
+@pytest.mark.asyncio
+async def test_success_only_callback_is_discarded_on_cancellation():
+    adapter = _DeliveryOutcomeAdapter(succeeds=True)
+    fired = []
+
+    async def handler(event):
+        raise asyncio.CancelledError
+
+    adapter.set_message_handler(handler)
+    adapter.register_post_successful_delivery_callback(
+        "session",
+        lambda: fired.append("cleanup"),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._process_message_background(_event(), "session")
+
+    assert fired == []
+    assert "session" not in adapter._post_successful_delivery_callbacks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_retains_created_commentary_preview():
+    adapter = _DeliveryOutcomeAdapter(succeeds=True)
+    adapter.deleted = []
+
+    async def delete_message(chat_id, message_id):
+        adapter.deleted.append((chat_id, message_id))
+        return True
+
+    adapter.delete_message = delete_message
+
+    async def handler(event):
+        consumer = GatewayStreamConsumer(
+            adapter,
+            event.source.chat_id,
+            StreamConsumerConfig(commentary_mode="preview"),
+            initial_reply_to_id=event.message_id,
+        )
+        consumer.on_commentary("Work was interrupted.")
+        consumer.finish()
+        await consumer.run()
+        preview_ids = consumer.commentary_preview_message_ids
+
+        async def cleanup():
+            for message_id in preview_ids:
+                await adapter.delete_message(event.source.chat_id, message_id)
+
+        adapter.register_post_successful_delivery_callback("session", cleanup)
+        raise asyncio.CancelledError
+
+    adapter.set_message_handler(handler)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._process_message_background(_event(), "session")
+
+    assert adapter.deleted == []
+    assert "session" not in adapter._post_successful_delivery_callbacks
