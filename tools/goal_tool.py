@@ -10,7 +10,7 @@ judge the active goal and enqueue continuation prompts as needed.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -50,12 +50,35 @@ def _resolve_default_max_turns(default_max_turns: Optional[int] = None) -> int:
         return DEFAULT_MAX_TURNS
 
 
+_CONTRACT_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
+
+
+def _normalize_contract(contract: Optional[Dict[str, Any]]):
+    """Validate a model-supplied completion contract for GoalManager."""
+    from hermes_cli.goals import GoalContract
+
+    if contract is None:
+        return None
+    if not isinstance(contract, dict):
+        raise ValueError("contract must be an object")
+
+    unknown = sorted(set(contract) - set(_CONTRACT_FIELDS))
+    if unknown:
+        raise ValueError(f"contract has unknown field(s): {', '.join(unknown)}")
+
+    for field, value in contract.items():
+        if not isinstance(value, str):
+            raise ValueError(f"contract.{field} must be a string")
+    return GoalContract.from_dict(contract)
+
+
 def set_goal_tool(
     goal: str,
     *,
     session_id: str,
     max_turns: Optional[int] = None,
     default_max_turns: Optional[int] = None,
+    contract: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Set or replace the standing goal for the current Hermes session."""
     sid = (session_id or "").strip()
@@ -74,6 +97,7 @@ def set_goal_tool(
     try:
         default_turns = _resolve_default_max_turns(default_max_turns)
         turns = _normalize_max_turns(max_turns)
+        completion_contract = _normalize_contract(contract)
     except ValueError as exc:
         return tool_error(str(exc), success=False)
 
@@ -87,12 +111,18 @@ def set_goal_tool(
         from hermes_cli.goals import GoalManager, load_goal
 
         manager = GoalManager(session_id=sid, default_max_turns=default_turns)
-        state = manager.set(goal_text, max_turns=turns)
+        state = manager.set(
+            goal_text,
+            max_turns=turns,
+            contract=completion_contract,
+        )
         persisted = load_goal(sid)
         if persisted is None or persisted.to_json() != state.to_json():
             return tool_error("failed to persist goal state", success=False)
     except Exception as exc:
-        return tool_error(f"failed to set goal: {type(exc).__name__}: {exc}", success=False)
+        return tool_error(
+            f"failed to set goal: {type(exc).__name__}: {exc}", success=False
+        )
 
     return tool_result(
         success=True,
@@ -118,9 +148,9 @@ SET_GOAL_SCHEMA = {
     "name": "set_goal",
     "description": (
         "Set or replace the standing goal for the current Hermes session. "
-        "Use this when the user gives an objective that should persist across "
-        "turns and Hermes should keep taking concrete steps until it is done. "
-        "Do not use this for ordinary short task planning; use todo for that. "
+        "Use ONLY when the user explicitly asks to set, start, or establish a "
+        "goal or standing goal. Never infer goal intent from task complexity, "
+        "duration, or multiple steps; an ordinary imperative is not enough. "
         "After this tool succeeds, the CLI/gateway /goal loop will judge the "
         "goal after each turn and continue automatically when appropriate."
     ),
@@ -139,6 +169,21 @@ SET_GOAL_SCHEMA = {
                     "use the configured default."
                 ),
             },
+            "contract": {
+                "type": "object",
+                "description": (
+                    "Optional native completion contract defining the outcome, "
+                    "proof, scope, constraints, and stop condition."
+                ),
+                "properties": {
+                    "outcome": {"type": "string"},
+                    "verification": {"type": "string"},
+                    "constraints": {"type": "string"},
+                    "boundaries": {"type": "string"},
+                    "stop_when": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
         },
         "required": ["goal"],
     },
@@ -152,6 +197,7 @@ registry.register(
     handler=lambda args, **kw: set_goal_tool(
         goal=args.get("goal", ""),
         max_turns=args.get("max_turns"),
+        contract=args.get("contract"),
         session_id=kw.get("session_id", ""),
         default_max_turns=kw.get("default_max_turns"),
     ),
