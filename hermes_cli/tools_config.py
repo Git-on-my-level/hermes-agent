@@ -108,6 +108,7 @@ CONFIGURABLE_TOOLSETS = [
     ("stt",             "🎙️ Speech-to-Text",           "voice transcription (gateway voice messages + voice mode)"),
     ("skills",          "📚 Skills",                    "list, view, manage"),
     ("todo",            "📋 Task Planning",             "todo"),
+    ("goal",            "🎯 Standing Goals",           "explicit model-callable goal activation"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
@@ -2154,7 +2155,7 @@ def _exempt_explicit_platform_native(
 #: toolset still ships zero schemas to a user without paid portal access — the
 #: same split Home Assistant uses. Probing the portal from this path would put
 #: a network call on every CLI start, gateway session and cron tick.
-_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl"})
+_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl", "goal"})
 
 
 def _enable_recently_shipped_toolsets(
