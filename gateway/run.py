@@ -4044,6 +4044,10 @@ class TurnRunner:
                 event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            # Compaction completion still re-arms typing even when the chat
+            # surface suppresses the notice text (noise filter / opt-out).
+            if str(event_type or "") == "compacted":
+                self._rearm_activity_after_compaction(ctx)
             return
         _fut = safe_schedule_threadsafe(
             _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
@@ -4052,6 +4056,8 @@ class TurnRunner:
             log_message=f"status_callback ({event_type}) scheduling error",
         )
         if _fut is None:
+            if str(event_type or "") == "compacted":
+                self._rearm_activity_after_compaction(ctx)
             return
         if ctx._cleanup_progress:
             def _track_status_id(fut) -> None:
@@ -4063,6 +4069,56 @@ class TurnRunner:
                 if getattr(res, "success", False) and mid:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
+        # After compaction Telegram clears the typing bubble when the status
+        # message lands; re-arm the keep-typing loop for the rest of the turn.
+        if str(event_type or "") == "compacted":
+            def _rearm(_fut=None) -> None:
+                self._rearm_activity_after_compaction(ctx)
+            _fut.add_done_callback(_rearm)
+
+    def _rearm_activity_after_compaction(self, ctx: "TurnContext") -> None:
+        """Resume typing / live activity after a mid-turn compaction boundary.
+
+        Telegram clears the typing indicator whenever a new message is delivered
+        (including compaction completion). If the keep-typing loop was paused or
+        the platform entered a typing cooldown during the long compression
+        window, the rest of the turn goes silent even while the agent is still
+        working. Always best-effort and never raises into the agent thread.
+        """
+        adapter = ctx._status_adapter
+        chat_id = ctx._status_chat_id
+        if not adapter or not chat_id or not ctx._run_still_current():
+            return
+        metadata = ctx._status_thread_metadata
+
+        async def _rearm_coro() -> None:
+            try:
+                resume = getattr(adapter, "resume_typing_for_chat", None)
+                if callable(resume):
+                    resume(chat_id)
+            except Exception:
+                pass
+            try:
+                cooldown = getattr(adapter, "_telegram_typing_cooldown_until", None)
+                if isinstance(cooldown, dict):
+                    cooldown.pop(str(chat_id), None)
+            except Exception:
+                pass
+            try:
+                send_typing = getattr(adapter, "send_typing", None)
+                if callable(send_typing):
+                    result = send_typing(chat_id, metadata=metadata)
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception:
+                logger.debug("post-compaction typing re-arm failed", exc_info=True)
+
+        safe_schedule_threadsafe(
+            _rearm_coro(),
+            ctx._loop_for_step,
+            logger=logger,
+            log_message="post-compaction typing re-arm scheduling error",
+        )
 
     def run_sync(self):
         ctx = self._ctx

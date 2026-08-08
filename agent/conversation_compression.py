@@ -74,6 +74,38 @@ def _emit_compaction_done(agent: Any) -> None:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
 
+def reset_ui_delivery_state_after_compaction(agent: Any) -> None:
+    """Re-open mid-turn UI delivery after a successful compaction boundary.
+
+    Compaction is a phase break inside one user turn. Pre-boundary interim
+    commentary is recorded in ``_delivered_interim_texts`` so identical phrases
+    are not re-bubbled while tools run. After the transcript is rewritten,
+    that set (and the stream-delivery tracker) must clear — otherwise the
+    model restates the same progress narration and the gateway suppresses it,
+    so Telegram commentary preview appears frozen until the final answer.
+
+    Also resets streamed-assistant text tracking so
+    ``already_streamed`` routing does not treat post-compaction content as a
+    continuation of the pre-boundary stream segment.
+    """
+    try:
+        agent._delivered_interim_texts = set()
+    except Exception:
+        logger.debug(
+            "could not clear delivered interim texts after compaction",
+            exc_info=True,
+        )
+    reset = getattr(agent, "_reset_stream_delivery_tracking", None)
+    if callable(reset):
+        try:
+            reset()
+        except Exception:
+            logger.debug(
+                "could not reset stream delivery tracking after compaction",
+                exc_info=True,
+            )
+
+
 # ── Routine compression status templates ────────────────────────────────────
 # Every ROUTINE (non-failure, non-manual-/compress) compression status line the
 # agent emits lives here so the gateway noise filter and its tests can couple
@@ -2322,6 +2354,11 @@ def compress_context(
         agent._last_compression_attempt_in_place = compacted_in_place
         agent._last_compaction_in_place = compacted_in_place
 
+        # Mid-turn UI: drop pre-boundary interim/stream delivery memory so
+        # post-compaction commentary and token streaming resume visibly.
+        if _compression_made_progress:
+            reset_ui_delivery_state_after_compaction(agent)
+
         # Keep the post-compression rough estimate for diagnostics, but do not
         # treat it as provider-reported prompt usage. Schema-heavy rough estimates
         # can remain above threshold even after the next real API request fits.
@@ -2530,6 +2567,9 @@ def _compress_context_via_codex_app_server(
         getattr(result, "thread_id", None) or "",
         getattr(result, "turn_id", None) or "",
     )
+    # Codex compaction rewrites the remote thread; reopen UI delivery so
+    # mid-turn commentary/stream resume the same way as Hermes compaction.
+    reset_ui_delivery_state_after_compaction(agent)
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
@@ -2831,5 +2871,6 @@ __all__ = [
     "check_compression_model_feasibility",
     "replay_compression_warning",
     "compress_context",
+    "reset_ui_delivery_state_after_compaction",
     "try_shrink_image_parts_in_messages",
 ]
