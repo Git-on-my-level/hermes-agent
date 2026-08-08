@@ -287,11 +287,12 @@ class TestSetGoalTool:
 
 
 class TestSetGoalToolSchema:
-    def test_registered_in_goal_toolset_and_fork_core_default(self):
+    def test_registered_for_interactive_defaults_but_not_cron(self):
         from model_tools import get_tool_definitions
-        from toolsets import _HERMES_CORE_TOOLS
+        from toolsets import _HERMES_CORE_TOOLS, _HERMES_INTERACTIVE_TOOLS
 
-        assert "set_goal" in _HERMES_CORE_TOOLS
+        assert "set_goal" in _HERMES_INTERACTIVE_TOOLS
+        assert "set_goal" not in _HERMES_CORE_TOOLS
 
         goal_names = {
             tool["function"]["name"]
@@ -314,6 +315,14 @@ class TestSetGoalToolSchema:
             )
         }
         assert "set_goal" in telegram_names
+
+        cron_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(
+                enabled_toolsets=["hermes-cron"], quiet_mode=True
+            )
+        }
+        assert "set_goal" not in cron_names
 
     def test_schema_requires_unmistakable_explicit_goal_intent(self):
         from tools.goal_tool import SET_GOAL_SCHEMA

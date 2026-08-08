@@ -7,7 +7,8 @@ tools array by three bridge tools — ``tool_search``, ``tool_describe``,
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
+* Interactive defaults in ``toolsets._HERMES_INTERACTIVE_TOOLS`` are never
+  deferred.
   Always-load means always-load. No exceptions.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
@@ -195,8 +196,9 @@ def _core_tool_names() -> frozenset[str]:
     and we don't want a hard cycle.
     """
     try:
-        from toolsets import _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS)
+        from toolsets import _HERMES_INTERACTIVE_TOOLS
+
+        return frozenset(_HERMES_INTERACTIVE_TOOLS)
     except Exception:
         return frozenset()
 
@@ -205,7 +207,8 @@ def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
+    OR it is not in ``_HERMES_INTERACTIVE_TOOLS``. Interactive defaults are
+    never deferred
     even when their toolset is technically plugin-provided (this protects
     against accidental shadowing).
     """
