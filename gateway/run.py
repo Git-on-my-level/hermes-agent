@@ -22970,8 +22970,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
-        """Deliver a queued response using the normal text+attachment split."""
+    ):
+        """Deliver a queued response using the normal text+attachment split.
+
+        Returns the adapter send/edit result when text is delivered so
+        callers can tell ACK from a raised-less failure.
+        """
+        send_result = None
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -22999,6 +23004,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            send_result = _edit_res
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -23009,7 +23015,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    send_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
@@ -23020,7 +23026,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return send_result
 
         synthetic_event = MessageEvent(
             text="",
@@ -23033,6 +23039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter,
             thread_metadata=metadata,
         )
+        return send_result
 
     async def _run_background_task(
         self,
@@ -30269,6 +30276,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _queued_final_delivery_succeeded = bool(
                                 getattr(_queued_final_result, "success", False)
                             )
+                            if not _already_streamed:
+                                _queued_final_delivery_succeeded = bool(
+                                    getattr(_queued_final_result, "success", False)
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
