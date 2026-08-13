@@ -13,8 +13,11 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     """Attach the ``plugins`` subcommand to ``subparsers``."""
     plugins_parser = subparsers.add_parser(
         "plugins",
-        help="Manage plugins — install, update, remove, list",
-        description="Install plugins from Git repositories, update, remove, or list them.",
+        help="Manage and validate plugins",
+        description=(
+            "Install, update, remove, list, or validate native Hermes plugins "
+            "and portable Agent Plugins v1 packages. Portable packages install disabled."
+        ),
     )
     plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_action")
 
@@ -30,6 +33,11 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "-f",
         action="store_true",
         help="Remove existing plugin and reinstall",
+    )
+    plugins_install.add_argument(
+        "--ref",
+        metavar="COMMIT_SHA",
+        help="Install exactly one immutable 40-character Git commit SHA",
     )
     _install_enable_group = plugins_install.add_mutually_exclusive_group()
     _install_enable_group.add_argument(
@@ -103,4 +111,36 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "disable", help="Disable a plugin without removing it"
     )
     plugins_disable.add_argument("name", help="Plugin name to disable")
+
+    plugins_capabilities = plugins_subparsers.add_parser(
+        "capabilities",
+        help="Show declared vs granted capabilities per plugin",
+        description=(
+            "Show each plugin's declared capabilities (from plugin.yaml) "
+            "against what the user has granted. Capabilities are a consent "
+            "and audit layer over host API surfaces — NOT a sandbox."
+        ),
+    )
+    plugins_capabilities.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Plugin id to inspect (omit to list all plugins with capabilities)",
+    )
+
+    plugins_doctor = plugins_subparsers.add_parser(
+        "doctor", help="Validate a plugin with the real runtime contracts"
+    )
+    plugins_doctor.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="Plugin path or installed plugin id (default: current directory)",
+    )
+    plugins_doctor.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit non-zero when validation reports an error",
+    )
+
     plugins_parser.set_defaults(func=cmd_plugins)

@@ -9,6 +9,8 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
+from hermes_constants import DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES
+
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
@@ -198,18 +200,22 @@ def _(rid, params: dict) -> dict:
         # Normalize so a hand-edited config.yaml with stray casing or
         # an unknown value reads back the SAME value the TUI actually
         # rendered (frontend's `normalizeIndicatorStyle` falls back to
-        # `_INDICATOR_DEFAULT` for the same inputs).  Otherwise
+        # `DEFAULT_INDICATOR_STYLE` for the same inputs).  Otherwise
         # `/indicator` would print one thing while the UI shows another.
         raw = (_load_cfg().get("display") or {}).get("tui_status_indicator", "")
         norm = str(raw).strip().lower()
         return _ok(
             rid,
-            {"value": norm if norm in _INDICATOR_STYLES else _INDICATOR_DEFAULT},
+            {"value": norm if norm in INDICATOR_STYLES else DEFAULT_INDICATOR_STYLE},
         )
     if key == "personality":
+        # Report the EFFECTIVE personality via the single owner — a stale or
+        # unknown name in config must not display as active.
+        from hermes_cli.personality import active_personality_name
+
         return _ok(
             rid,
-            {"value": (_load_cfg().get("display") or {}).get("personality") or "none"},
+            {"value": active_personality_name(_load_cfg()) or "none"},
         )
     if key == "reasoning":
         cfg = _load_cfg()

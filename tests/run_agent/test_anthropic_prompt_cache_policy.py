@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -40,6 +42,38 @@ class TestNativeAnthropic:
             model="claude-sonnet-4-6",
         )
         assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_anthropic_provider_on_third_party_host_stays_message_only(self):
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+        assert agent._direct_native_anthropic_tool_cache_capability() is False
+
+    def test_only_direct_native_anthropic_enables_tool_markers(self):
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._direct_native_anthropic_tool_cache_capability() is True
+
+        assert agent._direct_native_anthropic_tool_cache_capability(
+            provider="custom",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+        ) is False
+        assert agent._direct_native_anthropic_tool_cache_capability(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="anthropic/claude-sonnet-4.6",
+        ) is False
 
 
 
@@ -177,6 +211,89 @@ class TestMiniMaxAnthropicWire:
         )
         assert agent._anthropic_prompt_cache_policy() == (False, False)
 
+    def test_minimax_m3_on_provider_minimax_does_not_cache(self):
+        # MiniMax-M3 uses server-side automatic prefix caching on the
+        # /anthropic wire (content-keyed, no marker needed). M3 is NOT on
+        # MiniMax's explicit-cache support list (which covers only M2.7 /
+        # M2.5 / M2.1 / M2), and emitting cache_control markers on M3 is
+        # neither observable nor billable — it only wastes serialization
+        # overhead and risks perturbing the server-side prefix hash. Marker
+        # path must stay off for M3 so the response.usage fields reflect
+        # server-side automatic caching without interference.
+        agent = _make_agent(
+            provider="minimax",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M3[1m]",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_minimax_m3_on_china_endpoint_does_not_cache(self):
+        # Mirror of the above against the China-region host. The
+        # M3-vs-M2 substring guard must trigger on the model name
+        # regardless of which MiniMax host the user picks.
+        agent = _make_agent(
+            provider="minimax-cn",
+            base_url="https://api.minimaxi.com/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M3",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_minimax_m3_via_custom_provider_does_not_cache(self):
+        # When the user wires a custom provider manually at MiniMax's
+        # Anthropic URL with M3, host-match alone must NOT bypass the
+        # M3-specific opt-out.
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://api.minimaxi.com/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M3[1m]",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_minimax_m3_via_provider_anthropic_proxy_does_not_cache(self):
+        # provider="anthropic" pointed at a MiniMax /anthropic proxy is a
+        # supported override (_anthropic_base_url_override_ok accepts
+        # MiniMax-style /anthropic hosts and _resolve_explicit_runtime
+        # preserves provider="anthropic"). The M3 exclusion must run
+        # BEFORE the native-Anthropic early return, or this route keeps
+        # emitting markers while the direct minimax/minimax-cn routes
+        # don't.
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M3",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_minimax_m27_via_provider_anthropic_proxy_still_caches(self):
+        # The proxy-route exclusion is M3-only: M2.x through the same
+        # provider="anthropic" MiniMax proxy keeps explicit cache_control
+        # (the native-Anthropic return still applies).
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M2.7",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_minimax_m27_still_caches_after_m3_opt_out(self):
+        # Regression guard: the M3 substring check must not collide with
+        # M2.7 / M2.5 / M2.1 / M2 model names. "minimax-m3" is not a
+        # substring of "minimax-m2.7" etc., but pin this with a test so a
+        # future "startswith minimax-m" loosening can't silently drop the
+        # M2.x cache_control path.
+        agent = _make_agent(
+            provider="minimax",
+            base_url="https://api.minimax.io/anthropic",
+            api_mode="anthropic_messages",
+            model="MiniMax-M2.7",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
 
 class TestOpenAIWireFormatOnCustomProvider:
     """A custom provider using chat_completions (OpenAI wire) should NOT get caching."""
@@ -256,6 +373,50 @@ class TestQwenAlibabaFamily:
         assert agent._anthropic_prompt_cache_policy() == (False, False)
 
 
+class TestDeepSeekOpenCode:
+    """DeepSeek on OpenCode does NOT use cache markers (#77217).
+
+    OpenCode Zen's relay rejects the Anthropic-style content block format
+    that cache markers produce (content becomes a block array instead of a
+    plain string), causing HTTP 400.  DeepSeek is intentionally excluded
+    from the caching path.
+    """
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["opencode", "opencode-zen", "opencode-go"],
+    )
+    def test_deepseek_on_opencode_does_not_cache(self, provider):
+        agent = _make_agent(
+            provider=provider,
+            base_url="https://opencode.ai/v1",
+            api_mode="chat_completions",
+            model="deepseek-v4-pro",
+        )
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_deepseek_on_direct_alibaba_does_not_cache(self):
+        agent = _make_agent(
+            provider="alibaba",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_mode="chat_completions",
+            model="deepseek-v4-pro",
+        )
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_deepseek_on_openrouter_does_not_cache(self):
+        agent = _make_agent(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="deepseek/deepseek-chat",
+        )
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+
 class TestNousPortalAnthropicWire:
     def test_portal_claude_on_the_messages_wire_uses_the_native_layout(self):
         agent = _make_agent(
@@ -315,4 +476,3 @@ class TestExplicitOverrides:
 # ─────────────────────────────────────────────────────────────────────
 # Long-lived prefix cache policy (cross-session 1h tier)
 # ─────────────────────────────────────────────────────────────────────
-

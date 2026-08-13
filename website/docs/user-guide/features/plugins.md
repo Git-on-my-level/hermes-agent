@@ -77,7 +77,6 @@ def register(ctx):
         toolset="hello_world",
         schema=schema,
         handler=handle_hello,
-        description="Return a friendly greeting for the given name.",
     )
 
     # --- Hook: log every tool call ---
@@ -88,6 +87,8 @@ def register(ctx):
 ```
 
 Drop both files into `~/.hermes/plugins/hello-world/`, restart Hermes, and the model can immediately call `hello_world`. The hook prints a log line after every tool invocation.
+
+The model-facing tool description belongs in `schema["description"]`. The optional `ctx.register_tool(description=...)` value is separate `ToolEntry` registry metadata: when omitted, it defaults to the schema description, but Hermes does not copy it back into a schema that lacks `description`. Prefer defining the text once in the schema. If you provide both values, keep them synchronized; the model sees the schema value.
 
 Project-local plugins under `./.hermes/plugins/` are disabled by default. Enable them only for trusted repositories by setting `HERMES_ENABLE_PROJECT_PLUGINS=true` before starting Hermes.
 
@@ -111,6 +112,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Register an image-generation backend | `ctx.register_image_gen_provider(provider)` — see [Image Generation Provider Plugins](/developer-guide/image-gen-provider-plugin) |
 | Register a video-generation backend | `ctx.register_video_gen_provider(provider)` — see [Video Generation Provider Plugins](/developer-guide/video-gen-provider-plugin) |
 | Register a context-compression engine | `ctx.register_context_engine(engine)` — see [Context Engine Plugins](/developer-guide/context-engine-plugin) |
+| Route human approval prompts | `ctx.register_approval_transport(name, present_fn)` — see [Approval transports](#approval-transports) |
 | Register a memory backend | Subclass `MemoryProvider` in `plugins/memory/<name>/__init__.py` — see [Memory Provider Plugins](/developer-guide/memory-provider-plugin) (uses a separate discovery system) |
 | Run a host-owned LLM call | `ctx.llm.complete(...)` / `ctx.llm.complete_structured(...)` — borrow the user's active model + auth for a one-shot completion with optional JSON schema validation. See [Plugin LLM Access](/developer-guide/plugin-llm-access) |
 | Register an inference backend (LLM provider) | `register_provider(ProviderProfile(...))` in `plugins/model-providers/<name>/__init__.py` — see [Model Provider Plugins](/developer-guide/model-provider-plugin) (uses a separate discovery system) |
@@ -165,6 +167,21 @@ hermes plugins disable <name>     # remove from allow-list + add to disabled
 
 After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`.
 
+For a reproducible install, pin a full immutable commit (tags, branches, and
+abbreviated SHAs are not accepted):
+
+```bash
+hermes plugins install owner/repo --ref 0123456789abcdef0123456789abcdef01234567
+```
+
+Hermes checks out the commit detached, verifies that `HEAD` exactly matches the
+requested SHA, and records the canonical source, installed revision, and pin
+status in the current profile. `hermes plugins update` refuses to move a pinned
+plugin; choose a new exact commit explicitly with
+`hermes plugins install <source> --force --ref <new-commit>`. The
+profile-local install metadata contains no config values, environment values,
+secrets, or capability grants.
+
 ### What the allow-list does NOT gate
 
 Several categories of plugin bypass `plugins.enabled` — they're part of Hermes' built-in surface and would break basic functionality if gated off by default:
@@ -181,27 +198,76 @@ Several categories of plugin bypass `plugins.enabled` — they're part of Hermes
 
 In short: **bundled "always-works" infrastructure loads automatically; third-party general plugins are opt-in.** The `plugins.enabled` allow-list is the gate specifically for arbitrary code a user drops into `~/.hermes/plugins/`.
 
+### Approval transports
+
+An approval transport changes **where a human sees and answers** an existing
+Hermes tool-approval request. It does not decide whether a command needs
+approval and it is not an authorization-policy API.
+
+```python
+def present(request):
+    # Deliver request.command and request.description to your UI, wait for
+    # its authenticated human response, then return a request-bound decision.
+    choice = send_to_my_ui_and_wait(request)  # once/session/always/deny
+    return request.respond(choice)
+
+
+def register(ctx):
+    ctx.register_approval_transport("my-ui", present)
+```
+
+`present` may be synchronous or async. Hermes runs it on a bounded worker and
+enforces the canonical `approvals.timeout` even if the plugin does not. The
+request is immutable and contains redacted display text, its host presentation
+class (`cli` or `gateway`), the host timeout, allowed choices, and an opaque
+request ID/digest.
+Return the result of
+`request.respond(choice)`; unbound dictionaries and stale or changed request
+IDs/digests are rejected. A plugin cannot return a scope that the host did not
+offer (for example, `always` on a once-only request).
+
+Registration alone does nothing. Enabling the plugin and explicitly selecting
+its transport are separate consent steps:
+
+```yaml
+plugins:
+  enabled: [my-approval-plugin]
+
+security:
+  approval:
+    transport: my-ui
+    transport_fallback: deny     # default
+```
+
+Transport exceptions, timeouts, unavailable registrations, invalid choices,
+and stale responses deny by default. To deliberately show the prompt on the
+ordinary CLI/TUI/gateway/ACP surface when the selected transport fails, set
+`transport_fallback: builtin`. Without that exact opt-in, Hermes never
+materializes the prompt on another surface.
+
+Hermes still owns hardline blocks, sudo-stdin protection, user deny rules,
+request binding, allowed scopes, persistence, hooks, and final authorization.
+Hardline commands are blocked before any transport callback. There is
+intentionally **no plugin approval policy, auto-allow callback, or required
+`pre_tool_call` policy** in this interface. A future approval-policy capability
+may use the plugin capability-consent model, but transport selection does not
+grant it.
+
 ### Migration for existing users
 
 When you upgrade to a version of Hermes that has opt-in plugins (config schema v21+), any user plugins already installed under `~/.hermes/plugins/` that weren't already in `plugins.disabled` are **automatically grandfathered** into `plugins.enabled`. Your existing setup keeps working. Bundled standalone plugins are NOT grandfathered — even existing users have to opt in explicitly. (Bundled platform/backend plugins never needed grandfathering because they were never gated.)
 
 ## Available hooks
 
-Plugins can register callbacks for these lifecycle events. See the **[Event Hooks page](/user-guide/features/hooks#plugin-hooks)** for full details, callback signatures, and examples.
+Plugins can register the 24 lifecycle events currently accepted by `hermes_cli.plugins.VALID_HOOKS`. The **[Event Hooks catalog](/user-guide/features/hooks#shipped-plugin-hook-catalog)** is canonical for exact timing, return handling, payload fields, and privacy notes.
 
-| Hook | Fires when |
-|------|-----------|
-| [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes |
-| [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns |
-| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the LLM loop — can return `{"context": "..."}` to [inject context into the user message](/user-guide/features/hooks#pre_llm_call) |
-| [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the LLM loop (successful turns only) |
-| [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) |
-| [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit handler |
-| [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session (`/new`, GC, CLI quit) |
-| [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`, `/clear`, idle rotation) |
-| [`subagent_stop`](/user-guide/features/hooks#subagent_stop) | Once per child after `delegate_task` finishes |
-| [`pre_gateway_dispatch`](/user-guide/features/hooks#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch. Return `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow. |
+| Descriptive category | Shipped hooks |
+|---|---|
+| **Directive/control** | `pre_tool_call`, `pre_llm_call`, `pre_verify`, `pre_gateway_dispatch` |
+| **Transform** | `transform_tool_result`, `transform_terminal_output`, `transform_llm_output` |
+| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
 
+These categories describe current behavior rather than defining future naming rules. Plugin middleware remains a separate registry/surface.
 ## Plugin types
 
 Hermes has four kinds of plugins:
@@ -272,7 +338,67 @@ hermes plugins update my-plugin              # pull latest
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
+hermes plugins capabilities [my-plugin]      # declared vs granted capabilities
 ```
+
+### Plugin capabilities and consent
+
+Plugins can declare the privileged host surfaces they want in their
+`plugin.yaml`:
+
+```yaml
+name: my-plugin
+capabilities:
+  - tools.override        # replace built-in tools
+  - llm.model_override    # pick the model for host-owned LLM calls
+```
+
+When a plugin declares capabilities, `hermes plugins install` (and
+`hermes plugins enable`) shows the list with one-line risk descriptions and
+asks once. Consenting records the grant under
+`plugins.entries.<id>.granted_capabilities` together with a consent hash and
+timestamp. Declining leaves the plugin enabled with those capabilities off —
+a well-behaved plugin probes with `ctx.has_capability()` and degrades
+gracefully.
+
+**Update re-consent:** if a plugin update declares capabilities you haven't
+granted, `hermes plugins update` surfaces the additions and asks again. New
+capabilities stay off until you consent — a plugin update can never silently
+widen its access.
+
+**Non-interactive sessions fail closed:** installing or updating without a
+TTY completes the install, but declared capabilities are *not* granted. Run
+`hermes plugins enable <id>` interactively to grant them later.
+
+Inspect the state at any time:
+
+```bash
+hermes plugins capabilities             # all plugins with declared/granted capabilities
+hermes plugins capabilities my-plugin   # one plugin, declared vs granted
+```
+
+Capability ids map 1:1 to the older per-feature config gates, which keep
+working but are **deprecated** in favor of the consent flow:
+
+| Capability | Legacy key (`plugins.entries.<id>.…`) |
+|---|---|
+| `tools.override` | `allow_tool_override` |
+| `llm.provider_override` | `llm.allow_provider_override` |
+| `llm.model_override` | `llm.allow_model_override` |
+| `llm.agent_id_override` | `llm.allow_agent_id_override` |
+| `llm.profile_override` | `llm.allow_profile_override` |
+| `llm.task_override` | `llm.allow_task_override` |
+
+A gate is open when *either* the capability is granted *or* the legacy key is
+set — existing configs keep working unchanged.
+
+:::warning Not a sandbox
+Capabilities are a **consent and audit layer**, not isolation. Plugins run as
+regular in-process Python: a malicious plugin can ignore every gate here.
+Granting a capability is a statement of trust in the plugin author — it is
+not a code audit, and Hermes has not reviewed the plugin's code. Only install
+plugins from sources you trust.
+:::
 
 ### Interactive UI
 

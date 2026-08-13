@@ -208,6 +208,38 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+# ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
+#
+# The prologue is the ONLY place the per-turn synchronous
+# memory_manager.prefetch_all() fires; a bare greeting must not block the
+# turn on provider network round-trips, while a substantive question must
+# still prefetch. These assert the gate at the call site (the classifier
+# itself is covered in tests/agent/test_memory_provider.py).
+
+
+def _agent_with_memory_manager():
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    agent._memory_manager = mm
+    return agent, mm
+
+
+def test_prefetch_skipped_for_trivial_user_message():
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message="hi!")
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+
+
+def test_prefetch_runs_for_substantive_user_message():
+    agent, mm = _agent_with_memory_manager()
+    query = "what did we decide about the deploy pipeline?"
+    ctx = _build(agent, user_message=query)
+    mm.prefetch_all.assert_called_once_with(query)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
@@ -333,13 +365,44 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
+class _TitlingAgent:
+    """Only what ``_maybe_title_session_at_turn_start`` reads off an agent."""
+
+    def __init__(self, platform):
+        self.platform = platform
+        self.session_id = "sess-1"
+        self.model = "test/model"
+        self.provider = "openrouter"
+        self.base_url = "https://openrouter.ai/api/v1"
+        self.api_key = "sk-x"
+        self.api_mode = "chat_completions"
+        self._session_db = MagicMock()
+        self._session_db_created = True
 
 
+def _title_turn(platform, message="Fix the login button"):
+    """Run the prologue's titling step and return the maybe_auto_title mock."""
+    from agent import turn_context
+
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            _TitlingAgent(platform),
+            [{"role": "user", "content": message}],
+        )
+    return titler
 
 
+@pytest.mark.parametrize("platform", ["cli", "telegram", "desktop", "acp", None])
+def test_prologue_titles_the_surfaces_a_person_reads(platform):
+    assert _title_turn(platform).called
 
 
+@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
+def test_prologue_does_not_title_machine_driven_runs(platform):
+    """Cron names its own session after the job, and nobody opens a subagent's.
 
-
-
+    Both would otherwise pay a side-LLM call per run for a name that is either
+    overwritten or never read.
+    """
+    assert not _title_turn(platform).called
 

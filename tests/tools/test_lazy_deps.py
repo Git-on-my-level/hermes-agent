@@ -83,6 +83,20 @@ class TestAllowlist:
 
     def test_feature_install_command_unknown(self):
         assert ld.feature_install_command("not.real") is None
+        assert ld.feature_install_command("not.real", venv_pip=True) is None
+
+    def test_feature_install_command_venv_pip_targets_interpreter(self):
+        # venv_pip=True must target the running interpreter's pip (correct in
+        # every install layout, immune to PEP 668) and carry the same specs
+        # as the default uv form.
+        import sys as _sys
+        default = ld.feature_install_command("platform.teams")
+        venv = ld.feature_install_command("platform.teams", venv_pip=True)
+        assert default is not None and venv is not None
+        assert venv.startswith(f"{_sys.executable} -m pip install ")
+        assert default.startswith("uv pip install ")
+        # Same spec tail on both forms.
+        assert venv.split(" -m pip install ", 1)[1] == default.split("uv pip install ", 1)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +239,59 @@ class TestIsSatisfiedVersionAware:
         assert ld._is_satisfied(spec) is True
         assert ld.feature_missing("tool.trace_upload") == ()
 
+    @pytest.mark.parametrize(
+        ("feature", "installed_versions", "expected_repairs"),
+        [
+            (
+                "skill.google_workspace",
+                {
+                    "google-api-python-client": "2.194.0",
+                    "google-auth": "2.55.0",
+                    "google-auth-oauthlib": "1.3.1",
+                    "google-auth-httplib2": "0.3.1",
+                    "httplib2": "0.31.2",
+                    "pyasn1": "0.6.3",
+                },
+                (
+                    "google-auth==2.55.1",
+                    "httplib2==0.32.0",
+                    "pyasn1==0.6.4",
+                ),
+            ),
+            (
+                "provider.vertex",
+                {
+                    "google-auth": "2.55.1",
+                    "pyasn1": "0.6.3",
+                },
+                ("pyasn1==0.6.4",),
+            ),
+        ],
+    )
+    def test_google_features_repair_stale_transitives(
+        self,
+        monkeypatch,
+        feature,
+        installed_versions,
+        expected_repairs,
+    ):
+        self._fake_version(monkeypatch, installed_versions)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        installed = []
+
+        def fake_install(specs, **kwargs):
+            installed.extend(specs)
+            for spec in specs:
+                package, wanted = spec.split("==", 1)
+                installed_versions[package] = wanted
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        ld.ensure(feature, prompt=False)
+
+        assert tuple(installed) == expected_repairs
+
 
 # ---------------------------------------------------------------------------
 # active_features + refresh_active_features (Piece A — hermes update wiring)
@@ -256,7 +323,19 @@ class TestRefreshActiveFeatures:
     def test_windows_matrix_refresh_is_skipped_before_pip(self, monkeypatch):
         # Matrix E2EE pulls python-olm, which has no native Windows wheel/build
         # path. `hermes update` must not retry that doomed install every run.
-        monkeypatch.setattr(ld.sys, "platform", "win32")
+        #
+        # The subject here is the *consumer* — refresh_active_features honouring
+        # the gate before pip — so we monkeypatch lazy_deps' own platform probe
+        # instead of faking the host, which keeps this covered on Linux too.
+        monkeypatch.setattr(
+            ld,
+            "_unsupported_feature_reason",
+            lambda feature: (
+                "unsupported on Windows: Matrix E2EE depends on python-olm"
+                if feature == "platform.matrix"
+                else None
+            ),
+        )
         monkeypatch.setattr(ld, "active_features", lambda: ["platform.matrix"])
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
@@ -270,6 +349,14 @@ class TestRefreshActiveFeatures:
 
         assert result["platform.matrix"].startswith("skipped:")
         assert "unsupported on Windows" in result["platform.matrix"]
+
+    @pytest.mark.windows_only
+    def test_matrix_probe_reports_unsupported_on_real_windows(self):
+        # The probe itself keys off the real host: patching sys.platform only
+        # proved the string, never that Windows actually hits this gate.
+        assert "unsupported on Windows" in (
+            ld._unsupported_feature_reason("platform.matrix") or ""
+        )
 
 
     def test_mixed_results_returns_per_feature_status(self, monkeypatch):

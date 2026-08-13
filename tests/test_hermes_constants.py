@@ -54,13 +54,13 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
 
+    @pytest.mark.windows_only
     def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
         """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""
         local_appdata = tmp_path / "LocalAppData"
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
-        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
 
         assert get_default_hermes_root() == local_appdata / "hermes"
 
@@ -69,13 +69,13 @@ class TestGetDefaultHermesRoot:
 class TestGetHermesHome:
     """Tests for get_hermes_home() platform-aware fallback."""
 
+    @pytest.mark.windows_only
     def test_windows_fallback_uses_localappdata(self, tmp_path, monkeypatch):
         """When HERMES_HOME is unset on Windows, use %LOCALAPPDATA%\\hermes."""
         local_appdata = tmp_path / "LocalAppData"
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
-        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
         assert get_hermes_home() == local_appdata / "hermes"
@@ -98,24 +98,24 @@ class TestGetProcessHermesHome:
 
 
 class TestHermesManagedNode:
+    @pytest.mark.windows_only
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
         node_dir = home / "node"
         bin_dir = node_dir / "bin"
         node_dir.mkdir(parents=True)
         bin_dir.mkdir()
-        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setenv("HERMES_HOME", str(home))
 
         assert iter_hermes_node_dirs() == [node_dir, bin_dir]
 
+    @pytest.mark.windows_only
     def test_windows_finds_npm_cmd_before_path(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
         node_dir = home / "node"
         node_dir.mkdir(parents=True)
         npm_cmd = node_dir / "npm.cmd"
         npm_cmd.write_text("@echo off\n")
-        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(hermes_constants, "node_tool_runnable", lambda path: True)
 
@@ -123,6 +123,7 @@ class TestHermesManagedNode:
 
 
 
+    @pytest.mark.windows_only
     def test_windows_skips_broken_managed_npm_without_path_fallback(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
         managed_npm = home / "node" / "npm.cmd"
@@ -132,7 +133,6 @@ class TestHermesManagedNode:
         bin_dir.mkdir()
         path_npm = bin_dir / "npm.cmd"
         path_npm.write_text("@echo off\n")
-        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("PATH", str(bin_dir))
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
@@ -212,6 +212,71 @@ class TestNodeToolRunnable:
         monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
 
         assert find_node_executable("npm") is None
+
+    def test_outdated_managed_node_heals_to_target_major(self, tmp_path, monkeypatch):
+        """A healthy managed tree below the target major upgrades on next resolve."""
+        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        old_node = self._stub(
+            managed_bin, "node", f"#!/bin/sh\necho 'v{target - 1}.20.0'\nexit 0\n"
+        )
+        heal_called = {"value": False}
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+
+        def _heal():
+            heal_called["value"] = True
+            old_node.write_text(f"#!/bin/sh\necho 'v{target}.5.1'\nexit 0\n")
+            old_node.chmod(0o755)
+            return True
+
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        resolved = hermes_constants.find_hermes_node_executable("node")
+        assert heal_called["value"] is True
+        assert resolved == str(old_node)
+
+    def test_outdated_managed_node_survives_failed_heal(self, tmp_path, monkeypatch):
+        """Offline heal failure keeps serving the old tree — old Node beats no Node."""
+        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        old_node = self._stub(
+            managed_bin, "node", f"#!/bin/sh\necho 'v{target - 1}.20.0'\nexit 0\n"
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", lambda: False)
+
+        assert hermes_constants.find_hermes_node_executable("node") == str(old_node)
+
+    def test_target_major_managed_node_does_not_heal(self, tmp_path, monkeypatch):
+        """A tree already at the target major never triggers the heal."""
+        target = hermes_constants._HERMES_NODE_TARGET_MAJOR
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        node = self._stub(
+            managed_bin, "node", f"#!/bin/sh\necho 'v{target}.5.1'\nexit 0\n"
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+
+        def _heal():
+            raise AssertionError("heal must not run for an up-to-date tree")
+
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        assert hermes_constants.find_hermes_node_executable("node") == str(node)
 
 
 
@@ -440,6 +505,7 @@ class TestSecureParentDir:
 
 
 
+    @pytest.mark.require_symlinks
     def test_symlink_resolved(self, tmp_path, monkeypatch):
         """Symlinks should be resolved before checking depth."""
         real_dir = tmp_path / "a" / "b"

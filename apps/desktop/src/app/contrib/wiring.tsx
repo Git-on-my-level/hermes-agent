@@ -11,7 +11,7 @@
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
 import { type CSSProperties, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
@@ -20,17 +20,19 @@ import { FindBar } from '@/components/find-bar'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
-import { $newSessionTabAction } from '@/components/pane-shell/tree/store'
+import { $newSessionTabAction, registerPaneCloser } from '@/components/pane-shell/tree/store'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
-import { getSessionMessages, triggerCronJob } from '@/hermes'
+import { getLatestSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
+import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
+import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
@@ -64,16 +66,18 @@ import {
   setMessages
 } from '@/store/session'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
-import { armWakeWord } from '@/store/wake-word'
-import { isSecondaryWindow } from '@/store/windows'
+import { armWakeWord, stopClientCapture } from '@/store/wake-word'
+import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
+import { closeWorkspaceTab } from '../chat/close-tab'
 import { requestComposerInsert } from '../chat/composer/focus'
 import { useComposerActions } from '../chat/hooks/use-composer-actions'
 import { CommandPalette } from '../command-palette'
 import { useGatewayBoot } from '../gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 import { useKeybinds } from '../hooks/use-keybinds'
+import { useHudHandoff } from '../hud/handoff'
 import { ModelPickerOverlay } from '../model-picker-overlay'
 import { ModelVisibilityOverlay } from '../model-visibility-overlay'
 import { mainChatOccupied, openSession } from '../open-session'
@@ -83,7 +87,14 @@ import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
-import { CRON_ROUTE, navigateToWorkspacePage, routeSessionId, SETTINGS_ROUTE, syncWorkspaceRoute } from '../routes'
+import {
+  CRON_ROUTE,
+  navigateToWorkspacePage,
+  routeSessionId,
+  sessionRoute,
+  SETTINGS_ROUTE,
+  syncWorkspaceRoute
+} from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -101,7 +112,12 @@ import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
-import { titlebarControlsPosition } from '../shell/titlebar'
+import {
+  titlebarControlsPosition,
+  titlebarControlsYNudge,
+  titlebarToolsRightCss,
+  titlebarToolsWidthCss
+} from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
 
@@ -169,8 +185,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const messagingSessions = useStore($messagingSessions)
+  const sessions = useStore($sessions)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
+  const boot = useStore($desktopBoot)
 
   const routedSessionId = routeSessionId(location.pathname)
   const routedSessionIdRef = useRef(routedSessionId)
@@ -235,14 +253,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
 
-  const {
-    loadMoreMessagingForPlatform,
-    loadMoreSessions,
-    loadMoreSessionsForProfile,
-    refreshCronJobs,
-    refreshMessagingSessions,
-    refreshSessions
-  } = useSessionListActions({ profileScope })
+  const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
+    useSessionListActions({ profileScope })
 
   const updateActiveSessionRuntimeInfo = useCallback(
     (info: { branch?: string; cwd?: string }) => {
@@ -318,7 +330,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
-          const latest = await getSessionMessages(storedSessionId, storedProfile)
+          const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
@@ -365,7 +377,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     try {
-      const latest = await getSessionMessages(storedSessionId, stored.profile)
+      const latest = await getLatestSessionMessages(storedSessionId, stored.profile)
       const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
       const sig = sessionMessagesSignature(latest.messages)
 
@@ -612,6 +624,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // session / new session), and it hears gateway truth from this window.
   useQuickEntryBridge({ startFreshSessionDraft, submitText })
 
+  // Leaving HUD mode hands this window the session back (see hud/handoff).
+  useHudHandoff({ navigate, resumeSession })
+
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output
   // failure keeps its content and sheds the error. Both the runtime cache AND
@@ -677,9 +692,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       if (event.type === 'wake.detected') {
         const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined
 
+        // Free the Mac mic so voice conversation can open getUserMedia.
+        // Server already pauses the detector lease; this stops client PCM feed.
+        stopClientCapture()
+
         // Audible confirmation that the wake registered, before voice capture
         // starts. Gated by the shared sound-mute toggle.
         playWakeSound()
+        activateWakeIndicator()
 
         // Multi-profile routing: a wake phrase enrolled by another profile
         // re-homes the gateway to that profile first (live swap — same path
@@ -763,14 +783,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const previewTarget = useStore($previewTarget)
 
   useDesktopIntegrations({
+    activeProfile: normalizeProfileKey(activeGatewayProfile),
     chatOpen,
     hasPreview: Boolean(previewTarget),
     locationPathname: location.pathname,
     navigate,
+    profileReady: boot.phase === 'renderer.ready',
     refreshSessions,
     resumeExhaustedSessionId,
     routedSessionId,
-    runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef
+    runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef,
+    sessions
   })
 
   // Pin/unpin the selected session (statusbar keybind + chat header) — pinned
@@ -819,6 +842,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     return () => $newSessionTabAction.set(null)
   }, [openNewSessionTab])
 
+  // The MAIN tab's Close. The workspace pane can't leave the tree, so its
+  // closer empties it instead: the next stacked session shifts in, else main
+  // drops to a fresh draft. Registering it here is also what gives the tab its
+  // close GESTURE (⌘-click / middle-click) — the strip reads the closer, not
+  // the `uncloseable` flag, so the pane stays undismissable either way.
+  useEffect(() => {
+    registerPaneCloser('workspace', () => void closeWorkspaceTab(id => navigate(sessionRoute(id))))
+
+    return () => registerPaneCloser('workspace')
+  }, [navigate])
+
   // The controller's entire callback surface, gathered into the stable
   // `actions` bag. `nextActions` is TS-checked against WiringActions each
   // render; its fields are copied into the ref object so `actions` keeps one
@@ -844,7 +878,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onDismissError: dismissError,
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
-    onLoadMoreProfileSessions: loadMoreSessionsForProfile,
     onLoadMoreSessions: loadMoreSessions,
     onManageCronJob: jobId => {
       setCronFocusJobId(jobId)
@@ -939,27 +972,27 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const rightTitlebarTools = useTitlebarToolContributions('right')
   const connection = useStore($connection)
   const controlsPos = titlebarControlsPosition(connection?.windowButtonPosition, Boolean(connection?.isFullscreen))
-  // Exact vertical centering: titlebarControlsPosition() returns
-  // (TITLEBAR_HEIGHT - TITLEBAR_CONTROL_HEIGHT) / 2, but TitlebarControls
-  // also applies a hard translate-y-0.5 (+2px) to its clusters. Cancel that
-  // constant so cluster center == bar center — measured, not eyeballed.
-  const controlsTranslateY = 2
   // Windows/WSLg reserve native min/max/close on the right (AppShell parity:
   // prefer the live WCO measurement, fall back to the static reservation).
   const measuredOverlayWidth = useWindowControlsOverlayWidth()
   const nativeOverlayWidth = measuredOverlayWidth ?? connection?.nativeOverlayWidth ?? 0
-  const titlebarToolsRight = nativeOverlayWidth > 0 ? `${nativeOverlayWidth}px` : '0.75rem'
+
+  const titlebarChrome = {
+    darwinMajor: connection?.darwinMajor ?? 0,
+    isFullscreen: Boolean(connection?.isFullscreen),
+    windowButtonPosition: connection?.windowButtonPosition
+  }
+
+  const titlebarToolsRight = titlebarToolsRightCss(nativeOverlayWidth, titlebarChrome)
   // Pane-registered tools (preview's monitor/devtools cluster) anchor flush
   // against the static system cluster — in the tree layout the titlebar band
   // sits ABOVE the grid, so AppShell's pane-width anchoring doesn't apply.
   const SYSTEM_TOOL_COUNT = 4
   const paneToolCount = rightTitlebarTools.filter(tool => !tool.hidden).length
-  const systemToolsWidth = `calc(${SYSTEM_TOOL_COUNT} * (var(--titlebar-control-size) + 0.25rem))`
+  const systemToolsWidth = titlebarToolsWidthCss(SYSTEM_TOOL_COUNT)
 
   const titlebarToolsWidth =
-    paneToolCount > 0
-      ? `calc(${systemToolsWidth} + ${paneToolCount} * (var(--titlebar-control-size) + 0.25rem))`
-      : systemToolsWidth
+    paneToolCount > 0 ? `calc(${systemToolsWidth} + ${titlebarToolsWidthCss(paneToolCount)})` : systemToolsWidth
 
   return (
     <ContribWiringContext.Provider value={api}>
@@ -968,25 +1001,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         style={
           {
             '--titlebar-controls-left': `${controlsPos.left}px`,
-            '--titlebar-controls-top': `${controlsPos.top - controlsTranslateY}px`,
+            '--titlebar-controls-top': `${controlsPos.top}px`,
+            '--titlebar-controls-y-nudge': titlebarControlsYNudge(titlebarChrome),
             '--titlebar-tools-right': titlebarToolsRight,
             '--titlebar-tools-width': titlebarToolsWidth,
             '--shell-preview-toolbar-gap': systemToolsWidth
           } as CSSProperties
         }
       >
-        <TitlebarControls
-          leftTools={leftTitlebarTools}
-          onOpenSettings={() => navigate(SETTINGS_ROUTE)}
-          tools={rightTitlebarTools}
-        />
+        {/* HUD mode has no titlebar to hang these off — the clusters are
+            `fixed`, so without this they'd float over the chat as orphaned
+            buttons. Exits are the ⌘⇧H toggle and ⌘W. */}
+        {!isHudWindow() && (
+          <TitlebarControls
+            leftTools={leftTitlebarTools}
+            onOpenSettings={() => navigate(SETTINGS_ROUTE)}
+            tools={rightTitlebarTools}
+          />
+        )}
         {children}
       </div>
 
       {/* The full real overlay set (mirrors DesktopController's `overlays`). */}
       <RemoteDisplayBanner />
-      {!isSecondaryWindow() && <DesktopInstallOverlay />}
-      {!isSecondaryWindow() && (
+      {!isAuxiliaryWindow() && <DesktopInstallOverlay />}
+      {!isAuxiliaryWindow() && (
         <DesktopOnboardingOverlay
           enabled={gatewayState === 'open'}
           onCompleted={() => {
@@ -1082,11 +1121,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {/* Toasts above everything. */}
       <NotificationStack />
 
-      {/* Petdex floating mascot — renders nothing unless installed + enabled. */}
-      <FloatingPet />
+      {/* Petdex floating mascot — renders nothing unless installed + enabled.
+          Never in the HUD: that window is the chat bar and nothing else. */}
+      {!isHudWindow() && <FloatingPet />}
 
-      {/* Single persistent xterm host chasing the terminal pane's slot rect. */}
-      <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />
+      {/* Single persistent xterm host chasing the terminal pane's slot rect.
+          The HUD has no terminal pane, so it has nothing to chase. */}
+      {!isHudWindow() && <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />}
     </ContribWiringContext.Provider>
   )
 }

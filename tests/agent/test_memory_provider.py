@@ -216,6 +216,26 @@ class TestMemoryManager:
         # p1 failed but p2 still synced
         assert p2.synced_turns == [("user", "assistant")]
 
+    def test_sync_all_keeps_legacy_provider_working_when_messages_are_available(self):
+        """New optional turn context is not sent to an old provider signature."""
+        mgr = MemoryManager()
+        legacy_provider = FakeMemoryProvider("legacy")
+        mgr.add_provider(legacy_provider)
+        completed_messages = [
+            {"role": "user", "content": "user"},
+            {"role": "assistant", "content": "assistant"},
+        ]
+
+        mgr.sync_all(
+            "user",
+            "assistant",
+            session_id="legacy-session",
+            messages=completed_messages,
+        )
+        mgr.flush_pending(timeout=5)
+
+        assert legacy_provider.synced_turns == [("user", "assistant")]
+
     # -- Tool routing -------------------------------------------------------
 
 
@@ -417,13 +437,15 @@ class TestUserInstalledProviderCli:
             "    def get_tool_schemas(self): return []\n"
             "    def handle_tool_call(self, *a, **kw): return '{}'\n"
             "def register(ctx):\n"
-            "    ctx.register_memory_provider(MyProvider())\n"
+            "    ctx.register_memory_provider(MyProvider())\n",
+            encoding="utf-8",
         )
-        (plugin_dir / "config.py").write_text("STATUS = 'ok'\n")
+        (plugin_dir / "config.py").write_text("STATUS = 'ok'\n", encoding="utf-8")
         (plugin_dir / "cli.py").write_text(
             "from . import config\n"
             "def register_cli(subparser):\n"
-            "    subparser.add_argument('--status', action='store_true')\n"
+            "    subparser.add_argument('--status', action='store_true')\n",
+            encoding="utf-8",
         )
         return plugin_dir
 
@@ -1138,3 +1160,23 @@ class TestMemoryInjectionRejectsMalformedSchema:
         names = {t["function"]["name"] for t in agent.tools}
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
+
+
+class TestTrivialPromptClassifier:
+    """is_trivial_prompt — the shared gate for core prefetch + provider injection."""
+
+    def test_trivial_variants(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        for t in ("hi", "HI!", "hey.", "hello", "yo", "sup~", "thanks :)",
+                  "done???", "ok", "yes.", "k", "", "   ", "/help", "lgtm"):
+            assert is_trivial_prompt(t), f"expected trivial: {t!r}"
+
+    def test_substantive_and_prefix_collisions_pass_through(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        # Words that merely START with a trivial word must not match.
+        for t in ("k8s", "yolo", "hive", "note", "supper", "hind",
+                  "hello world", "ok so what's next", "what's my name",
+                  "hey can you check the logs", "continue the migration plan"):
+            assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"

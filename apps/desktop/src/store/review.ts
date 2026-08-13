@@ -2,7 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
-import { revealTreePane } from '@/components/pane-shell/tree/store'
+import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
 import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { desktopGit } from '@/lib/desktop-git'
@@ -10,8 +10,9 @@ import { isExcludedPath } from '@/lib/excluded-paths'
 import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
-import { refreshRepoStatus } from './coding-status'
-import { $busy, $currentCwd } from './session'
+import { refreshRepoStatus, repoStatusForCwd } from './coding-status'
+import { stampSessionPrBranch } from './pull-requests'
+import { $busy, $currentCwd, $selectedStoredSessionId, $sessions } from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
 // State for the review pane: the working-tree changed-file list, the selected
@@ -285,7 +286,12 @@ export function toggleReview(scopeCwd: null | string = null): void {
     return
   }
 
-  if ($reviewOpen.get()) {
+  // Ask the TREE, not `$reviewOpen`. The store stays true while the pane sits
+  // behind a sibling tab in the right column or inside a minimized zone, so a
+  // boolean flip spent the press re-asserting a value it already held and ⌘G
+  // read as a dead key. `revealReview` fronts and un-minimizes; only close when
+  // the diff is genuinely the thing on screen.
+  if (isPaneVisible(REVIEW_PANE_ID)) {
     closeReview()
   } else {
     revealReview(scopeCwd)
@@ -520,6 +526,17 @@ export async function createOrOpenPr(): Promise<void> {
 
     if (url) {
       void window.hermesDesktop?.openExternal?.(url)
+    }
+
+    // The session recorded its branch when it started; the checkout may have
+    // moved since, so bind the conversation to the branch the PR actually came
+    // from — otherwise a session that began on trunk badges whatever else lives
+    // on trunk, or nothing.
+    const session = $sessions.get().find(s => s.id === $selectedStoredSessionId.get())
+    const branch = repoStatusForCwd(ctx.cwd).get()?.branch
+
+    if (session?.git_repo_root && branch) {
+      stampSessionPrBranch(session.id, session.git_repo_root, branch)
     }
 
     void refreshShipInfo()

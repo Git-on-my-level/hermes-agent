@@ -482,17 +482,43 @@ class RelayTurnContext:
         default_factory=threading.RLock,
         repr=False,
     )
-    _token: contextvars.Token[RelayTurnContext | None] | None = field(
-        default=None,
-        repr=False,
-    )
+    _previous_turn: RelayTurnContext | None = field(default=None, repr=False)
     _active_registered: bool = field(default=False, repr=False)
+    relay_enabled: bool = True
     closed: bool = False
 
 
 _CURRENT_TURN: contextvars.ContextVar[RelayTurnContext | None] = contextvars.ContextVar(
     "hermes_relay_turn", default=None
 )
+
+# Depth of managed Relay callbacks executing on the current logical call path.
+# Set >0 while the native Relay pipeline is mid-dispatch of a Hermes callback
+# (tool or LLM). Nested managed execution inside that window is structurally
+# broken — the native pipeline binds its Futures to the outer, blocked event
+# loop — so resolve_execution_context() bypasses Relay while the flag is set.
+# ContextVar so the marker follows contextvars.copy_context() into the worker
+# threads / per-thread loops that tools use for their internal async work.
+_MANAGED_CALLBACK_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "hermes_relay_managed_callback_depth", default=0
+)
+
+
+class managed_callback_guard:
+    """Mark the current context as inside a managed Relay callback.
+
+    Synchronous context manager used by the relay adapters around the
+    ``invoke()`` callbacks they hand to the native pipeline. Everything the
+    callback transitively calls (including work it forwards to worker threads
+    via ``contextvars.copy_context()``) sees the marker and runs unmanaged.
+    """
+
+    def __enter__(self) -> "managed_callback_guard":
+        self._token = _MANAGED_CALLBACK_DEPTH.set(_MANAGED_CALLBACK_DEPTH.get() + 1)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        _MANAGED_CALLBACK_DEPTH.reset(self._token)
 
 
 class RelaySessionCoordinator:
@@ -600,7 +626,28 @@ class RelaySessionCoordinator:
         if lease.released:
             raise RuntimeError("Hermes Relay conversation lease is released")
         turn = RelayTurnContext(lease=lease, turn_id=turn_id, task_id=task_id)
-        if isinstance(lease.host, RelayRuntime) and lease.session is not None:
+        key = (lease.profile_key, lease.session_id)
+        with self._active_turns_lock:
+            active = self._active_turns.get(key)
+            if active:
+                # A Relay session owns one physical scope stack. Concurrent
+                # Hermes turns would create sibling scopes on that stack, but
+                # their completion order is not guaranteed to be LIFO.
+                turn.relay_enabled = False
+                logger.warning(
+                    "Skipping Relay instrumentation for concurrent Hermes turn "
+                    "%s in session %s",
+                    turn_id,
+                    lease.session_id,
+                )
+            else:
+                self._active_turns[key] = {id(turn)}
+                turn._active_registered = True
+        if (
+            turn.relay_enabled
+            and isinstance(lease.host, RelayRuntime)
+            and lease.session is not None
+        ):
             try:
                 turn.handle = lease.host.run_in_session(
                     lease.session,
@@ -617,11 +664,8 @@ class RelaySessionCoordinator:
                 )
             except Exception:
                 logger.warning("Hermes Relay turn initialization failed", exc_info=True)
-        turn._token = _CURRENT_TURN.set(turn)
-        key = (lease.profile_key, lease.session_id)
-        with self._active_turns_lock:
-            self._active_turns.setdefault(key, set()).add(id(turn))
-            turn._active_registered = True
+        turn._previous_turn = _CURRENT_TURN.get()
+        _CURRENT_TURN.set(turn)
         return turn
 
     def end_turn(
@@ -755,16 +799,18 @@ class RelaySessionCoordinator:
 
     @staticmethod
     def _reset_turn_context(turn: RelayTurnContext) -> None:
-        """Reset the originating ContextVar token when called in that context."""
-        if turn._token is None:
+        """Unwind ``turn`` without disturbing a newer context-local turn."""
+        if _CURRENT_TURN.get() is not turn:
             return
-        try:
-            _CURRENT_TURN.reset(turn._token)
-        except ValueError:
-            # A copied async/thread context may own terminal cleanup. Keep the
-            # token so the originating context can clear its stale reference.
-            return
-        turn._token = None
+        previous = turn._previous_turn
+        seen = {id(turn)}
+        while previous is not None and previous.closed:
+            if id(previous) in seen:
+                previous = None
+                break
+            seen.add(id(previous))
+            previous = previous._previous_turn
+        _CURRENT_TURN.set(previous)
 
     @staticmethod
     def release_conversation(lease: ConversationLease) -> None:
@@ -793,10 +839,21 @@ def current_turn() -> RelayTurnContext | None:
     return _CURRENT_TURN.get()
 
 
+def relay_instrumentation_enabled() -> bool:
+    """Return whether this inherited turn may create Relay instrumentation."""
+    turn = current_turn()
+    return turn is None or (turn.relay_enabled and not turn.closed)
+
+
 def active_turn(session_id: str | None = None) -> RelayTurnContext | None:
     """Return a live turn only when it belongs to the active profile/session."""
     turn = current_turn()
-    if turn is None or turn.closed or turn.lease.released:
+    if (
+        turn is None
+        or not turn.relay_enabled
+        or turn.closed
+        or turn.lease.released
+    ):
         return None
     if turn.lease.profile_key != current_profile_key():
         return None
@@ -814,6 +871,25 @@ def resolve_execution_context(
     session_id: str,
 ) -> tuple[RelayRuntime | None, RelaySession | None, Any]:
     """Resolve one active turn/session parent for managed Relay execution."""
+    if _MANAGED_CALLBACK_DEPTH.get() > 0:
+        # A managed Relay callback is already executing on this logical call
+        # path (e.g. the native ``tools.execute`` pipeline is mid-dispatch of
+        # a Hermes tool). Nested managed execution here is structurally
+        # impossible: the native pipeline binds its Futures to the OUTER
+        # call's event loop, which is blocked inside the synchronous tool
+        # callback until the tool returns. A nested managed LLM call (the
+        # vision_analyze auxiliary path) therefore awaits a foreign-loop
+        # Future that can never complete — "attached to a different loop"
+        # at best, deadlock at worst, and "Event loop is closed" during
+        # shutdown when the orphaned Future is completed late (#77244).
+        # Run nested calls unmanaged; the outer tool scope still records
+        # the tool-level event for observability.
+        return None, None, None
+    inherited_turn = current_turn()
+    if inherited_turn is not None and (
+        not inherited_turn.relay_enabled or inherited_turn.closed
+    ):
+        return None, None, None
     turn = active_turn(session_id)
     if (
         turn is not None

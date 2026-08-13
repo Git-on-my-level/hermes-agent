@@ -74,9 +74,11 @@ def _make_runtime_install(
 # ---------------------------------------------------------------------------
 
 class TestManagedUvPath:
+    # POSIX arm of the name mapping; the Windows arm (uv.exe) is exercised
+    # for real by TestEnsureUvWindowsSafe on the Windows lane.
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: bin/uv name")
     def test_posix(self, tmp_path):
-        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"):
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import managed_uv_path
             assert managed_uv_path() == tmp_path / "bin" / "uv"
 
@@ -157,6 +159,8 @@ class TestEnsureUv:
         assert observed == [repair]
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX-only: the _UvResult dual contract is not offered on Windows")
 class TestEnsureUvUpdateBoundary:
     """``ensure_uv()`` must answer to both the single-value and the legacy
     ``(path, fresh_bootstrap)`` call conventions — **on POSIX**.
@@ -172,15 +176,15 @@ class TestEnsureUvUpdateBoundary:
     2-tuple, in both the success and failure cases.
 
     The dual contract is intentionally **not** offered on Windows — see
-    ``TestEnsureUvWindowsSafe`` for why — so these tests pin ``platform.system``
-    to a POSIX value.
+    ``TestEnsureUvWindowsSafe`` for why — so these tests are POSIX-only: the
+    host's real ``platform.system()`` selects the wrapper branch, nothing is
+    faked.
     """
 
     def test_success_usable_as_single_value(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"):
+             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")):
             from hermes_cli.managed_uv import ensure_uv
             uv_bin = ensure_uv()
             assert uv_bin == str(tmp_path / "bin" / "uv")
@@ -189,8 +193,7 @@ class TestEnsureUvUpdateBoundary:
     def test_success_unpacks_as_legacy_two_tuple(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"):
+             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")):
             from hermes_cli.managed_uv import ensure_uv
             uv_bin, fresh = ensure_uv()  # old: uv_bin, fresh_bootstrap = ensure_uv()
             assert uv_bin == str(tmp_path / "bin" / "uv")
@@ -199,7 +202,6 @@ class TestEnsureUvUpdateBoundary:
     def test_failure_unpacks_without_raising(self, tmp_path):
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
              patch("hermes_cli.managed_uv._install_uv", side_effect=RuntimeError("network down")):
             from hermes_cli.managed_uv import ensure_uv
             uv_bin, fresh = ensure_uv()
@@ -232,13 +234,17 @@ class TestEnsureUvWindowsSafe:
         with pytest.raises(TypeError):
             subprocess.list2cmdline([_UvResult("C:\\hermes\\uv.exe"), "pip"])
 
+    @pytest.mark.windows_only
     def test_windows_returns_plain_str_safe_for_subprocess(self, tmp_path):
+        """``windows_only``: the subject is the real Windows opt-out branch and
+        ``subprocess.list2cmdline`` — the faked ``platform.system`` only ever
+        proved the branch existed, not that the field crash was fixed on the
+        host that reported it."""
         import subprocess
-        # On (mocked) Windows the managed binary is uv.exe.
+        # On Windows the managed binary is uv.exe.
         _make_executable(tmp_path / "bin" / "uv.exe")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Windows"):
+             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")):
             from hermes_cli.managed_uv import _UvResult, ensure_uv
             uv_bin = ensure_uv()
             assert type(uv_bin) is str and not isinstance(uv_bin, _UvResult)
@@ -366,14 +372,15 @@ class TestManagedPythonStore:
         assert base_env["PYTHONHOME"] == "/poison/home"
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX-only: fixtures build the bin/ (not Scripts/) venv layout")
 class TestRuntimeRepair:
     def test_safe_runtime_is_a_noop(self, tmp_path):
         from hermes_cli.managed_uv import repair_vulnerable_runtime
 
         root, live, sentinel = _make_runtime_install(tmp_path)
         current = _runtime_info(live / "bin" / "python", (3, 53, 1))
-        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
-             patch(
+        with patch(
                  "hermes_cli.managed_uv.probe_sqlite_runtime",
                  return_value=current,
              ), \
@@ -388,6 +395,47 @@ class TestRuntimeRepair:
         assert sentinel.read_text(encoding="utf-8") == "live"
         assert not (root / ".hermes-runtime").exists()
         mock_install.assert_not_called()
+
+    def test_stage_candidate_sync_keeps_uv_project_config(self, tmp_path):
+        from hermes_cli.managed_uv import _stage_candidate_venv
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+        generation = root / ".hermes-runtime" / "python" / "gen"
+        python = generation / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("py", encoding="utf-8")
+
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((list(argv), kwargs.get("env")))
+            return MagicMock(returncode=0)
+
+        with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
+             patch(
+                 "hermes_cli.managed_uv._smoke_candidate_venv",
+                 return_value=(True, "", None),
+             ):
+            candidate = _stage_candidate_venv(
+                "uv",
+                project_root=root,
+                generation=generation,
+                python=python,
+            )
+
+        assert candidate is not None
+        assert len(calls) == 2
+        venv_argv, venv_env = calls[0]
+        sync_argv, sync_env = calls[1]
+        assert venv_argv[:2] == ["uv", "venv"]
+        assert "--no-config" in venv_argv
+        assert venv_env.get("UV_NO_CONFIG") == "1"
+        assert sync_argv[:2] == ["uv", "sync"]
+        assert "--locked" in sync_argv
+        assert "--no-config" not in sync_argv
+        assert "UV_NO_CONFIG" not in sync_env
 
     def test_failed_candidate_preserves_live_venv(self, tmp_path):
         from hermes_cli.managed_uv import (
@@ -404,8 +452,7 @@ class TestRuntimeRepair:
         candidate_python.write_text("candidate interpreter", encoding="utf-8")
         fixed = _runtime_info(candidate_python, (3, 53, 1))
 
-        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
-             patch(
+        with patch(
                  "hermes_cli.managed_uv.probe_sqlite_runtime",
                  side_effect=[current, current],
              ), \
@@ -449,8 +496,7 @@ class TestRuntimeRepair:
         (fresh_backup / "bin").mkdir(parents=True)
 
         current = _runtime_info(live / "bin" / "python", (3, 53, 1))
-        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
-             patch(
+        with patch(
                  "hermes_cli.managed_uv.probe_sqlite_runtime",
                  return_value=current,
              ):
@@ -479,8 +525,7 @@ class TestRuntimeRepair:
             "candidate venv interpreter", encoding="utf-8"
         )
 
-        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
-             patch(
+        with patch(
                  "hermes_cli.managed_uv.probe_sqlite_runtime",
                  side_effect=[current, current],
              ), \
@@ -834,33 +879,36 @@ class TestRefreshManagedUvCatalog:
     def test_version_change_reports_true(self, tmp_path):
         import hermes_cli.managed_uv as managed_uv
 
-        uv_path = tmp_path / "bin" / "uv"
-        _make_executable(uv_path)
         versions = iter(["uv 0.1.0", "uv 0.2.0"])
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
              patch("hermes_cli.managed_uv._install_uv"), \
              patch(
                  "hermes_cli.managed_uv._uv_version_string",
                  side_effect=lambda _uv: next(versions),
              ):
+            # Host-native path: the refresh only acts on the managed binary,
+            # so the fixture must live at the real host's managed_uv_path()
+            # (uv on POSIX, uv.exe on Windows) — no platform fake needed.
+            uv_path = managed_uv.managed_uv_path()
+            _make_executable(uv_path)
             assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is True
 
 
     def test_installer_failure_reports_false(self, tmp_path):
         import hermes_cli.managed_uv as managed_uv
 
-        uv_path = tmp_path / "bin" / "uv"
-        _make_executable(uv_path)
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
              patch(
                  "hermes_cli.managed_uv._install_uv",
                  side_effect=RuntimeError("network down"),
              ):
+            uv_path = managed_uv.managed_uv_path()
+            _make_executable(uv_path)
             assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is False
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX-only: fixtures build the bin/ (not Scripts/) venv layout")
 class TestRepairRetriesAfterUvRefresh:
     def _run_repair(self, tmp_path, *, refresh_result, second_attempt):
         """Drive repair with the first provisioning attempt failing."""
@@ -877,8 +925,7 @@ class TestRepairRetriesAfterUvRefresh:
                 return None
             return second_attempt(project_root)
 
-        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
-             patch(
+        with patch(
                  "hermes_cli.managed_uv.probe_sqlite_runtime",
                  return_value=current,
              ), \
@@ -983,4 +1030,77 @@ class TestDefaultLiveVenv:
         assert _default_live_venv(root) == root / "venv"
         result = repair_vulnerable_runtime("uv", project_root=root)
         assert result.status == "not-applicable"
+
+
+class TestVenvPythonUpdateBoundary:
+    """``_venv_python`` must survive a hermes_constants predating its symbol.
+
+    ``hermes update`` imports hermes_constants from the OLD checkout, ``git
+    pull`` replaces that file, and the freshly-pulled managed_uv then runs its
+    lazy ``from hermes_constants import venv_python_path`` against the module
+    object already cached in ``sys.modules``. That cached module has no such
+    symbol, so the import raises — while naming the NEW file on disk, which
+    plainly contains it, which is what made the error so confusing:
+
+        cannot import name 'venv_python_path' from 'hermes_constants'
+        (~/.hermes/hermes-agent/hermes_constants.py)
+
+    It aborted the managed-Python runtime repair on the first update from any
+    release older than the symbol. Same class as the ``ensure_uv()`` arity skew
+    documented on ``_UvResult``.
+    """
+
+    def test_recovers_when_the_cached_module_predates_the_symbol(self, monkeypatch):
+        import hermes_constants
+
+        from hermes_cli.managed_uv import _venv_python
+
+        # The stale in-memory module: the symbol the new code wants is absent,
+        # exactly as on an install that booted the pre-upgrade checkout. The
+        # file on disk is the current one, so a reload recovers the real helper.
+        monkeypatch.delattr(hermes_constants, "venv_python_path", raising=False)
+
+        # Host-native: the subject is the reload-recovery seam, not the
+        # bin/Scripts mapping — assert whatever layout the real host resolves.
+        expected = Path("/opt/hermes/venv/Scripts/python.exe") \
+            if sys.platform == "win32" else Path("/opt/hermes/venv/bin/python")
+        assert _venv_python(Path("/opt/hermes/venv")) == expected
+
+    def test_recovery_uses_the_shared_helper_not_a_second_copy(self, monkeypatch):
+        """The reload must resolve through hermes_constants, not open-code it.
+
+        Hand-rolling `Scripts`/`bin` here is what #76105 deduped away and what
+        `test_no_open_coded_venv_layout_remains_in_hermes_cli` bans.
+        """
+        import hermes_constants
+
+        from hermes_cli.managed_uv import _venv_python
+
+        monkeypatch.delattr(hermes_constants, "venv_python_path", raising=False)
+
+        sentinel = Path("/sentinel/from/shared/helper")
+        real_reload = __import__("importlib").reload
+
+        def _reload_with_marker(module):
+            fresh = real_reload(module)
+            monkeypatch.setattr(
+                fresh, "venv_python_path", lambda *a, **k: sentinel, raising=False
+            )
+            return fresh
+
+        monkeypatch.setattr("importlib.reload", _reload_with_marker)
+        assert _venv_python(Path("/opt/hermes/venv")) == sentinel
+
+    def test_uses_the_real_helper_when_it_is_importable(self, monkeypatch):
+        """The normal path never reloads — recovery stays a fallback."""
+        from hermes_cli.managed_uv import _venv_python
+
+        def _no_reload(module):  # pragma: no cover - must not run
+            raise AssertionError("reload must not run when the import succeeds")
+
+        monkeypatch.setattr("importlib.reload", _no_reload)
+
+        expected = Path("/opt/hermes/venv/Scripts/python.exe") \
+            if sys.platform == "win32" else Path("/opt/hermes/venv/bin/python")
+        assert _venv_python(Path("/opt/hermes/venv")) == expected
 

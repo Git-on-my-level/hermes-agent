@@ -313,6 +313,48 @@ class TestActiveVenvMarkerStripping:
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
 
 
+class TestProfileScopedPassthrough:
+    def test_make_run_env_uses_active_profile_for_passthrough(self, monkeypatch):
+        """Allowlisted values must come from the routed profile, not os.environ."""
+        from agent import secret_scope as ss
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        clear_env_passthrough()
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
+        try:
+            result = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+            clear_env_passthrough()
+
+        assert result["SERVICE_TOKEN"] == "token-for-routed-profile"
+
+    def test_make_run_env_omits_missing_scoped_passthrough(self, monkeypatch):
+        """A missing routed secret must not fall back to the default profile."""
+        from agent import secret_scope as ss
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        clear_env_passthrough()
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            result = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+            clear_env_passthrough()
+
+        assert "SERVICE_TOKEN" not in result
+
+
 class TestBlocklistCoverage:
     """Sanity checks that the blocklist covers all known providers."""
 
@@ -516,11 +558,19 @@ class TestSanePathIncludesHomebrew:
         assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
 
+    @pytest.mark.windows_only
     def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch):
+        """Windows-only: ``_path_env_key`` looks for a case-insensitive PATH
+        key only on Windows, so the mixed-case ``Path`` preservation this
+        asserts is a genuinely Windows-native behaviour.
+
+        The Git Bash dir prepend is neutralised so the assertion is about the
+        key casing alone (a real Windows box has those dirs).
+        """
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
         windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
-        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
         with patch.object(local_mod.os, "environ", windows_env):
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]
@@ -555,13 +605,15 @@ class TestHermesBinDirOnPath:
         local_mod._HERMES_BIN_DIR = None
         assert local_mod._prepend_hermes_bin_dir("/usr/bin:/bin") == "/usr/bin:/bin"
 
-    def test_make_run_env_injects_hermes_bin_dir(self, monkeypatch):
-        """A gateway env missing the hermes dir gets it back in the subshell PATH."""
+    def test_make_run_env_injects_hermes_bin_dir(self):
+        """A gateway env missing the hermes dir gets it back in the subshell PATH.
+
+        Platform-agnostic: ``_prepend_hermes_bin_dir`` uses ``os.pathsep`` on
+        every host, so no platform flag is faked here."""
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
         with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=True):
             result = _make_run_env({})
         entries = result["PATH"].split(os.pathsep)

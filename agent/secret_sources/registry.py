@@ -32,7 +32,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, MutableMapping, Optional
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -40,13 +40,17 @@ from agent.secret_sources.base import (
     FetchResult,
     SecretSource,
     is_valid_env_name,
+    reset_source_environment,
+    set_source_environment,
 )
 
 logger = logging.getLogger(__name__)
 
 # Ordered registry: name → source instance.  Python dicts preserve
-# insertion order, which doubles as the default apply order.
+# insertion order, which doubles as the default apply order. Origin is
+# recorded beside each source so consumers never infer ownership from names.
 _SOURCES: Dict[str, SecretSource] = {}
+_SOURCE_ORIGINS: Dict[str, str] = {}
 _BUILTINS_LOADED = False
 
 
@@ -92,7 +96,12 @@ class ApplyReport:
 # ---------------------------------------------------------------------------
 
 
-def register_source(source: SecretSource, *, replace: bool = False) -> bool:
+def register_source(
+    source: SecretSource,
+    *,
+    replace: bool = False,
+    builtin: bool = False,
+) -> bool:
     """Register a secret source.  Returns True on success.
 
     Rejections are logged, never raised — a bad plugin must not take
@@ -138,6 +147,7 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
                 )
                 return False
     _SOURCES[name] = source
+    _SOURCE_ORIGINS[name] = "builtin" if builtin else "plugin"
     return True
 
 
@@ -149,6 +159,16 @@ def get_source(name: str) -> Optional[SecretSource]:
 def list_sources() -> List[SecretSource]:
     _ensure_builtin_sources()
     return list(_SOURCES.values())
+
+
+def list_plugin_sources() -> List[SecretSource]:
+    """Return sources registered outside the bundled bootstrap set."""
+    _ensure_builtin_sources()
+    return [
+        source
+        for name, source in _SOURCES.items()
+        if _SOURCE_ORIGINS.get(name) == "plugin"
+    ]
 
 
 def _ensure_builtin_sources() -> None:
@@ -164,21 +184,21 @@ def _ensure_builtin_sources() -> None:
     try:
         from agent.secret_sources.bitwarden import BitwardenSource
 
-        register_source(BitwardenSource())
+        register_source(BitwardenSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning("Failed to register bundled Bitwarden secret source",
                        exc_info=True)
     try:
         from agent.secret_sources.onepassword import OnePasswordSource
 
-        register_source(OnePasswordSource())
+        register_source(OnePasswordSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning("Failed to register bundled 1Password secret source",
                        exc_info=True)
     try:
         from agent.secret_sources.command import CommandSource
 
-        register_source(CommandSource())
+        register_source(CommandSource(), builtin=True)
     except Exception:  # noqa: BLE001 — never block startup
         logger.warning("Failed to register bundled command secret source",
                        exc_info=True)
@@ -187,6 +207,7 @@ def _ensure_builtin_sources() -> None:
 def _reset_registry_for_tests() -> None:
     global _BUILTINS_LOADED
     _SOURCES.clear()
+    _SOURCE_ORIGINS.clear()
     _BUILTINS_LOADED = False
 
 
@@ -196,7 +217,8 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path
+    source: SecretSource, cfg: dict, home_path: Path,
+    environ: MutableMapping[str, str],
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
@@ -211,7 +233,14 @@ def _fetch_with_timeout(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        def _fetch() -> FetchResult:
+            token = set_source_environment(environ)
+            try:
+                return source.fetch(cfg, home_path)
+            finally:
+                reset_source_environment(token)
+
+        future = executor.submit(_fetch)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -321,7 +350,7 @@ def _profile_alias_target(var: str, profile: str) -> Optional[str]:
 
 
 def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[Dict[str, str]] = None) -> ApplyReport:
+              environ: Optional[MutableMapping[str, str]] = None) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
     ``environ`` defaults to ``os.environ``; injectable for tests.
@@ -376,7 +405,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path)
+        result = _fetch_with_timeout(source, cfg, home_path, env)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

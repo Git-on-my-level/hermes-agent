@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.redact import redact_cdp_url
@@ -181,6 +182,11 @@ try:
     from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
+# Browser Use CLI (optional)
+try:
+    from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
+except ImportError:
+    _is_browser_use_cli_mode = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
 
@@ -1568,6 +1574,42 @@ _cleanup_running = False
 _cleanup_lock = threading.Lock()
 
 
+def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
+    """Return a provider-authoritative session expiry as epoch seconds.
+
+    Cloud providers may omit ``expires_at``. Unknown or malformed values are
+    therefore treated as having no known expiry, preserving the existing
+    lifecycle for local browsers and providers without an expiry contract.
+    """
+    value = session_info.get("expires_at")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        logger.warning("Ignoring invalid cloud browser session expiry timestamp")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _session_has_expired(
+    session_info: Dict[str, Any], *, now: Optional[float] = None
+) -> bool:
+    """Return whether a cached browser session crossed its provider deadline."""
+    expires_at = _session_expiry_timestamp(session_info)
+    if expires_at is None:
+        return False
+    return (time.time() if now is None else now) >= expires_at
+
+
 def _emergency_cleanup_all_sessions():
     """
     Emergency cleanup of all active browser sessions.
@@ -2151,8 +2193,29 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     with _cleanup_lock:
         # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
+        existing_session = _active_sessions.get(task_id)
+
+    if existing_session is not None:
+        if not _session_has_expired(existing_session):
+            return existing_session
+
+        logger.info(
+            "Replacing expired cloud browser session for task %s",
+            task_id,
+        )
+        _cleanup_single_browser_session(task_id)
+        # Cleanup removes the activity entry. The replacement session must be
+        # tracked by the inactivity reaper just like an initial session.
+        _update_session_activity(task_id)
+
+        # Guard against a concurrent replacement: another thread may have
+        # already cleaned up the expired session and created a fresh one
+        # while we were waiting.  If so, return the live replacement instead
+        # of falling through to create yet another session.
+        with _cleanup_lock:
+            replacement = _active_sessions.get(task_id)
+        if replacement is not None and replacement is not existing_session:
+            return replacement
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2883,6 +2946,37 @@ def _redact_browser_output(value: Any) -> Any:
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
+
+def evaluate_url_safety(url: str) -> Optional[dict]:
+    """Run URL safety checks; None if safe, else an error dict"""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    _secret = {"success": False, "error": "Blocked: URL contains what appears to be an API key or token. Secrets must not be sent in URLs."}
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+    url = _normalize_url_for_request(url)
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+
+    local = _is_local_backend()
+    sensitive_query_key = _sensitive_query_param_name(url)
+    if sensitive_query_key and not local:
+        return {"success": False, "error": (
+            "Blocked: URL contains a credential-like query parameter "
+            f"({sensitive_query_key}). Cloud browser backends are third-party "
+            "readers; use a local browser/CDP session or remove the sensitive "
+            "query parameter before navigating.")}
+    if _is_always_blocked_url(url):
+        return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+    if not local and not _allow_private_urls() and not _is_safe_url(url):
+        return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    blocked = check_website_access(url)
+    if blocked:
+        return {"success": False, "error": blocked["message"],
+                "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]}}
+    return None
+
 
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
@@ -4539,12 +4633,23 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # An expired cloud CDP URL cannot accept an agent-browser close command.
+        # Avoid feeding it back through _get_session_info(), which would try to
+        # renew the session recursively while cleanup is still in progress.
+        if _session_has_expired(session_info):
+            logger.debug(
+                "Skipping agent-browser close for expired session %s",
+                task_id,
+            )
+        else:
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug(
+                    "agent-browser close command completed for task %s",
+                    task_id,
+                )
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -4816,6 +4921,12 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # Browser Use CLI backend — browser_exec replaces the whole browser_*
+    # surface (including browser_cdp/browser_dialog, whose check_fns funnel
+    # through here), so hide these tools from the model.
+    if _is_browser_use_cli_mode():
+        return False
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True

@@ -3,11 +3,12 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
-import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
-import { useLocation } from 'react-router-dom'
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
+import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { Backdrop } from '@/components/Backdrop'
 import { COMPOSER_HEART_CONFIG, HeartField } from '@/components/chat/vibe-hearts'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
@@ -19,7 +20,7 @@ import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
+import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { cn } from '@/lib/utils'
@@ -42,7 +43,7 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
@@ -63,6 +64,7 @@ import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
+import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -114,7 +116,7 @@ function ChatHeader({
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
-  const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
+  const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
 
   // Which agent/persona owns this chat — glanceable in the header once a
   // second profile exists, so the open session's ownership is never ambiguous
@@ -133,7 +135,7 @@ function ChatHeader({
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
   // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isSecondaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  if (isAuxiliaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
     return null
   }
 
@@ -220,9 +222,38 @@ function ChatRuntimeBoundary({
   onThreadMessagesChange,
   suppressMessages
 }: ChatRuntimeBoundaryProps) {
-  const storeMessages = useMessagesWhileVisible(useSessionView().$messages)
+  const view = useSessionView()
+  const runtimeId = useStore(view.$runtimeId)
+  const storeMessages = useMessagesWhileVisible(view.$messages)
   const messages = suppressMessages ? NO_MESSAGES : storeMessages
-  const runtimeMessageRepository = useRuntimeMessageRepository(messages)
+
+  const [windowPages, setWindowPages] = useState(1)
+  const [windowSessionKey, setWindowSessionKey] = useState(runtimeId)
+  // Sticky-cut continuity across flushes (advanceTranscriptWindow). A ref, not
+  // state: it is derived from `messages` and must never trigger a render.
+  const windowStateRef = useRef<null | TranscriptWindowState>(null)
+
+  // Reset the window on session swap during RENDER, so a large expand from the
+  // previous chat can't leak into the next one's first paint (#55191).
+  if (windowSessionKey !== runtimeId) {
+    setWindowSessionKey(runtimeId)
+    setWindowPages(1)
+    windowStateRef.current = null
+  }
+
+  const { messages: windowedMessages, windowed } = useMemo(() => {
+    const next = advanceTranscriptWindow(windowStateRef.current, messages, windowPages)
+
+    windowStateRef.current = next
+
+    return next.window
+  }, [messages, windowPages])
+
+  const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
+
+  const expandWindow = useCallback(() => setWindowPages(pages => pages + 1), [])
+
+  const transcriptWindow = useMemo(() => ({ olderAvailable: windowed, expandWindow }), [expandWindow, windowed])
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: runtimeMessageRepository,
@@ -237,10 +268,17 @@ function ChatRuntimeBoundary({
     onReload
   })
 
-  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+  return (
+    <TranscriptWindowProvider value={transcriptWindow}>
+      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+    </TranscriptWindowProvider>
+  )
 }
 
-export function ChatView({
+// Memoized: the tile caller (session-tile.tsx) and the contrib surface re-render
+// on idle ticks unrelated to the chat; with stable callback props (hoisted to
+// useCallback at the call sites) memo() lets the whole chat shell skip those.
+export const ChatView = memo(function ChatView({
   className,
   gateway,
   modelMenuContent,
@@ -366,7 +404,7 @@ export function ChatView({
   // scratch window, not the full-height empty state.
   const showIntro =
     isPrimary &&
-    !isSecondaryWindow() &&
+    !isAuxiliaryWindow() &&
     freshDraftReady &&
     !isRoutedSessionView &&
     !selectedSessionId &&
@@ -596,4 +634,4 @@ export function ChatView({
       </ChatRuntimeBoundary>
     </div>
   )
-}
+})

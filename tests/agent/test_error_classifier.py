@@ -371,6 +371,39 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_fallback is False
 
+    def test_404_bare_model_id_missing_prefix_is_model_not_found(self):
+        """A bare id the provider only serves as ``vendor/id`` is malformed.
+
+        Regression for #78796: NVIDIA NIM answers a prefix-less
+        ``nemotron-3-ultra-550b-a55b`` with a naked ``404 page not found``.
+        Without the catalogue check this fell into the generic branch and
+        burned three retries on a deterministic failure, reporting what
+        looked like an outage.
+        """
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+
+    def test_404_correctly_prefixed_model_stays_generic(self):
+        """A properly prefixed id hitting a 404 is a real endpoint problem —
+        it must keep the retryable generic classification."""
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
+    def test_404_unknown_bare_model_stays_generic(self):
+        """A local NIM container isn't in the catalogue — no verdict invented."""
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(e, provider="nvidia", model="my-local-nim")
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
     # ── Provider policy-block (OpenRouter privacy/guardrail) ──
 
 
@@ -450,9 +483,55 @@ class TestClassifyApiError:
 
     # ── Provider-specific: llama.cpp grammar-parse ──
 
+    def test_llama_cpp_unable_to_generate_parser_template(self):
+        e = MockAPIError(
+            "Unable to generate parser for this template. "
+            "Automatic parser generation failed: error parsing grammar",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="custom", model="local-llama")
+        assert result.reason == FailoverReason.llama_cpp_grammar_pattern
+        assert result.retryable is True
+        assert result.should_compress is False
 
+    def test_qwen_apply_prompt_template_no_user_query_not_llama_cpp_grammar(self):
+        """Local engines wrap Qwen raise_exception as applyPromptTemplate 400.
 
+        Must NOT classify as llama_cpp_grammar_pattern (which strips tool
+        schema keywords and retries). Fail fast as format_error so the user
+        sees a request-shape failure instead of a misleading template/parser
+        loop — typical after context overflow + failed compression.
+        """
+        e = MockAPIError(
+            "Engine protocol applyPromptTemplate request returned 400: "
+            '{"error":{"code":400,"message":"Unable to generate parser for '
+            "this template. Automatic parser generation failed: "
+            "While executing CallExpression ... multi_step_tool %} "
+            "{{- raise_exception('No user query found in messages')",
+            status_code=400,
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="qwen/qwen3.6-35b-a3b",
+            approx_tokens=226_000,
+            context_length=100_864,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is True
 
+    def test_bare_no_user_query_found_is_format_error_even_on_large_session(self):
+        e = MockAPIError("No user query found in messages", status_code=400)
+        result = classify_api_error(
+            e,
+            approx_tokens=226_000,
+            context_length=100_864,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
 
     # ── Provider-specific: Anthropic long-context tier ──
 
