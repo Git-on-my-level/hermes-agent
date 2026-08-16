@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-14T17:59:48Z",
+  "updated_at": "2026-08-16T18:15:28Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -117,9 +117,13 @@
           "description": ""
         },
         {
-          "id": "z-ai/glm-5.2",
+          "id": "z-ai/glm-5.3",
           "description": "default",
           "default": true
+        },
+        {
+          "id": "z-ai/glm-5.2",
+          "description": ""
         },
         {
           "id": "z-ai/glm-5.1",
@@ -254,8 +258,11 @@
           "id": "minimax/minimax-m3"
         },
         {
-          "id": "z-ai/glm-5.2",
+          "id": "z-ai/glm-5.3",
           "default": true
+        },
+        {
+          "id": "z-ai/glm-5.2"
         },
         {
           "id": "z-ai/glm-5.1"

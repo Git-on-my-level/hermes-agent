@@ -115,7 +115,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI
-    ("z-ai/glm-5.2",                           "default"),
+    ("z-ai/glm-5.3",                           "default"),
+    ("z-ai/glm-5.2",                           ""),
     ("z-ai/glm-5.1",                           ""),
     # Xiaomi
     ("xiaomi/mimo-v2.5-pro",                   ""),
@@ -289,6 +290,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # MiniMax
         "minimax/minimax-m3",
         # Z-AI
+        "z-ai/glm-5.3",
         "z-ai/glm-5.2",
         "z-ai/glm-5.1",
         # Xiaomi
@@ -1421,7 +1423,7 @@ _PROVIDER_ALIASES = {
 # lists are ordered most-capable-first, so [0] is the priciest Anthropic
 # flagship (claude-fable-5 / opus) — silently billing the most expensive model
 # for traffic the user never opted into.
-PREFERRED_SILENT_DEFAULT_MODEL = "z-ai/glm-5.2"
+PREFERRED_SILENT_DEFAULT_MODEL = "z-ai/glm-5.3"
 
 
 def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
