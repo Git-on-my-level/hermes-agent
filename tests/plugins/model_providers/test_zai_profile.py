@@ -10,7 +10,7 @@ GLM-5.2 additionally exposes a native ``reasoning_effort`` knob with two
 enabled levels (high / max) on the OpenAI-compatible ``/api/paas/v4``
 endpoint; the Hermes effort scale is collapsed onto those.
 
-GLM-5.3 dropped ``thinking.type: disabled``. Off maps to enabled + low.
+GLM-5.3 dropped ``thinking.type: disabled``. Default thinking is high.
 
 These tests pin the profile's wire-shape contract so Z.AI requests stay
 correctly shaped without going live.
@@ -141,20 +141,20 @@ class TestZaiGLM52ReasoningEffort:
 class TestZaiGLM53Reasoning:
     """GLM-5.3 cannot disable thinking. Effort is low / high / max."""
 
-    def test_no_preference_omits_thinking(self, zai_profile):
+    def test_no_preference_defaults_to_high(self, zai_profile):
         extra_body, top_level = zai_profile.build_api_kwargs_extras(
             reasoning_config=None, model="glm-5.3"
         )
-        assert extra_body == {}
-        assert top_level == {}
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "high"}
 
-    def test_disabled_becomes_enabled_plus_low(self, zai_profile):
+    def test_disabled_defaults_to_enabled_plus_high(self, zai_profile):
         extra_body, top_level = zai_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False},
             model="glm-5.3",
         )
         assert extra_body == {"thinking": {"type": "enabled"}}
-        assert top_level == {"reasoning_effort": "low"}
+        assert top_level == {"reasoning_effort": "high"}
 
     @pytest.mark.parametrize("effort", ["none", "minimal", "low"])
     def test_light_efforts_map_to_low(self, zai_profile, effort):
@@ -257,5 +257,5 @@ class TestZaiFullKwargsIntegration:
             base_url="https://api.z.ai/api/paas/v4",
             provider_name="zai",
         )
-        assert kwargs["reasoning_effort"] == "low"
+        assert kwargs["reasoning_effort"] == "high"
         assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}

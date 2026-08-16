@@ -76,26 +76,23 @@ def _is_glm_5_3(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
 
 
-def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str | None:
-    """Map Hermes reasoning effort onto GLM-5.3's ``low`` / ``high`` / ``max``.
+def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str:
+    """Map Hermes reasoning onto GLM-5.3's ``low`` / ``high`` / ``max``.
 
-    Thinking cannot be turned off. ``enabled=False`` and ``none`` / ``minimal``
-    / ``low`` request ``low``. ``medium`` / ``high`` request ``high``.
-    ``xhigh`` / ``max`` / ``ultra`` request ``max``. When no preference is
-    set, the server default (``max``) is left untouched.
+    Thinking cannot be turned off. Fork default is ``high`` — including
+    when the user left reasoning unset or turned it off. Explicit
+    ``none`` / ``minimal`` / ``low`` still request ``low``. ``medium`` /
+    ``high`` request ``high``. ``xhigh`` / ``max`` / ``ultra`` request
+    ``max``.
     """
     if not isinstance(reasoning_config, dict):
-        return None
-    if reasoning_config.get("enabled") is False:
-        return "low"
-
+        return "high"
     effort = (reasoning_config.get("effort") or "").strip().lower()
-    if not effort:
-        return None
     if effort in {"none", "minimal", "low"}:
         return "low"
     if effort in {"xhigh", "max", "ultra"}:
         return "max"
+    # enabled=False with no explicit effort, empty effort, medium, high
     return "high"
 
 
@@ -141,11 +138,8 @@ class ZaiProfile(ProviderProfile):
         # GLM-5.3 rejects thinking.type=disabled (PAYG HTTP 400 / code 1210).
         # Always send enabled, and use reasoning_effort=low for "off".
         if _is_glm_5_3(model):
-            if isinstance(reasoning_config, dict):
-                extra_body["thinking"] = {"type": "enabled"}
-                effort = _glm_5_3_reasoning_effort(reasoning_config)
-                if effort is not None:
-                    top_level["reasoning_effort"] = effort
+            extra_body["thinking"] = {"type": "enabled"}
+            top_level["reasoning_effort"] = _glm_5_3_reasoning_effort(reasoning_config)
             return extra_body, top_level
 
         # Only emit when the user expressed a preference; omitting the field

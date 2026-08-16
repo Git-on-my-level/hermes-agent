@@ -55,20 +55,16 @@ def _is_glm_5_3_model(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
 
 
-def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str | None:
+def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str:
     """Map Hermes effort onto GLM-5.3's low / high / max.
 
-    Thinking cannot be turned off. Disabled / none / minimal / low → low.
-    medium / high → high. xhigh / max / ultra → max. No preference leaves
-    the server default (max) untouched.
+    Fork default is high, including unset or disabled. Explicit none /
+    minimal / low still request low. medium / high request high.
+    xhigh / max / ultra request max.
     """
     if not isinstance(reasoning_config, dict):
-        return None
-    if reasoning_config.get("enabled") is False:
-        return "low"
+        return "high"
     effort = (reasoning_config.get("effort") or "").strip().lower()
-    if not effort:
-        return None
     if effort in {"none", "minimal", "low"}:
         return "low"
     if effort in {"xhigh", "max", "ultra"}:
@@ -101,14 +97,8 @@ class OpenCodeGoProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
 
         if _is_glm_5_3_model(model):
-            # GLM-5.3 rejects thinking.type=disabled. Always send enabled,
-            # and use reasoning_effort=low for "off".
-            if not isinstance(reasoning_config, dict):
-                return extra_body, top_level
             extra_body["thinking"] = {"type": "enabled"}
-            effort = _glm_5_3_reasoning_effort(reasoning_config)
-            if effort is not None:
-                top_level["reasoning_effort"] = effort
+            top_level["reasoning_effort"] = _glm_5_3_reasoning_effort(reasoning_config)
             return extra_body, top_level
 
         if _is_glm_5_2_model(model):

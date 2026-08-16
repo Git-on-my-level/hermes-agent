@@ -107,20 +107,20 @@ class TestOpenCodeGoGLM52Reasoning:
 class TestOpenCodeGoGLM53Reasoning:
     """GLM-5.3 cannot disable thinking. Effort is low / high / max."""
 
-    def test_no_preference_omits_thinking(self, opencode_go_profile):
+    def test_no_preference_defaults_to_high(self, opencode_go_profile):
         extra_body, top_level = opencode_go_profile.build_api_kwargs_extras(
             reasoning_config=None, model="glm-5.3"
         )
-        assert extra_body == {}
-        assert top_level == {}
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "high"}
 
-    def test_disabled_becomes_enabled_plus_low(self, opencode_go_profile):
+    def test_disabled_defaults_to_enabled_plus_high(self, opencode_go_profile):
         extra_body, top_level = opencode_go_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False},
             model="glm-5.3",
         )
         assert extra_body == {"thinking": {"type": "enabled"}}
-        assert top_level == {"reasoning_effort": "low"}
+        assert top_level == {"reasoning_effort": "high"}
 
     @pytest.mark.parametrize("effort", ["none", "minimal", "low"])
     def test_light_efforts_map_to_low(self, opencode_go_profile, effort):
@@ -236,5 +236,5 @@ class TestOpenCodeGoFullKwargsIntegration:
             reasoning_config={"enabled": False},
             base_url="https://opencode.ai/zen/go/v1",
         )
-        assert kwargs["reasoning_effort"] == "low"
+        assert kwargs["reasoning_effort"] == "high"
         assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
