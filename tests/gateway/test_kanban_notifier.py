@@ -100,6 +100,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
             platform="telegram",
             chat_id="chat-1",
             thread_id="20197",
+            delivery_mode="notify+wake",
             delivery_metadata={
                 "chat_type": "dm",
                 "direct_messages_topic_id": "20197",
@@ -481,6 +482,196 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
+    """A raising adapter rewinds the claim so the next tick can retry.
+
+    This is the second rewind path (distinct from the adapter-disconnect path
+    in test_kanban_notifier_rewinds_claim_if_adapter_disconnects). Here the
+    adapter is connected and the send call actually fires; the claim must
+    still rewind so the event isn't lost when send() raises mid-tick.
+    """
+    db_path = tmp_path / "send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FailingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Send was attempted (so we exercised the failure path, not just the
+    # disconnect path) and the claim was rewound — the unseen-events query
+    # still returns the event for retry on the next tick.
+    assert adapter.attempts >= 1, "send should have been attempted at least once"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_notifier_retries_only_failed_tail_after_partial_batch_success(tmp_path, monkeypatch):
+    """A successful earlier event is never replayed after a later failure.
+
+    This is a real SQLite persistence-chain regression: two events are created
+    under a temporary HERMES_HOME, a fresh watcher sends ``crashed`` then fails
+    ``completed``, and a later watcher retry must send only ``completed``.
+    """
+    db_path = tmp_path / "partial-batch.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="two terminal events", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed")
+        kb.complete_task(conn, tid, summary="tail completion")
+    finally:
+        conn.close()
+
+    adapter = FailCompletedOnceAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [delivery["text"] for delivery in adapter.sent]
+    assert sum("worker crashed" in text for text in texts) == 1
+    assert sum(" done" in text for text in texts) == 1
+
+
+def test_notifier_marks_unknown_persisted_platform_attention_required(tmp_path, monkeypatch):
+    """A malformed platform has a durable no-attempt outcome and stays unseen."""
+    db_path = tmp_path / "unknown-platform.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="unknown platform", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="removed-platform", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="must remain inspectable")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, tid)
+        _, events = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="removed-platform", chat_id="chat-1",
+            kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
+        )
+    finally:
+        conn.close()
+
+    assert sub["delivery_state"] == "attention_required"
+    assert sub["delivery_attempt_count"] == 0
+    assert "unknown platform adapter" in sub["delivery_last_error"]
+    assert [event.kind for event in events] == ["completed"]
+
+
+def test_notifier_keeps_known_disconnected_platform_pending(tmp_path, monkeypatch):
+    """Ordinary startup/reconnect must not create attention-record noise."""
+    db_path = tmp_path / "known-disconnected.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert sub["delivery_state"] == "pending"
+    assert sub["delivery_attempt_count"] == 0
+    assert [event.kind for event in _unseen_terminal_events(tid)] == ["completed"]
+
+
+class ReportedFailureAdapter:
+    """Adapter that REPORTS failure via SendResult(success=False) instead of
+    raising — the exact contract the Telegram adapter uses for 'Not connected'
+    and degraded-send paths."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        from gateway.platforms.base import SendResult
+        return SendResult(success=False, error="Not connected")
+
+
+def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
+    """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
+
+    Before #21398 the notifier auto-unsubscribed on any terminal event kind
+    (gave_up / crashed / timed_out), so the second crash in a respawn cycle
+    silently dropped — the subscription was already gone. This test pins the
+    new contract: subscription survives non-final terminal events; the
+    cursor handles dedup.
+
+    Two crashes ten seconds apart on the same task — both should land on
+    the adapter.
+    """
+    db_path = tmp_path / "redeliver-cycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cycle test", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        # First crash — fired by the dispatcher when the worker PID dies.
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # First crash delivered.
+    assert len(adapter.sent) == 1
+    assert "crashed" in adapter.sent[0]["text"].lower()
+
+    # Subscription survives — the cursor advanced past event #1, but the
+    # row is still there.
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1, (
+            "Subscription must survive a crashed event so a respawn-cycle "
+            "second crash also notifies the user (issue #21398)."
+        )
+
+        # Second crash — same task, same dispatcher (or a respawn). Append
+        # another event to simulate the dispatcher firing crashed a second
+        # time during retry.
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    # New tick: the second event has a fresh id past the cursor advance,
+    # so it gets claimed and delivered.
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2, (
+        f"Second crashed event should also notify; got {len(adapter.sent)} "
+        f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
+    )
+    assert "crashed" in adapter.sent[1]["text"].lower()
+
+
 def test_notifier_delivers_subscription_owned_by_active_profile(tmp_path, monkeypatch):
     """A single-profile gateway stamps active profile but keeps adapters primary."""
     db_path = tmp_path / "active-profile-owner.db"
@@ -628,6 +819,117 @@ def test_notifier_claims_platform_only_a_secondary_profile_owns(tmp_path, monkey
     )
 
 
+def test_notifier_subscription_survives_done_reopen_until_archive(
+    tmp_path, monkeypatch,
+):
+    """Done is reversible; archive alone ends notification ownership."""
+    db_path = tmp_path / "done-reopen-archive.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review continuation",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="origin-chat",
+            thread_id="origin-thread",
+            user_id="origin-user",
+            chat_type="group",
+            notifier_profile="reviewer",
+            delivery_mode="notify+wake",
+        )
+        assert kb.complete_task(conn, tid, summary="first completion")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.sent[0]["chat_id"] == "origin-chat"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
+    assert adapter.handled[0].source.thread_id == "origin-thread"
+    assert adapter.handled[0].source.profile == "reviewer"
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1, "completion must retain the origin subscription"
+        first_cursor = subs[0]["last_event_id"]
+    finally:
+        conn.close()
+
+    # A quiet tick proves the completed event cannot replay after its cursor
+    # was advanced, even though the subscription now remains present.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        assert kb.complete_task(conn, tid, summary="corrected completion")
+    finally:
+        conn.close()
+
+    # Fork claims one event per tick so a failed tail cannot swallow a
+    # confirmed send. Status and the second completion therefore need two ticks.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The reopen status and second completion each deliver once, while only
+    # completion wakes the exact original session/thread.
+    assert len(adapter.sent) == 3
+    assert len(adapter.handled) == 2
+    assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
+    assert adapter.handled[-1].source.thread_id == "origin-thread"
+    assert adapter.handled[-1].source.profile == "reviewer"
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["last_event_id"] > first_cursor
+        assert kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Archive itself is intentionally silent, but consumes its event and
+    # removes the subscription so no later historical event can replay.
+    assert len(adapter.sent) == 3
+    assert len(adapter.handled) == 2
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -647,6 +949,7 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
             platform="telegram",
             chat_id="chat-dm",
             chat_type="dm",
+            delivery_mode="notify+wake",
         )
         kb.complete_task(conn, tid, summary="done")
     finally:
