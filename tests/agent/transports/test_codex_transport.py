@@ -740,6 +740,81 @@ class TestCodexBuildKwargs:
         assert len(normalized.tool_calls) == 1
         assert normalized.tool_calls[0].name == "web_search"
 
+    def test_xai_aliases_reserved_tool_search_bridge(self, transport):
+        """xAI reserves ``tool_search`` for its native tool and 400s on the
+        client declaration (#95003). The bridge must go out aliased; sibling
+        bridge tools and ordinary tools are untouched."""
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[
+                {"type": "function", "function": {
+                    "name": "tool_search", "description": "Search deferred tools.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "tool_describe", "description": "Describe a tool.",
+                    "parameters": {"type": "object",
+                                   "properties": {"name": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+            ],
+            is_xai_responses=True,
+        )
+        names = [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
+        assert "hermes_tool_search" in names
+        assert "tool_search" not in names
+        assert "tool_describe" in names
+        assert "read_file" in names
+
+    def test_non_xai_path_keeps_tool_search_name(self, transport):
+        """The alias is scoped to xAI — other Responses backends keep the
+        canonical bridge name on the wire."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {
+                "name": "tool_search", "description": "Search deferred tools.",
+                "parameters": {"type": "object",
+                               "properties": {"query": {"type": "string"}}}}}],
+            is_codex_backend=True,
+        )
+        names = [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
+        assert names == ["tool_search"]
+
+    def test_xai_normalize_maps_tool_search_alias_back(self, transport, monkeypatch):
+        """The wire alias must become ``tool_search`` again for Hermes dispatch."""
+        msg = SimpleNamespace(
+            content=None,
+            reasoning=None,
+            tool_calls=[
+                SimpleNamespace(
+                    id="call_1",
+                    call_id="call_1",
+                    response_item_id="fc_1",
+                    function=SimpleNamespace(
+                        name="hermes_tool_search",
+                        arguments='{"query":"github issue"}',
+                    ),
+                )
+            ],
+            codex_reasoning_items=None,
+            codex_message_items=None,
+            reasoning_details=None,
+        )
+        response = SimpleNamespace(output=[], status="completed")
+
+        monkeypatch.setattr(
+            "agent.codex_responses_adapter._normalize_codex_response",
+            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+        )
+        normalized = transport.normalize_response(response)
+
+        assert normalized.tool_calls is not None
+        assert normalized.tool_calls[0].name == "tool_search"
+
     def test_xai_does_not_inject_native_web_search_without_client_web_search(self, transport):
         """The native ``web_search`` built-in is a 1:1 swap for an
         already-requested client ``web_search`` — NOT an additive grant.  A

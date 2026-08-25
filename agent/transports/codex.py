@@ -52,6 +52,37 @@ def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
 # (Firecrawl / Tavily / …). Mapped back to ``web_search`` in normalize_response.
 _XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
 
+# xAI reserves ``tool_search`` server-side for Grok's own native Tool Search
+# feature and rejects *any* client function declared with that name:
+#   HTTP 400 {"code":"invalid-argument","error":"The function name
+#   tool_search is reserved for the tool_search tool"}
+# Hermes's progressive-disclosure bridge registers exactly that literal
+# (``tools.tool_search.TOOL_SEARCH_NAME``), so once the bridge activates
+# (``tools.tool_search.enabled: auto`` crossing its threshold) every request
+# to api.x.ai fails mid-session. Same treatment as the web_search collision
+# above and the OpenCode reserved names: rename on the wire (hermes_<name>),
+# map back in ``normalize_response`` so Hermes dispatch is unaffected.
+# Upstream issue #95003.
+_XAI_RESERVED_TOOL_NAMES = ("tool_search",)
+_RESERVED_TOOL_ALIAS_PREFIX = "hermes_"
+_XAI_RESERVED_ALIAS_TO_NAME = {
+    f"{_RESERVED_TOOL_ALIAS_PREFIX}{name}": name
+    for name in _XAI_RESERVED_TOOL_NAMES
+}
+
+
+def _rename_reserved_tools_for_xai(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Alias xAI-reserved client function names on the wire."""
+    rewritten: List[Dict[str, Any]] = []
+    for tool in response_tools:
+        if isinstance(tool, dict) and tool.get("name") in _XAI_RESERVED_TOOL_NAMES:
+            aliased = dict(tool)
+            aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{tool['name']}"
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
 
 def _xai_prefers_native_web_search() -> bool:
     """True when xAI Responses should use Grok's native ``web_search`` built-in.
@@ -489,6 +520,12 @@ class ResponsesApiTransport(ProviderTransport):
                 else:
                     response_tools = _rename_client_web_search_for_xai(response_tools)
 
+        # xAI reserves ``tool_search`` for its native server-side tool and
+        # rejects the client declaration outright (#95003). Alias it on the
+        # wire; normalize_response maps it back before dispatch.
+        if is_xai_responses and response_tools:
+            response_tools = _rename_reserved_tools_for_xai(response_tools)
+
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
         # eagerly call ``_make_tools(tools)`` which does ``for tool in tools``
@@ -720,6 +757,10 @@ class ResponsesApiTransport(ProviderTransport):
                 # the real ``web_search`` tool (Firecrawl / etc.).
                 if name == _XAI_CLIENT_WEB_SEARCH_ALIAS:
                     name = "web_search"
+                elif name in _XAI_RESERVED_ALIAS_TO_NAME:
+                    # Undo the xAI reserved-name wire alias (hermes_tool_search
+                    # -> tool_search, #95003).
+                    name = _XAI_RESERVED_ALIAS_TO_NAME[name]
                 tool_calls.append(ToolCall(
                     id=tc.id if hasattr(tc, "id") else (name or None),
                     name=name,
