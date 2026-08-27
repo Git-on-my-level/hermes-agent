@@ -1353,3 +1353,75 @@ class TestPreflightSlashEnumStrip:
         assert params["properties"]["model_id"].get("enum") == [
             "Qwen/Qwen3.5-0.8B", "plain-id"
         ]
+
+
+class TestXaiReservedToolSearchAlias:
+    """xAI rejects a client function named tool_search (#95003)."""
+
+    _TOOLS = [
+        {"type": "function", "function": {
+            "name": "tool_search", "description": "Search deferred tools.",
+            "parameters": {"type": "object",
+                           "properties": {"query": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "tool_describe", "description": "Describe a deferred tool.",
+            "parameters": {"type": "object",
+                           "properties": {"name": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "read_file", "description": "Read a file.",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}}}}},
+    ]
+
+    def _names(self, kw):
+        return [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
+
+    def test_xai_aliases_reserved_tool_search(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=list(self._TOOLS),
+            is_xai_responses=True,
+        )
+        names = self._names(kw)
+        assert "hermes_tool_search" in names
+        assert "tool_search" not in names
+        assert "tool_describe" in names
+        assert "read_file" in names
+
+    def test_non_xai_backend_keeps_tool_search_name(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=list(self._TOOLS),
+            is_codex_backend=True,
+            base_url="https://api.openai.com/v1",
+        )
+        names = self._names(kw)
+        assert "tool_search" in names
+        assert "hermes_tool_search" not in names
+
+    def test_normalize_maps_tool_search_alias_back(self, transport, monkeypatch):
+        msg = SimpleNamespace(
+            content=None,
+            reasoning=None,
+            tool_calls=[
+                SimpleNamespace(
+                    id="call_1", call_id="call_1", response_item_id="fc_1",
+                    function=SimpleNamespace(
+                        name="hermes_tool_search",
+                        arguments='{"query":"create github issue"}',
+                    ),
+                ),
+            ],
+            codex_reasoning_items=None,
+            codex_message_items=None,
+            reasoning_details=None,
+        )
+        response = SimpleNamespace(output=[], status="completed")
+        monkeypatch.setattr(
+            "agent.codex_responses_adapter._normalize_codex_response",
+            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+        )
+        normalized = transport.normalize_response(response)
+        assert normalized.tool_calls[0].name == "tool_search"

@@ -67,10 +67,15 @@ _XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
 # rename on the wire (hermes_<name>), map back in normalize_response so
 # Hermes dispatch is unaffected.
 _OPENCODE_RESERVED_TOOL_NAMES = ("web_search", "search_files")
+# xAI reserves ``tool_search`` for Grok's native server-side Tool Search
+# and rejects the client declaration (HTTP 400, #95003). Same alias
+# treatment as the OpenCode collisions. ``tool_describe`` / ``tool_call``
+# are not reserved.
+_XAI_RESERVED_TOOL_NAMES = ("tool_search",)
 _RESERVED_TOOL_ALIAS_PREFIX = "hermes_"
 _RESERVED_ALIAS_TO_NAME = {
     f"{_RESERVED_TOOL_ALIAS_PREFIX}{name}": name
-    for name in _OPENCODE_RESERVED_TOOL_NAMES
+    for name in (*_OPENCODE_RESERVED_TOOL_NAMES, *_XAI_RESERVED_TOOL_NAMES)
 }
 
 
@@ -97,17 +102,25 @@ def _is_opencode_responses_backend(params: Dict[str, Any]) -> bool:
         return False
 
 
-def _rename_reserved_tools_for_opencode(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Alias OpenCode-reserved client function names on the wire."""
+def _rename_reserved_tools(
+    response_tools: List[Dict[str, Any]],
+    reserved_names: tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    """Alias provider-reserved client function names on the wire."""
     rewritten: List[Dict[str, Any]] = []
     for tool in response_tools:
-        if isinstance(tool, dict) and tool.get("name") in _OPENCODE_RESERVED_TOOL_NAMES:
+        if isinstance(tool, dict) and tool.get("name") in reserved_names:
             aliased = dict(tool)
             aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{tool['name']}"
             rewritten.append(aliased)
         else:
             rewritten.append(tool)
     return rewritten
+
+
+def _rename_reserved_tools_for_opencode(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Alias OpenCode-reserved client function names on the wire."""
+    return _rename_reserved_tools(response_tools, _OPENCODE_RESERVED_TOOL_NAMES)
 
 
 def _xai_prefers_native_web_search() -> bool:
@@ -562,6 +575,14 @@ class ResponsesApiTransport(ProviderTransport):
         # #85589). Alias them on the wire; normalize_response maps them back.
         if response_tools and _is_opencode_responses_backend(params):
             response_tools = _rename_reserved_tools_for_opencode(response_tools)
+
+        # xAI reserves ``tool_search`` for its native server-side tool and
+        # rejects the client declaration outright (#95003). Alias it on the
+        # wire; normalize_response maps it back before dispatch.
+        if is_xai_responses and response_tools:
+            response_tools = _rename_reserved_tools(
+                response_tools, _XAI_RESERVED_TOOL_NAMES
+            )
 
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
