@@ -3415,6 +3415,8 @@ DEFAULT_CONFIG = {
         #                         run (e.g. a deep feature branch that must
         #                         not accumulate update merge commits).
         "parked_branch_strategy": "switch",
+        "remote": "origin",
+        "branch": "main",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example
