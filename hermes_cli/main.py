@@ -10848,14 +10848,17 @@ def _finalize_update_output(state):
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name.
+    """Normalize the update branch from CLI, then config, then main."""
+    from hermes_cli.update_channel import resolve_update_branch
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
-    """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    return resolve_update_branch(args)
+
+
+def _resolve_update_target(args) -> tuple[str, str]:
+    """Normalize ``(remote, branch)`` from CLI, then config, then origin/main."""
+    from hermes_cli.update_channel import resolve_update_target
+
+    return resolve_update_target(args)
 
 
 def _size_delta_label(saved_mb: float) -> str:
@@ -10924,10 +10927,12 @@ def cmd_update(args):
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
+        remote, branch = _resolve_update_target(args)
         _self()._cmd_update_check(
             branch=branch,
+            remote=remote,
             branch_explicit=bool(getattr(args, "branch", None)),
+            remote_explicit=bool(getattr(args, "remote", None)),
         )
         return
 
