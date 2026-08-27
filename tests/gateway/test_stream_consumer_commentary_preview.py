@@ -53,6 +53,7 @@ async def test_preview_first_send_then_repeated_edits_stack_history():
             "thread_id": "topic-7",
             "reply_to_message_id": "reply-42",
             "expect_edits": True,
+            "_interim_send": True,
         },
     )
     assert [call.kwargs["message_id"] for call in adapter.edit_message.await_args_list] == [
@@ -94,6 +95,7 @@ async def test_preview_waiting_placeholder_then_first_commentary_replaces_it():
             "thread_id": "topic-7",
             "reply_to_message_id": "reply-42",
             "expect_edits": True,
+            "_interim_send": True,
         },
     )
     assert [call.kwargs["content"] for call in adapter.edit_message.await_args_list] == [
@@ -239,7 +241,7 @@ async def test_overlong_preview_uses_full_content_send_instead_of_clipping():
         chat_id="chat",
         content=commentary,
         reply_to=None,
-        metadata={"thread_id": "topic-7"},
+        metadata={"thread_id": "topic-7", "_interim_send": True},
     )
     assert consumer.commentary_preview_message_ids == ()
     assert consumer.has_delivered_text(commentary) is False
