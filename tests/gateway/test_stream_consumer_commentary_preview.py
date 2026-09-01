@@ -48,7 +48,7 @@ async def test_preview_first_send_then_repeated_edits_stack_history():
     adapter.send.assert_awaited_once_with(
         chat_id="chat",
         content="Checking the repo.",
-        reply_to="reply-42",
+        reply_to=None,
         metadata={
             "thread_id": "topic-7",
             "reply_to_message_id": "reply-42",
@@ -90,7 +90,7 @@ async def test_preview_waiting_placeholder_then_first_commentary_replaces_it():
     adapter.send.assert_awaited_once_with(
         chat_id="chat",
         content="Waiting for xai-oauth/grok-4.5...",
-        reply_to="reply-42",
+        reply_to=None,
         metadata={
             "thread_id": "topic-7",
             "reply_to_message_id": "reply-42",
@@ -241,7 +241,11 @@ async def test_overlong_preview_uses_full_content_send_instead_of_clipping():
         chat_id="chat",
         content=commentary,
         reply_to=None,
-        metadata={"thread_id": "topic-7", "_interim_send": True},
+        metadata={
+            "thread_id": "topic-7",
+            "reply_to_message_id": "reply-42",
+            "_interim_send": True,
+        },
     )
     assert consumer.commentary_preview_message_ids == ()
     assert consumer.has_delivered_text(commentary) is False
