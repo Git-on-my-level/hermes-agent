@@ -819,6 +819,23 @@ def cron_edit(args):
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
 
+    model = getattr(args, "model", None)
+    model_provider = getattr(args, "model_provider", None)
+    target_no_agent = job.get("no_agent") and getattr(args, "no_agent", None) is not False
+    if target_no_agent and (model is not None or model_provider is not None):
+        print(
+            color(
+                "Cannot set --model or --provider on a no-agent job; "
+                "its script is the entire job and no model is invoked. "
+                "Use --agent in the same edit to enable model execution.",
+                Colors.RED,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    before = dict(job)
+
     existing_skills = list(job.get("skills") or ([] if not job.get("skill") else [job.get("skill")]))
     replacement_skills = _normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None))
     add_skills = _normalize_skills(None, getattr(args, "add_skills", None)) or []
@@ -846,8 +863,8 @@ def cron_edit(args):
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
-        model=getattr(args, "model", None),
-        provider=getattr(args, "model_provider", None),
+        model=model,
+        provider=model_provider,
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
@@ -857,6 +874,14 @@ def cron_edit(args):
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
+
+    persisted = resolve_job_ref(job["id"])
+    if not persisted:
+        print(color(f"Failed to reload updated job: {job['id']}", Colors.RED), file=sys.stderr)
+        return 1
+    if persisted == before:
+        print(color(f"No changes made to job: {job['id']}", Colors.DIM))
+        return 0
 
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))

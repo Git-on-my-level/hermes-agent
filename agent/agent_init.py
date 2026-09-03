@@ -1622,10 +1622,20 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    # xAI reserves ``tool_search`` on its Responses API.  Do not assemble the
+    # client-side progressive-disclosure bridge for that route: dropping or
+    # renaming only its wire declaration would leave the deferred schemas
+    # unreachable.  Returning the pre-assembly list keeps every configured
+    # tool directly available, while all non-xAI routes retain Tool Search.
+    _xai_responses = agent.api_mode == "codex_responses" and (
+        agent.provider in {"xai", "xai-oauth"}
+        or agent._base_url_hostname == "api.x.ai"
+    )
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=_xai_responses,
     )
     
     # Show tool configuration and store valid tool names for validation
