@@ -1062,9 +1062,19 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
+    # xAI reserves ``tool_search`` on its Responses API. Do not assemble the
+    # client-side progressive-disclosure bridge for that route: dropping or
+    # renaming only its wire declaration would leave the deferred schemas
+    # unreachable. Returning the pre-assembly list keeps every configured
+    # tool directly available, while all non-xAI routes retain Tool Search.
+    _xai_responses = agent.api_mode == "codex_responses" and (
+        agent.provider in {"xai", "xai-oauth"}
+        or agent._base_url_hostname == "api.x.ai"
+    )
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=_xai_responses,
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()

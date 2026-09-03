@@ -46,6 +46,71 @@ class TestCronCommandLifecycle:
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        "flag,value",
+        [("--model", "new-model"), ("--provider", "nous")],
+    )
+    def test_edit_refuses_inference_pins_for_no_agent_job(
+        self, tmp_cron_dir, capsys, flag, value
+    ):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="report.py",
+            no_agent=True,
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        rc = cron_command(parser.parse_args(["cron", "edit", job["id"], flag, value]))
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Cannot set --model or --provider on a no-agent job" in captured.err
+        assert "Updated job" not in captured.out
+        unchanged = get_job(job["id"])
+        assert unchanged.get("model") is None
+        assert unchanged.get("provider") is None
+
+    def test_edit_same_value_does_not_claim_update(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt="Daily report",
+            schedule="every 1h",
+            name="Daily report",
+        )
+
+        rc = cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name="Daily report",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                model=None,
+                model_provider=None,
+                no_agent=None,
+                monitor_script=None,
+                monitor_url=None,
+                continuity=None,
+                reasoning_effort=None,
+            )
+        )
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert f"No changes made to job: {job['id']}" in out
+        assert "Updated job" not in out
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",
