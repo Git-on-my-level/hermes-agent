@@ -461,7 +461,13 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
         proc.stdout.close()
 
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _cmd_update_check(
+    branch: str = "main",
+    *,
+    remote: str = "origin",
+    branch_explicit: bool = False,
+    remote_explicit: bool = False,
+):
     """``hermes update --check``: fetch and report without installing. ``branch_explicit`` is
     True iff --branch was passed (Docker installs print a notice instead of dropping the flag)."""
     # Same marker-first admission gate as the apply path, so --check never reports git
@@ -499,16 +505,17 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     depth_args = ["--depth", "1"] if is_shallow else []
 
     # Probe locally for an 'upstream' remote before a network fetch non-forks always fail.
+    from hermes_cli.update_channel import is_stock_upstream_probe
     fetch_result = None
-    if branch == "main" and _git_run(git_cmd, ["remote", "get-url", "upstream"]).returncode == 0:
+    if is_stock_upstream_probe(remote, branch) and _git_run(git_cmd, ["remote", "get-url", "upstream"]).returncode == 0:
         print("→ Fetching from upstream...")
         fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + ["upstream", branch], network=True)
     if fetch_result is not None and fetch_result.returncode == 0:
         compare_branch = f"upstream/{branch}"
     else:
-        print("→ Fetching from origin...")
-        fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + ["origin", branch], network=True)
-        compare_branch = f"origin/{branch}"
+        print(f"→ Fetching from {remote}...")
+        fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + [remote, branch], network=True)
+        compare_branch = f"{remote}/{branch}"
 
     if fetch_result.returncode != 0:
         _print_fetch_failure(fetch_result.stderr)
@@ -679,7 +686,7 @@ def _repair_current_checkout(
     return current_checkout_complete
 
 
-def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
+def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, remote: str = "origin") -> None:
     """Fast-forward failed: merge on a custom branch (local commits survive) or reset --hard on the
     same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure."""
     # A custom branch (local commits atop origin/<branch>) also can't ff, and reset --hard
@@ -688,20 +695,20 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
     if _cur_branch and _cur_branch != branch:
         print(
             f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-            f"merging origin/{branch} instead of resetting so local commits survive...")
+            f"merging {remote}/{branch} instead of resetting so local commits survive...")
         # Best-effort safety tag as a recovery anchor.
         _git_run(git_cmd, ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"])
-        if _git_run(git_cmd, ["merge", "--no-edit", f"origin/{branch}"]).returncode != 0:
+        if _git_run(git_cmd, ["merge", "--no-edit", f"{remote}/{branch}"]).returncode != 0:
             _git_run(git_cmd, ["merge", "--abort"])
             print("✗ Merge conflict between local commits and upstream — update stopped, nothing was changed.")
-            print(f"  Resolve manually: cd {_m().PROJECT_ROOT} && git merge origin/{branch}")
+            print(f"  Resolve manually: cd {_m().PROJECT_ROOT} && git merge {remote}/{branch}")
             print("  Then re-run the update. Local work is untouched.")
             sys.exit(1)
         return
     # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
     # local graph, so park pre_pull_sha behind a rescue ref first.
-    merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"])
+    merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"{remote}/{branch}"])
     has_common_ancestor = merge_base_result.returncode == 0 and merge_base_result.stdout.strip()
     if not has_common_ancestor and pre_pull_sha:
         from datetime import datetime as _dt, timezone
@@ -709,7 +716,7 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         rescue_ref = (
             f"refs/hermes-update-backups/orphan-{branch}-"
             f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{pre_pull_sha[:12]}")
-        head = f"  ⚠ Local history shares no common ancestor with origin/{branch} (orphan divergence) — "
+        head = f"  ⚠ Local history shares no common ancestor with {remote}/{branch} (orphan divergence) — "
         if _git_run(git_cmd, ["update-ref", rescue_ref, pre_pull_sha]).returncode == 0:
             print(
                 f"{head}backed up current HEAD to {rescue_ref} before resetting. "
@@ -721,12 +728,12 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
                 f"but the backup write failed (pre-reset SHA was {pre_pull_sha}).")
         _prune_orphan_rescue_refs(git_cmd, _m().PROJECT_ROOT, branch)
     print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
-    reset_result = _git_run(git_cmd, ["reset", "--hard", f"origin/{branch}"])
+    reset_result = _git_run(git_cmd, ["reset", "--hard", f"{remote}/{branch}"])
     if reset_result.returncode != 0:
-        print(f"✗ Failed to reset to origin/{branch}.")
+        print(f"✗ Failed to reset to {remote}/{branch}.")
         if reset_result.stderr.strip():
             print(f"  {reset_result.stderr.strip()}")
-        print(f"  Try manually: git fetch origin && git reset --hard origin/{branch}")
+        print(f"  Try manually: git fetch {remote} && git reset --hard {remote}/{branch}")
         sys.exit(1)
 
 
@@ -762,8 +769,8 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
 
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
-    keep_stash):
-    """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
+    keep_stash, remote: str = "origin"):
+    """Fast-forward onto ``<remote>/<branch>`` and settle the autostash. Divergence by shape:
     custom branch -> merge, same branch -> reset, orphan history -> rescue ref first; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
     update_succeeded = False
@@ -775,8 +782,8 @@ def _pull_updates(
     try:
         # merge --ff-only the already-fetched ref instead of `git pull`, which would do a
         # SECOND network fetch; identical in effect given the fresh tracking ref.
-        if _git_run(git_cmd, ["merge", "--ff-only", f"origin/{branch}"]).returncode != 0:
-            _reconcile_diverged_checkout(git_cmd, branch, pre_pull_sha)
+        if _git_run(git_cmd, ["merge", "--ff-only", f"{remote}/{branch}"]).returncode != 0:
+            _reconcile_diverged_checkout(git_cmd, branch, pre_pull_sha, remote=remote)
         _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha)
         update_succeeded = True
     finally:
@@ -812,7 +819,8 @@ class _CheckoutPlan:
 
 
 def _apply_parked_branch_guard(
-    git_cmd, branch, current_branch, *, switch_branch, _windows_gateway_resume
+    git_cmd, branch, current_branch, *, switch_branch, _windows_gateway_resume,
+    remote: str = "origin",
 ) -> tuple[bool, bool, "str | None"]:
     """Decide how a checkout parked on another branch is brought to *branch* (stash-switch-pull-
     switch-back used to "update" main while the running code stayed behind).
@@ -846,24 +854,24 @@ def _apply_parked_branch_guard(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
         return True, False, switch_block_reason
     # --branch typos used to surface via the checkout failing, which this path skips.
-    if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"origin/{branch}"]).returncode != 0:
-        print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+    if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"{remote}/{branch}"]).returncode != 0:
+        print(f"✗ Branch '{branch}' does not exist locally or on {remote}.")
         sys.exit(1)
     print(
         f"  ℹ On branch '{current_branch}' — updating it in place from "
-        f"origin/{branch} (no branch switch; local commits preserved).")
+        f"{remote}/{branch} (no branch switch; local commits preserved).")
     return False, True, switch_block_reason
 
 
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
-    switch_branch, _windows_gateway_resume):
+    switch_branch, _windows_gateway_resume, remote: str = "origin"):
     """Parked-branch guard, land on the target, stash, count new commits. Exits when the
     checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
     date, -1 when tips differ but the shallow count is unrecoverable."""
     parked_branch_switched, in_place_update, switch_block_reason = _apply_parked_branch_guard(
         git_cmd, branch, current_branch, switch_branch=switch_branch,
-        _windows_gateway_resume=_windows_gateway_resume)
+        remote=remote, _windows_gateway_resume=_windows_gateway_resume)
 
     if not in_place_update and current_branch == "HEAD" != branch:
         print(f"  ⚠ Currently on detached HEAD — switching to {branch} for update...")
@@ -871,13 +879,13 @@ def _prepare_checkout_for_update(
     if (
         not in_place_update and current_branch != branch
         and _git_run(git_cmd, ["checkout", branch]).returncode != 0):
-        track_result = _git_run(git_cmd, ["checkout", "-B", branch, f"origin/{branch}"])
+        track_result = _git_run(git_cmd, ["checkout", "-B", branch, f"{remote}/{branch}"])
         if track_result.returncode != 0:
             # Restore the stash before bailing so the user isn't stranded.
             if auto_stash_ref is not None:
                 _m()._restore_stashed_changes(
                     git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False, input_fn=gw_input_fn)
-            print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+            print(f"✗ Branch '{branch}' does not exist locally or on {remote}.")
             if track_result.stderr.strip():
                 print(f"  {track_result.stderr.strip().splitlines()[0]}")
             sys.exit(1)
@@ -890,13 +898,13 @@ def _prepare_checkout_for_update(
     # On shallow checkouts `rev-list --count` can report the entire remote ancestry. The
     # zero/nonzero gate is still sound; treat the shallow NUMBER as unknown and recover it
     # via the GitHub compare API when possible.
-    result = _git_run(git_cmd, ["rev-list", f"HEAD..origin/{branch}", "--count"], check=True)
+    result = _git_run(git_cmd, ["rev-list", f"HEAD..{remote}/{branch}", "--count"], check=True)
     commit_count = int(result.stdout.strip())
 
     apply_is_shallow = _is_shallow_checkout(git_cmd)
     if commit_count > 0 and apply_is_shallow:
         from hermes_cli.banner import _github_compare_behind
-        counted = _github_compare_behind(*_tip_shas(git_cmd, f"origin/{branch}"))
+        counted = _github_compare_behind(*_tip_shas(git_cmd, f"{remote}/{branch}"))
         # counted == 0 means local-ahead: falls through to the up-to-date path.
         commit_count = counted if counted is not None else -1
 
@@ -1061,7 +1069,8 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
 
 
 def _verify_head_after_pull(
-    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool, _windows_gateway_resume
+    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool, _windows_gateway_resume,
+    remote: str = "origin",
 ) -> str | None:
     """Return the post-pull HEAD SHA; ``sys.exit(1)`` if the pull was a no-op or landed off-branch."""
     # A detached checkout pinned to a SHA can report "N new commit(s)" and a successful
@@ -1079,7 +1088,7 @@ def _verify_head_after_pull(
         print("✗ Code did not move — update was a no-op.")
         print(
             f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
-            f"origin/{branch} advanced but the working tree stayed put.")
+            f"{remote}/{branch} advanced but the working tree stayed put.")
         print(
             "  Reattach to the branch and retry: "
             f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update")
@@ -1092,7 +1101,7 @@ def _verify_head_after_pull(
     if not in_place_update and post_pull_branch and post_pull_branch not in {branch, "HEAD"}:
         print()
         print(
-            f"✗ Update pulled origin/{branch}, but the checkout is on "
+            f"✗ Update pulled {remote}/{branch}, but the checkout is on "
             f"'{post_pull_branch}' — not claiming success.")
         print(
             "  Switch to the target branch and retry: "
@@ -1192,12 +1201,12 @@ def _finish_already_up_to_date(
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
-    _windows_gateway_resume) -> None:
+    _windows_gateway_resume, remote: str = "origin") -> None:
     """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
     _invalidate_update_cache()
     post_pull_sha = _verify_head_after_pull(
         git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
+        remote=remote, _windows_gateway_resume=_windows_gateway_resume)
 
     # Gateways still serve pre-pull modules until the restart phase; an interrupt before a
     # completed restart leaves this marker so the next update catches up even when git is
@@ -1302,7 +1311,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     try:
         # Scoped fetch: a bare `git fetch origin` pulls thousands of branches and can stall.
-        branch = _m()._resolve_update_branch(args)
+        remote, branch = _m()._resolve_update_target(args)
 
         # Self-heal abandoned .git/*.lock files (crashed fetch) or the fetch fails "File exists".
         from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
@@ -1318,8 +1327,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # runs and failed restores preserve the stash but nothing ever mentioned it again.
         _m()._warn_orphaned_update_autostashes(git_cmd, _m().PROJECT_ROOT)
 
+        print(f"→ Update channel: {remote}/{branch}")
         print("→ Fetching updates...")
-        fetch_result = _git_run(git_cmd, ["fetch", "origin", branch], network=True)
+        fetch_result = _git_run(git_cmd, ["fetch", remote, branch], network=True)
         if fetch_result.returncode != 0:
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
@@ -1328,7 +1338,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
-            _windows_gateway_resume=_windows_gateway_resume)
+            remote=remote, _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
 
         if commit_count == 0:
@@ -1352,10 +1362,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
-            keep_stash=opts.keep_stash)
+            keep_stash=opts.keep_stash, remote=remote)
         _apply_pulled_update(
             git_cmd, branch, pre_pull_sha, _plan, opts, gateway_mode=gateway_mode,
-            is_fork=is_fork, desktop_dir=desktop_dir,
+            is_fork=is_fork, desktop_dir=desktop_dir, remote=remote,
             had_desktop_app_before_update=had_desktop_app_before_update,
             pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
             _windows_gateway_resume=_windows_gateway_resume)

@@ -731,6 +731,7 @@ from hermes_cli.main_install_repair import (  # frozen updater surface: update_c
     _resolve_install_target_python,
     _resolve_node_runtime_npm,
     _resolve_update_branch,
+    _resolve_update_target,
     _run_install_with_heartbeat,
     _run_package_only_install,
     _update_marker_path,
@@ -2224,13 +2225,15 @@ def _update_preflight_handled(args) -> bool:
         sys.exit(2)
 
     if getattr(args, "check", False):
-        # --check honors --branch so its answer matches what update would pull.
-        branch = _resolve_update_branch(args)
+        # --check honors --remote/--branch so its answer matches what update would pull.
+        remote, branch = _resolve_update_target(args)
         from hermes_cli.update_cmd import _cmd_update_check
 
         _cmd_update_check(
             branch=branch,
+            remote=remote,
             branch_explicit=bool(getattr(args, "branch", None)),
+            remote_explicit=bool(getattr(args, "remote", None)),
         )
         return True
     return False

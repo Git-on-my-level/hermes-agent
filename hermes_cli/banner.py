@@ -264,14 +264,18 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the configured update channel (stock: origin/main)."""
+    from hermes_cli.update_channel import is_stock_upstream_probe, load_update_channel_defaults
+
+    remote, branch = load_update_channel_defaults()
+    target_ref = f"{remote}/{branch}"
     # Probe the origin URL under the same config-isolated env as the fetch below. A plain
     # get-url applies a global url.<https>.insteadOf rewrite, so an SSH origin masquerades as
     # HTTPS, the SSH-avoiding fast path is skipped — and the fetch, whose env drops global
     # config (GIT_CONFIG_GLOBAL=/dev/null), dials the raw SSH origin; its host-key prompt opens
     # /dev/tty directly and steals the CLI's keystrokes (#104591).
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True)
-    if _is_official_ssh_remote(origin_url):
+    if is_stock_upstream_probe(remote, branch) and _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         if not head_rev:
             return None
@@ -301,7 +305,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # transfers ~1,400 remote heads (3.0 s vs 0.55 s measured) and can burn the full timeout.
         # A scoped fetch still updates ``origin/main`` and FETCH_HEAD; ``--depth 1`` preserves
         # the shallow boundary.
-        fetch_args = ["fetch", "origin", "main", *(["--depth", "1"] if is_shallow else []), "--quiet"]
+        fetch_args = ["fetch", remote, branch, *(["--depth", "1"] if is_shallow else []), "--quiet"]
         return _git_ok(fetch_args, cwd=repo_dir, timeout=10, network=True)
 
     fetch_ok = _quiet(_fetch, False)  # Offline or timeout — don't use stale refs
@@ -317,9 +321,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir))
+            or _git_stdout(["rev-parse", target_ref], cwd=repo_dir))
         return _tips_behind(head_rev, target_rev)
-    behind = _git_count(["rev-list", "--count", "HEAD..origin/main"], cwd=repo_dir)
+    behind = _git_count(["rev-list", "--count", f"HEAD..{target_ref}"], cwd=repo_dir)
     return behind if fetch_ok or (behind is not None and behind > 0) else None
 
 

@@ -1176,6 +1176,12 @@ def _resolve_node_runtime_npm() -> str | None:
     return None
 
 
+def _resolve_update_target(args=None) -> tuple[str, str]:
+    """CLI ``--remote``/``--branch``, then config ``updates.*``, then origin/main."""
+    from hermes_cli.update_channel import resolve_update_target
+    return resolve_update_target(args)
+
+
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` to a non-empty name (default ``main``; blank/whitespace = default)."""
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    """Branch half of :func:`_resolve_update_target` (legacy call sites)."""
+    return _resolve_update_target(args)[1]
