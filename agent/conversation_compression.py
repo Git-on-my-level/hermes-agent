@@ -79,8 +79,29 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
     return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
+def reset_ui_delivery_state_after_compaction(agent: Any) -> None:
+    """Re-open mid-turn UI delivery after a successful compaction boundary.
+
+    Compaction is a phase break inside one user turn. Pre-boundary interim
+    commentary is recorded in ``_delivered_interim_texts`` so identical phrases
+    are not re-bubbled while tools run. After the transcript is rewritten,
+    that set (and the stream-delivery tracker) must clear — otherwise the
+    model restates the same progress narration and the gateway suppresses it,
+    so Telegram commentary preview appears frozen until the final answer.
+    """
+    try:
+        agent._delivered_interim_texts = set()
+    except Exception:
+        logger.debug("could not clear delivered interim texts after compaction", exc_info=True)
+    reset = getattr(agent, "_reset_stream_delivery_tracking", None)
+    if callable(reset):
+        with _swallow("could not reset stream delivery tracking after compaction", exc_info=True):
+            reset()
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
+    reset_ui_delivery_state_after_compaction(agent)
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
@@ -4011,6 +4032,7 @@ def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int
 __all__ = [
     "COMPACTION_STATUS", "COMPACTION_DONE_STATUS", "COMPACTION_HEARTBEAT_STATUS", "COMPACTION_STATUS_MARKER", "is_compaction_progress_status",
     "check_compression_model_feasibility", "replay_compression_warning", "compress_context",
+    "reset_ui_delivery_state_after_compaction",
     "try_shrink_image_parts_in_messages",
 ]
 

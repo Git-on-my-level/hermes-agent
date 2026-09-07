@@ -33,6 +33,7 @@ from gateway.response_filters import (
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
+from gateway.stream_consumer_preview import StreamCommentaryPreviewMixin
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -74,6 +75,9 @@ class StreamConsumerConfig:
     # (progressive editMessageText).  "off" is handled by the gateway.
     transport: str = "edit"
     chat_type: str = ""  # originating chat type; gates platform-specific drafts
+    # "separate" = one message per commentary item; "preview" = one editable bubble (Telegram).
+    commentary_mode: str = "separate"
+    commentary_waiting_label: str = ""
 
 
 @dataclass
@@ -96,7 +100,7 @@ class _Tick:
         return not self.got_done and not self.got_segment_break and self.commentary_text is None
 
 
-class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThinkFilterMixin):
+class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, StreamFallbackMixin, StreamThinkFilterMixin):
     """Async consumer that progressively edits a platform message with streamed tokens.
     Usage: ``agent.stream_delta_callback = consumer.on_delta``; ``create_task(consumer.run())``;
     after the agent finishes ``consumer.finish()`` then ``await task`` for the final edit."""
@@ -177,6 +181,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # to emit a lone "✅"; an EAGER re-seed opened a bubble that got_done MUST close.
         self._awaiting_reopen_after_boundary = False
         self._reopen_seeded_eagerly = False
+        self._commentary_preview_message_ids: list[str] = []
+        self._commentary_preview_message_id: Optional[str] = None
+        self._commentary_preview_last_text = ""
+        self._commentary_preview_edit_supported = True
+        self._commentary_preview_entries: list[str] = []
+        self._commentary_preview_is_placeholder = False
+        self._commentary_waiting_label = str(getattr(self.cfg, "commentary_waiting_label", "") or "").strip()
+        self._commentary_placeholder_sent = False
 
     def _reset_message_state(self) -> None:
         """Per-message (segment) state: fresh at construction and after each segment break."""
@@ -524,6 +536,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Async task that drains the queue and edits the platform message."""
         self._len_fn, self._safe_limit = self._resolve_length_budget()
         await self._start_transports()
+        await self._maybe_send_waiting_placeholder()
         try:
             while True:
                 # Session reset (/new, /stop): abandon rather than deliver stale deltas.

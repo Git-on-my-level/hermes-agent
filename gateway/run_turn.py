@@ -46,6 +46,30 @@ logger = logging.getLogger("gateway.run")
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
+    @staticmethod
+    def _format_commentary_waiting_label(
+        *,
+        provider: Any = None,
+        model: Any = None,
+        reasoning_config: Any = None,
+    ) -> str:
+        """Build ``Waiting for provider/model/effort...`` for preview mode."""
+        parts: list[str] = []
+        provider_s = str(provider or "").strip()
+        model_s = str(model or "").strip()
+        if provider_s:
+            parts.append(provider_s)
+        if model_s:
+            parts.append(model_s)
+        effort_s = ""
+        if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is not False:
+            effort_s = str(reasoning_config.get("effort") or "").strip()
+        if effort_s:
+            parts.append(effort_s)
+        if not parts:
+            return "Waiting for model..."
+        return f"Waiting for {'/'.join(parts)}..."
+
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
@@ -2334,6 +2358,7 @@ class GatewayTurnMixin:
 
     def _build_stream_consumer_config(
         self, source: "SessionSource", scfg: Any, adapter: Any, *, on_missing_cursor: str,
+        commentary_mode: str = "separate", commentary_waiting_label: str = "",
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
@@ -2367,6 +2392,8 @@ class GatewayTurnMixin:
             cursor=_effective_cursor, buffer_only=_buffer_only,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            commentary_mode=commentary_mode if source.platform == Platform.TELEGRAM else "separate",
+            commentary_waiting_label=commentary_waiting_label if source.platform == Platform.TELEGRAM else "",
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
