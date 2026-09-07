@@ -53,22 +53,10 @@ class GatewayTurnMixin:
         model: Any = None,
         reasoning_config: Any = None,
     ) -> str:
-        """Build ``Waiting for provider/model/effort...`` for preview mode."""
-        parts: list[str] = []
-        provider_s = str(provider or "").strip()
-        model_s = str(model or "").strip()
-        if provider_s:
-            parts.append(provider_s)
-        if model_s:
-            parts.append(model_s)
-        effort_s = ""
-        if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is not False:
-            effort_s = str(reasoning_config.get("effort") or "").strip()
-        if effort_s:
-            parts.append(effort_s)
-        if not parts:
-            return "Waiting for model..."
-        return f"Waiting for {'/'.join(parts)}..."
+        from gateway.commentary_preview import format_waiting_label
+        return format_waiting_label(
+            provider=provider, model=model, reasoning_config=reasoning_config,
+        )
 
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,

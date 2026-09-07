@@ -821,7 +821,9 @@ class TurnRunner:
 
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
-    def _setup_stream_consumer(self, platform_key):
+    def _setup_stream_consumer(
+        self, platform_key, *, model=None, provider=None, reasoning_config=None,
+    ):
         ctx = self._ctx
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
@@ -832,17 +834,18 @@ class TurnRunner:
             from gateway.config import StreamingConfig
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
-        plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
+        plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming") if callable(ctx.resolve_display_setting) else None
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
         want_interim_messages = ctx.interim_assistant_messages_enabled
         if want_stream_deltas or want_interim_messages:
             try:
+                from gateway.commentary_preview import telegram_preview_channel
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._adapter_for_source(ctx.source)
                 if adapter:
-                    commentary_mode = "separate"
+                    preview = False
                     if (
                         ctx.source.platform == Platform.TELEGRAM
                         and ctx.interim_assistant_messages_enabled
@@ -851,11 +854,18 @@ class TurnRunner:
                         raw = ctx.resolve_display_setting(
                             ctx.user_config, platform_key, "interim_assistant_message_mode", "separate",
                         )
-                        if str(raw or "").strip().lower() == "preview":
-                            commentary_mode = "preview"
+                        preview = str(raw or "").strip().lower() == "preview"
+                    commentary_mode, waiting_label = telegram_preview_channel(
+                        platform=ctx.source.platform,
+                        preview=preview,
+                        provider=provider,
+                        model=model,
+                        reasoning_config=reasoning_config,
+                    )
                     consumer_cfg, pause_typing_before_finalize = self._runner._build_stream_consumer_config(
                         ctx.source, scfg, adapter, on_missing_cursor="raise",
                         commentary_mode=commentary_mode,
+                        commentary_waiting_label=waiting_label,
                     )
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
@@ -1690,7 +1700,12 @@ class TurnRunner:
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(
+            platform_key,
+            model=model,
+            provider=runtime_kwargs.get("provider"),
+            reasoning_config=reasoning_config,
+        )
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
