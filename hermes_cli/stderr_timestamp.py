@@ -1,8 +1,15 @@
-"""Run a child process while prefixing each stderr line with a timestamp."""
+"""Run a child process while prefixing each stderr line with a timestamp.
+
+The log this writes is the launchd gateway's ``StandardErrorPath`` target, so it is also the
+only place that can bound its size: launchd has no rotation of its own and the file is not a
+``logging`` handler. Rollover therefore happens here, on the same ``logging.max_size_mb`` /
+``logging.backup_count`` settings that bound ``agent.log``.
+"""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import signal
@@ -23,22 +30,108 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:23]
 
 
-def _write_timestamped_line(log_file: TextIO, line: str) -> None:
-    rendered = line.rstrip("\r\n")
-    prefix = "" if _TIMESTAMP_PREFIX.match(rendered) else f"{_timestamp()} "
-    log_file.write(f"{prefix}{rendered}\n")
-    log_file.flush()
+DEFAULT_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_BACKUP_COUNT = 3
 
 
-def _open_log(log_path: Path) -> TextIO:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    return log_path.open("a", encoding="utf-8", buffering=1)
+def _rotation_settings() -> tuple[int, int]:
+    """``(max_bytes, backup_count)`` from ``logging.*`` in config.yaml, else the shipped floor.
+
+    launchd starts this wrapper before anything guarantees the Hermes config is readable, and a
+    gateway that cannot start is far worse than one whose error log rotates on the defaults — so
+    any failure here falls back rather than propagating.
+    """
+    try:
+        from hermes_logging import configured_log_rotation
+        return configured_log_rotation()
+    except Exception:
+        return DEFAULT_MAX_BYTES, DEFAULT_BACKUP_COUNT
+
+
+class RotatingErrorLog:
+    """Append timestamped lines to *path*, rolling over at *max_bytes* into ``.1``…``.N``.
+
+    ``gateway.error.log`` is written by this wrapper rather than by the logging subsystem, so the
+    ``logging.max_size_mb`` / ``logging.backup_count`` rotation that bounds ``agent.log`` never
+    reached it and the launchd error log grew without limit (40 MB in the field). The rollover is
+    open-coded instead of delegated to ``RotatingFileHandler`` because the payload is raw child
+    stderr, not ``LogRecord``s.
+    """
+
+    def __init__(self, path: Path, *, max_bytes: int, backup_count: int) -> None:
+        self._path = path
+        self._max_bytes = max(0, int(max_bytes))
+        self._backup_count = max(0, int(backup_count))
+        self._file: TextIO | None = None
+        self._size = 0
+
+    def __enter__(self) -> "RotatingErrorLog":
+        self._open()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _open(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self._path.open("a", encoding="utf-8", buffering=1)
+        try:
+            self._size = self._path.stat().st_size
+        except OSError:
+            self._size = 0
+
+    def close(self) -> None:
+        if self._file is not None:
+            with contextlib.suppress(OSError):
+                self._file.close()
+            self._file = None
+
+    def write_line(self, line: str) -> None:
+        rendered = line.rstrip("\r\n")
+        prefix = "" if _TIMESTAMP_PREFIX.match(rendered) else f"{_timestamp()} "
+        payload = f"{prefix}{rendered}\n"
+        width = len(payload.encode("utf-8"))
+        self._roll_if_full(width)
+        if self._file is None:
+            return
+        self._file.write(payload)
+        self._size += width
+
+    def _roll_if_full(self, incoming: int) -> None:
+        # A non-empty file is the precondition: a single line longer than the whole budget must
+        # land somewhere instead of rotating an empty file on every write.
+        if not self._max_bytes or not self._size or self._size + incoming <= self._max_bytes:
+            return
+        self.close()
+        try:
+            self._roll()
+        except OSError:
+            # Losing the gateway's stderr is worse than an oversized log; keep appending.
+            pass
+        self._open()
+
+    def _roll(self) -> None:
+        name = self._path.name
+        if not self._backup_count:
+            self._path.unlink(missing_ok=True)
+            return
+        self._path.with_name(f"{name}.{self._backup_count}").unlink(missing_ok=True)
+        for index in range(self._backup_count - 1, 0, -1):
+            source = self._path.with_name(f"{name}.{index}")
+            if source.exists():
+                source.replace(self._path.with_name(f"{name}.{index + 1}"))
+        self._path.replace(self._path.with_name(f"{name}.1"))
+
+
+def _open_log(log_path: Path) -> RotatingErrorLog:
+    max_bytes, backup_count = _rotation_settings()
+    return RotatingErrorLog(log_path, max_bytes=max_bytes, backup_count=backup_count)
 
 
 def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
     with _open_log(log_path) as log_file:
         for raw_line in iter(stderr.readline, b""):
-            _write_timestamped_line(log_file, raw_line.decode("utf-8", errors="replace"))
+            log_file.write_line(raw_line.decode("utf-8", errors="replace"))
 
 
 def _install_signal_forwarders(proc: subprocess.Popen[bytes]) -> dict[int, object]:
@@ -108,7 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         proc = subprocess.Popen(_prepare_child_command(args.command), stderr=subprocess.PIPE)
     except OSError as exc:
         with _open_log(log_path) as log_file:
-            _write_timestamped_line(log_file, f"failed to start stderr-timestamped command: {exc}")
+            log_file.write_line(f"failed to start stderr-timestamped command: {exc}")
         return 127
 
     assert proc.stderr is not None
