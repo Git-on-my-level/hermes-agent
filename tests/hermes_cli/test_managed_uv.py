@@ -1499,3 +1499,200 @@ class TestWindowsRuntimeSelfLock:
 
         assert locked
         assert "999" in detail
+
+
+# ---------------------------------------------------------------------------
+# Live-gateway preflight: never swap the venv under a running gateway
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX-only: fixtures build the bin/ (not Scripts/) venv layout")
+class TestLiveGatewayPreflight:
+    """The cutover renames the live venv aside and deletes it. A supervised gateway started from
+    ``venv/bin/python`` is still executing out of that tree, so the swap must wait for a window
+    where nothing runs from it — otherwise the OS kills the gateway (macOS AMFI reports
+    OS_REASON_CODESIGNING) and the supervisor respawns it on the new tree.
+    """
+
+    def test_executable_inside_the_live_venv_is_a_holder(self, tmp_path):
+        from hermes_cli.managed_uv import _executable_is_inside
+
+        _root, live, _sentinel = _make_runtime_install(tmp_path)
+        assert _executable_is_inside(live, str(live / "bin" / "python"))
+
+    def test_executable_outside_the_live_venv_is_not_a_holder(self, tmp_path):
+        from hermes_cli.managed_uv import _executable_is_inside
+
+        _root, live, _sentinel = _make_runtime_install(tmp_path)
+        assert not _executable_is_inside(live, str(tmp_path / "other" / "bin" / "python"))
+
+    def test_unreadable_executable_is_not_attributed_to_the_venv(self, tmp_path):
+        """An empty exe cannot be placed inside any venv, so it is not a holder of this one."""
+        from hermes_cli.managed_uv import _executable_is_inside
+
+        _root, live, _sentinel = _make_runtime_install(tmp_path)
+        assert not _executable_is_inside(live, "")
+
+    def test_live_gateway_defers_repair_before_provisioning(self, tmp_path, capsys):
+        """Regression: pre-fix the repair parked and replaced the venv while the gateway was
+        running from it, so launchd reported OS_REASON_CODESIGNING and bounced the gateway."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, sentinel = _make_runtime_install(tmp_path)
+        current = _runtime_info(live / "bin" / "python", (3, 50, 4))
+
+        with patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime", return_value=current,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._live_gateway_venv_holders",
+                 return_value=[(4242, str(live / "bin" / "python"))],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation"
+             ) as mock_install:
+            result = repair_vulnerable_runtime("uv", project_root=root)
+
+        assert result.status == "skipped"
+        assert "4242" in result.detail
+        assert mock_install.call_count == 0, (
+            "a repair that cannot cut over must not provision a candidate first"
+        )
+        assert sentinel.read_text(encoding="utf-8") == "live"
+        assert not (root / ".hermes-runtime").exists()
+
+        out = capsys.readouterr().out
+        assert "SQLite runtime repair deferred" in out
+        assert "hermes gateway stop" in out, "the deferral must name the way to complete it"
+
+    def test_gateway_started_during_staging_still_blocks_the_cutover(self, tmp_path):
+        """TOCTOU: the venv must survive a gateway that appears while the candidate is built."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, sentinel = _make_runtime_install(tmp_path)
+        live_python = live / "bin" / "python"
+        current = _runtime_info(live_python, (3, 50, 4))
+        candidate_info = _runtime_info(live_python, (3, 53, 1))
+        generation = root / ".hermes-runtime" / "python" / "generation-1"
+        generation.mkdir(parents=True)
+        candidate = root / ".hermes-runtime" / "venv-candidate-1"
+        candidate.mkdir(parents=True)
+
+        # First answer is the early preflight (clear), second is the pre-cutover re-check.
+        holders = iter([[], [(99, str(live_python))]])
+
+        with patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime", return_value=current,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._live_gateway_venv_holders",
+                 side_effect=lambda _live: next(holders),
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation",
+                 return_value=(generation, generation / "bin" / "python", candidate_info),
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._stage_candidate_venv", return_value=candidate,
+             ), \
+             patch("hermes_cli.managed_uv._cut_over_candidate") as mock_cut_over:
+            result = repair_vulnerable_runtime("uv", project_root=root)
+
+        assert result.status == "skipped"
+        assert mock_cut_over.call_count == 0, (
+            "the pre-cutover re-check is the load-bearing guard"
+        )
+        assert sentinel.read_text(encoding="utf-8") == "live"
+        assert not candidate.exists(), "a deferred cutover must not leak its candidate venv"
+        assert not generation.exists(), "a deferred cutover must not leak its Python generation"
+
+    def test_repair_proceeds_when_no_gateway_holds_the_venv(self, tmp_path):
+        """The guard must fail OPEN: an always-firing deferral would block the CVE repair."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, _sentinel = _make_runtime_install(tmp_path)
+        current = _runtime_info(live / "bin" / "python", (3, 50, 4))
+
+        with patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime", return_value=current,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._live_gateway_venv_holders", return_value=[],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation", return_value=None,
+             ) as mock_install:
+            result = repair_vulnerable_runtime("uv", project_root=root)
+
+        assert mock_install.call_count >= 1, "no holder means the repair must run"
+        assert result.status == "failed"
+
+    def test_holder_scan_survives_an_unavailable_process_table(self, tmp_path, monkeypatch):
+        """A scan that cannot answer must not block the repair on an unrelated failure."""
+        import builtins
+
+        from hermes_cli.managed_uv import _live_gateway_venv_holders
+
+        _root, live, _sentinel = _make_runtime_install(tmp_path)
+        real_import = builtins.__import__
+
+        def _explode(name, *args, **kwargs):
+            if name == "psutil":
+                raise RuntimeError("psutil unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _explode)
+        assert _live_gateway_venv_holders(live) == []
+
+    def test_only_gateway_command_lines_hold_the_venv(self, tmp_path, monkeypatch):
+        """The updater and the agent's own venv Python children run from the same tree; only a
+        real gateway may defer the repair, and identity is the canonical FULL-cmdline matcher."""
+        from hermes_cli.managed_uv import _live_gateway_venv_holders
+
+        _root, live, _sentinel = _make_runtime_install(tmp_path)
+        venv_python = str(live / "bin" / "python")
+        outside_python = str(tmp_path / "other" / "bin" / "python")
+
+        rows = [
+            # (pid, exe, cmdline)
+            (11, venv_python, [venv_python, "-m", "hermes_cli.main", "gateway", "run"]),
+            (12, venv_python, [venv_python, "-m", "hermes_cli.main", "update"]),
+            (13, venv_python, [venv_python, "/tmp/hermes_kernel_abc.py"]),
+            (14, outside_python, [outside_python, "-m", "hermes_cli.main", "gateway", "run"]),
+        ]
+
+        class _Proc:
+            def __init__(self, pid, exe, cmdline):
+                self.info = {"pid": pid, "exe": exe}
+                self._cmdline = cmdline
+
+            def cmdline(self):
+                return self._cmdline
+
+        fake = SimpleNamespace(
+            process_iter=lambda _attrs: [_Proc(*row) for row in rows],
+            Process=lambda _pid: None,
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+
+        holders = _live_gateway_venv_holders(live)
+
+        assert [pid for pid, _exe in holders] == [11], (
+            "only the gateway inside the live venv holds it: the updater and a tool child are "
+            "not gateways, and a gateway outside this venv is not this venv's problem"
+        )
+
+    def test_symlinked_venv_interpreter_still_counts_as_a_holder(self, tmp_path):
+        """A venv whose bin/python links into the managed-Python store still dies when the venv
+        around it is replaced, so the link must not exonerate the process."""
+        from hermes_cli.managed_uv import _executable_is_inside
+
+        root, live, _sentinel = _make_runtime_install(tmp_path)
+        store = root / ".hermes-runtime" / "python" / "gen-1" / "bin"
+        store.mkdir(parents=True)
+        real = store / "python3.11"
+        real.write_text("managed interpreter", encoding="utf-8")
+        link = live / "bin" / "python3.11"
+        link.symlink_to(real)
+
+        assert _executable_is_inside(live, str(link))

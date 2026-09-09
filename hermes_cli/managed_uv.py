@@ -847,6 +847,108 @@ def _result(
     return RuntimeRepairResult(status, detail, sqlite_before=current.sqlite_version_string, **extra)
 
 
+def _executable_is_inside(live: Path, executable: str) -> bool:
+    """True when *executable* is an interpreter belonging to the venv at *live*.
+
+    Both the reported and the fully resolved path are tested, because a venv whose ``bin/python``
+    is a symlink into the managed-Python store still dies when the venv around it is replaced.
+    Pure, so it is exercised without live processes.
+    """
+    if not executable:
+        return False
+    roots = _distinct_paths(live)
+    candidates = _distinct_paths(Path(executable))
+    return any(
+        candidate == root or root in candidate.parents
+        for root in roots for candidate in candidates)
+
+
+def _distinct_paths(path: Path) -> list[Path]:
+    """*path* as given plus its resolved form, de-duplicated; resolution failures are dropped."""
+    paths = [path]
+    try:
+        resolved = path.resolve()
+    except (OSError, ValueError):
+        return paths
+    if resolved != path:
+        paths.append(resolved)
+    return paths
+
+
+def _live_gateway_venv_holders(live: Path) -> list[tuple[int, str]]:
+    """Running Hermes gateways that execute from the venv at *live*, as ``(pid, exe)``.
+
+    Every profile's gateway is covered because one checkout's venv backs them all. Identity comes
+    from the canonical ``looks_like_gateway_command_line`` matcher against the FULL cmdline, never
+    an argv substring (root ``AGENTS.md``): the updater and the agent's own venv Python children
+    are not gateways and must not block a CVE repair. ``cmdline`` is read lazily, only for
+    executables already known to sit under *live* — fetching it for every process on the host
+    costs ~13x an ``exe``-only scan, and this runs inside the repair path.
+
+    ``find_gateway_pids`` is deliberately not used here: it shells out to the supervisor and takes
+    seconds, which this preflight pays twice per repair.
+
+    Never raises: a scan that cannot answer returns nothing rather than blocking the repair on an
+    unrelated failure.
+    """
+    try:
+        import psutil
+        from gateway.status import looks_like_gateway_command_line
+        proc_iter = psutil.process_iter(["pid", "exe"])
+    except Exception as exc:
+        logger.debug("could not scan for gateway venv holders: %s", exc)
+        return []
+    holders: list[tuple[int, str]] = []
+    for proc in proc_iter:
+        try:
+            info = proc.info
+        except Exception:
+            continue
+        pid, executable = info.get("pid"), str(info.get("exe") or "")
+        if pid is None or int(pid) == os.getpid():
+            continue
+        if not _executable_is_inside(live, executable):
+            continue
+        try:
+            cmdline = " ".join(str(part) for part in (proc.cmdline() or []))
+        except Exception:
+            cmdline = ""
+        if looks_like_gateway_command_line(cmdline):
+            holders.append((int(pid), executable))
+    return holders
+
+
+def _repair_live_gateway_preflight(
+    live: Path, current: SQLiteRuntimeInfo) -> RuntimeRepairResult | None:
+    """Defer the repair while a live gateway executes from *live*; else ``None``.
+
+    The cutover renames the whole venv aside and then deletes it. A supervised gateway started from
+    ``venv/bin/python`` is still executing out of that tree, and replacing the code-signed backing
+    binary under it makes macOS AMFI SIGKILL the process — the field symptom was
+    ``last exit reason = OS_REASON_CODESIGNING`` in ``launchctl print`` plus "gateway=down after
+    first bounce" in the fleet update log, with launchd's KeepAlive papering over it by respawning.
+    Draining the gateway is the supervisor's job, not this function's, so the swap waits for a
+    window where nothing runs from the tree instead of taking one.
+    """
+    holders = _live_gateway_venv_holders(live)
+    if not holders:
+        return None
+    pids = ", ".join(str(pid) for pid, _ in holders[:6])
+    detail = f"a live gateway runs from the venv this repair must replace (PID {pids})"
+    for line in (
+        f"  ⚠ SQLite runtime repair deferred: {detail}.",
+        "    Swapping the venv under a running gateway does not restart it gracefully — the OS "
+        "kills it (macOS reports OS_REASON_CODESIGNING) and the supervisor respawns it.",
+        "    To complete the repair, stop the gateway first:",
+        "      hermes gateway stop",
+        "      hermes update",
+        "      hermes gateway start",
+        "    Sessions stay protected meanwhile: Hermes keeps databases "
+        "out of WAL mode on this SQLite build."):
+        print(line)
+    return _result("skipped", current, detail)
+
+
 def _repair_windows_preflight(
     root: Path, live: Path, current: SQLiteRuntimeInfo) -> RuntimeRepairResult | None:
     """Defer the repair when Windows holders make the venv rename impossible; else ``None``."""
@@ -910,6 +1012,14 @@ def _repair_under_lock(
             "replacement environment did not pass dependency and import smoke tests",
             sqlite_after=candidate_info.sqlite_version_string)
 
+    # TOCTOU re-check: a gateway may have started while the candidate was being built. This is
+    # the load-bearing guard — the early preflight only avoids provisioning work.
+    late_defer = _repair_live_gateway_preflight(live, current)
+    if late_defer is not None:
+        _remove_tree(candidate, boundary=runtime_root)
+        _remove_tree(generation, boundary=managed_python_install_dir(root))
+        return late_defer
+
     cut_over, backup, final_info, cutover_detail = _cut_over_candidate(
         candidate, project_root=root, live=live)
     if not cut_over:
@@ -936,6 +1046,10 @@ def repair_vulnerable_runtime(
 
     Every failure before cutover leaves the live venv untouched. Rename or post-cutover smoke
     failures restore the parked venv synchronously.
+
+    The cutover is also skipped entirely while a live gateway executes from the venv: replacing
+    that tree under a running process kills it rather than restarting it. See
+    ``_repair_live_gateway_preflight``.
     """
     root = Path(project_root) if project_root is not None else _PROJECT_ROOT
     live = Path(venv_dir) if venv_dir is not None else _default_live_venv(root)
@@ -953,6 +1067,11 @@ def repair_vulnerable_runtime(
         _sweep_stale_runtime_backups(live, root=root)
         return _result("safe", current, sqlite_after=current.sqlite_version_string)
     deferred = _repair_windows_preflight(root, live, current)
+    if deferred is not None:
+        return deferred
+    # Defer BEFORE provisioning: a candidate staged for a cutover that cannot run only leaks an
+    # incomplete generation. Re-checked under the lock just before the swap.
+    deferred = _repair_live_gateway_preflight(live, current)
     if deferred is not None:
         return deferred
     runtime_root = root / _RUNTIME_DIR_NAME
