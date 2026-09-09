@@ -161,6 +161,30 @@ COMPONENT_PREFIXES = {
 }
 
 
+DEFAULT_LOG_MAX_SIZE_MB = 5
+DEFAULT_LOG_BACKUP_COUNT = 3
+
+
+def resolve_log_rotation(
+    max_size_mb: Optional[int] = None, backup_count: Optional[int] = None
+) -> tuple[int, int]:
+    """Return ``(max_bytes, backup_count)`` for a rotating Hermes log file.
+
+    Arguments win; ``None`` falls back to the shipped 5 MB / 3 floor. Kept public so writers
+    that live outside the ``logging`` subsystem — the launchd stderr wrapper writes
+    ``gateway.error.log`` by hand — rotate on the same numbers as ``agent.log`` instead of
+    growing forever.
+    """
+    megabytes = max_size_mb or DEFAULT_LOG_MAX_SIZE_MB
+    return int(megabytes) * 1024 * 1024, int(backup_count or DEFAULT_LOG_BACKUP_COUNT)
+
+
+def configured_log_rotation() -> tuple[int, int]:
+    """``resolve_log_rotation`` fed from ``logging.*`` in config.yaml (defaults when unreadable)."""
+    _, cfg_max_size, cfg_backup = _read_logging_config()
+    return resolve_log_rotation(cfg_max_size, cfg_backup)
+
+
 def setup_logging(
     *,
     hermes_home: Optional[Path] = None,
@@ -182,8 +206,8 @@ def setup_logging(
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
     level_name = (log_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
-    backups = backup_count or cfg_backup or 3
+    max_bytes, backups = resolve_log_rotation(
+        max_size_mb or cfg_max_size, backup_count or cfg_backup)
 
     from agent.redact import RedactingFormatter  # lazy: circular at module load
 
