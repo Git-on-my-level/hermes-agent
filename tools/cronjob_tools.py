@@ -567,7 +567,8 @@ def _action_create(a: Dict[str, Any]) -> str:
             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
             script=_normalize_optional_job_value(script), context_from=context_from,
             enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
-            no_agent=_no_agent, attach_to_session=a["attach_to_session"],
+            no_agent=_no_agent, expect_output=bool(a["expect_output"]),
+            attach_to_session=a["attach_to_session"],
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
@@ -768,7 +769,8 @@ def _update_context_from(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[s
 
 
 def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str, Any]) -> Optional[str]:
-    """enabled_toolsets / attach_to_session / workdir / no_agent / repeat / schedule."""
+    """enabled_toolsets / attach_to_session / workdir / no_agent / expect_output / repeat /
+    schedule."""
     if a["enabled_toolsets"] is not None:
         updates["enabled_toolsets"] = a["enabled_toolsets"] or None
     if a["attach_to_session"] is not None:
@@ -784,6 +786,8 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
                 "Cannot set no_agent=True on a job without a script. "
                 "Set `script` in the same update, or on the job first.")
         updates["no_agent"] = target_no_agent
+    if a["expect_output"] is not None:
+        updates["expect_output"] = bool(a["expect_output"])
     if a["repeat"] is not None:
         # Shared chokepoint coerces string forms ('forever'/'once'/'3') and 0/negative.
         from cron.jobs import normalize_repeat_value
@@ -870,6 +874,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    expect_output: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
@@ -963,6 +968,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "default": False,
                 "description": "True = no LLM: the scheduler runs `script` (required) on schedule and delivers its stdout verbatim; empty stdout sends nothing (watchdog pattern). Use for script-only pings with fixed output; keep False for anything needing reasoning."
             },
+            "expect_output": {
+                "type": "boolean",
+                "description": "no_agent jobs only. True = a run that exits 0 with EMPTY stdout is recorded as a FAILURE and alerted, instead of counting as a silent success. Use for any job whose absence is itself the alarm (watchdogs, spend monitors). A job with legitimately quiet ticks should emit a final stdout line of {\"wakeAgent\": false} to declare the quiet explicitly rather than printing nothing."
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1008,7 +1017,7 @@ def check_cronjob_requirements() -> bool:
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
-    "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
+    "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "expect_output", "attach_to_session",
     "paused_reason")
 
 
