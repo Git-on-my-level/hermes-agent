@@ -48,6 +48,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Skip the LLM entirely — run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings).")
+    _flag(cron_create, "--expect-output", dest="expect_output", default=False,
+        help="no-agent jobs: treat an empty-stdout run as a FAILURE instead "
+            "of a silent success. Use when the job's silence would itself be "
+            "the alarm. A job with genuinely quiet ticks should print a final "
+            'line of {"wakeAgent": false} rather than nothing.')
     cron_create.add_argument("--monitor-script", dest="monitor_script",
         help="Monitor mode: path to a cheap source script under "
             "~/.hermes/scripts/ that runs each tick BEFORE the agent. "
@@ -112,6 +117,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "existing script on the job).")
     cron_edit.add_argument("--agent", dest="no_agent", action="store_const", const=False,
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).")
+    cron_edit.add_argument(
+        "--expect-output", dest="expect_output", action="store_const", const=True, default=None,
+        help="Treat an empty-stdout run as a failure for this no-agent job.")
+    cron_edit.add_argument("--allow-silent", dest="expect_output", action="store_const", const=False,
+        help="Let an empty-stdout run count as a silent success (the default).")
     cron_edit.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Turn on run-to-run continuity: each run sees the job's own "

@@ -1254,6 +1254,9 @@ def _run_no_agent_job(
 ) -> tuple[bool, str, str, Optional[str]]:
     """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
+
+    With ``expect_output`` set on the job, empty stdout is an error alert instead of a silent
+    success; the wakeAgent=false gate remains the way to declare a deliberately quiet tick.
     """
     # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
     # reload never runs for no_agent jobs. Does not override existing values.
@@ -1296,6 +1299,36 @@ def _run_no_agent_job(
     if not _parse_wake_gate(output):
         logger.info("Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id)
         return True, f"{header}**Status:** silent (wakeAgent=false)\n", SILENT_MARKER, None
+
+    if not output.strip() and job.get("expect_output"):
+        # This job declares that it always has something to say, so empty stdout is a broken
+        # run, not a quiet one. Without this, a watchdog that has stopped working is
+        # indistinguishable from a watchdog reporting all-clear — the failure the non-zero-exit
+        # branch above already guards against ("a silently broken watchdog is the worst-case
+        # outcome"), applied to the case where the script exits 0 and produces nothing.
+        #
+        # A job with legitimately quiet ticks declares them out loud with the wake gate
+        # ({"wakeAgent": false}), handled above and still a silent run. Deliberate silence is
+        # expressible; accidental silence is not.
+        logger.warning(
+            "Job '%s' (no_agent): empty stdout but expect_output is set — treating as failure",
+            job_id)
+        detail = (
+            "Script exited 0 but produced no output, and this job declares expect_output. "
+            "Either the script broke, or it should signal a deliberately quiet tick with a "
+            'final stdout line of {"wakeAgent": false}.'
+        )
+        alert = (
+            f"⚠ Cron job '{job_name}' produced no output\n\n"
+            f"{detail}\n\n"
+            f"Time: {now_iso}"
+        )
+        return (
+            False,
+            f"{header}**Status:** failed (empty output, expect_output set)\n\n{detail}\n",
+            alert,
+            detail,
+        )
 
     if not output.strip():
         logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)

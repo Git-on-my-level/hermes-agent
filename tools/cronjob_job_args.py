@@ -83,7 +83,15 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
             "DETECTED diff into the prompt. The first tick always runs as "
             "baseline. The source must emit STABLE output (no timestamps, no "
             "random ordering) or every tick will look changed.")
-    if job.get("no_agent"):
+    if job.get("no_agent") and job.get("expect_output"):
+        notes.append(
+            "no_agent mode with expect_output: stdout is delivered verbatim; "
+            "EMPTY stdout is recorded as a FAILURE and alerted, so a script "
+            "that has stopped working cannot look like one reporting "
+            "all-clear. A deliberately quiet tick must say so with a final "
+            'stdout line of {"wakeAgent": false}. Non-zero exit or timeout '
+            "sends an error alert. prompt/skills are ignored.")
+    elif job.get("no_agent"):
         notes.append(
             "no_agent mode: stdout is delivered verbatim; EMPTY stdout sends "
             "nothing at all (watchdog pattern — script should stay quiet when "
@@ -340,7 +348,7 @@ def _validate_context_from_refs(refs: List[Any]) -> Optional[str]:
 # Optional fields echoed by _format_job only when truthy (order = JSON key order).
 _FORMAT_JOB_OPTIONAL_KEYS = (
     "script", "reasoning_effort", "monitor_script", "monitor_url",
-    "monitor_state", "no_agent", "enabled_toolsets", "workdir")
+    "monitor_state", "no_agent", "expect_output", "enabled_toolsets", "workdir")
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:

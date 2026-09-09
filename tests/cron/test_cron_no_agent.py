@@ -368,3 +368,94 @@ def test_agent_job_provider_classification_unchanged(error, expected):
 
     job = {"name": "daily-digest", "no_agent": False}
     assert expected in _summarize_cron_failure_for_delivery(job, error)
+
+
+# ---------------------------------------------------------------------------
+# expect_output: silence as a failure, for jobs whose absence is the alarm
+# ---------------------------------------------------------------------------
+
+
+def test_empty_stdout_is_a_silent_success_by_default(hermes_env):
+    """Back-compat: without expect_output, empty stdout stays a silent success."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "scripts" / "quiet.sh").write_text("#!/bin/bash\nexit 0\n")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="quiet.sh", no_agent=True, deliver="local")
+
+    success, _doc, _final, error = run_job(job)
+    assert success is True
+    assert error is None
+
+
+def test_expect_output_turns_empty_stdout_into_a_failure(hermes_env):
+    """A watchdog that has stopped talking must not look like one reporting all-clear."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "scripts" / "broken.sh").write_text("#!/bin/bash\nexit 0\n")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="broken.sh", no_agent=True,
+        expect_output=True, deliver="local")
+
+    success, doc, final_response, error = run_job(job)
+    assert success is False
+    assert error is not None
+    assert "no output" in final_response.lower()
+    assert "expect_output" in doc
+
+
+def test_expect_output_still_delivers_real_output(hermes_env):
+    """The flag must not disturb the happy path."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "scripts" / "loud.sh").write_text("#!/bin/bash\necho 'disk 91%'\n")
+    job = create_job(
+        prompt=None, schedule="every 5m", script="loud.sh", no_agent=True,
+        expect_output=True, deliver="local")
+
+    success, _doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert "disk 91%" in final_response
+
+
+def test_expect_output_allows_a_declared_quiet_tick_via_wake_gate(hermes_env):
+    """Deliberate silence stays expressible: {"wakeAgent": false} is not a failure.
+
+    This is the escape hatch that makes expect_output safe to set on a silent-when-healthy
+    watchdog — the job says "I ran and have nothing to report" out loud instead of proving it
+    by printing nothing.
+    """
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "scripts" / "gated.sh").write_text(
+        '#!/bin/bash\necho \'{"wakeAgent": false}\'\n')
+    job = create_job(
+        prompt=None, schedule="every 5m", script="gated.sh", no_agent=True,
+        expect_output=True, deliver="local")
+
+    success, _doc, _final, error = run_job(job)
+    assert success is True
+    assert error is None
+
+
+def test_expect_output_roundtrips_through_the_cronjob_tool(hermes_env):
+    """The agent-facing door writes and clears the same field the scheduler reads."""
+    from cron.jobs import get_job
+    from tools.cronjob_tools import cronjob
+
+    (hermes_env / "scripts" / "w.sh").write_text("#!/bin/bash\necho hi\n")
+    created = json.loads(cronjob(
+        action="create", schedule="every 5m", script="w.sh", no_agent=True,
+        expect_output=True, deliver="local"))
+    assert created["success"] is True
+    job_id = created["job_id"]
+    assert get_job(job_id)["expect_output"] is True
+
+    updated = json.loads(cronjob(action="update", job_id=job_id, expect_output=False))
+    assert updated["success"] is True
+    assert get_job(job_id)["expect_output"] is False

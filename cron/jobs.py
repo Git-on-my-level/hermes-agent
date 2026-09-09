@@ -1585,6 +1585,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "enabled_toolsets": lambda v: _normalize_str_list(v) if v else None,
     "workdir": _normalize_workdir,
     "no_agent": bool,
+    "expect_output": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
 }
@@ -1698,6 +1699,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    expect_output: bool = False,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
@@ -1770,6 +1772,11 @@ def create_job(
         "base_url": f["base_url"],
         "script": f["script"],
         "no_agent": f["no_agent"],
+        # When True, a no_agent run that exits 0 with EMPTY stdout is recorded as a
+        # failure rather than a silent success — for jobs whose silence is itself the
+        # alarm. A deliberately quiet tick declares itself with the existing wake gate
+        # ({"wakeAgent": false}) instead of emitting nothing.
+        "expect_output": f["expect_output"],
         "monitor_script": f["monitor_script"],
         "monitor_url": f["monitor_url"],
         "monitor_state": None,
