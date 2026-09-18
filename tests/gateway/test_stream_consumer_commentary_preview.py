@@ -147,6 +147,7 @@ async def test_preview_edit_failure_falls_back_and_tracks_every_breadcrumb():
     adapter.edit_message = AsyncMock(
         side_effect=[
             SimpleNamespace(success=False, message_id="preview-1", error="not editable"),
+            SimpleNamespace(success=False, message_id="preview-1", error="still not editable"),
             SimpleNamespace(success=True, message_id="preview-2"),
         ]
     )
@@ -344,6 +345,9 @@ async def test_preview_recovers_editability_after_transient_edit_failure():
     fresh send, scattering one run across multiple bubbles (RCA 2026-09-18).
     After the degraded fresh send lands, its bubble is a normal editable
     message and the next commentary must edit it in place again.
+
+    With the retry-before-degrade follow-up, reaching the degrade path takes
+    two consecutive failed edits (the first failure retries the bubble).
     """
     adapter = MagicMock()
     adapter.MAX_MESSAGE_LENGTH = 4096
@@ -356,6 +360,7 @@ async def test_preview_recovers_editability_after_transient_edit_failure():
     adapter.edit_message = AsyncMock(
         side_effect=[
             RuntimeError("transient network error"),
+            RuntimeError("transient network error again"),
             SimpleNamespace(success=True, message_id="preview-2"),
         ]
     )
@@ -377,6 +382,44 @@ async def test_preview_recovers_editability_after_transient_edit_failure():
     assert recovered.kwargs["message_id"] == "preview-2"
     assert "Third edits the fallback bubble in place." in recovered.kwargs["content"]
     assert consumer.commentary_preview_message_ids == ("preview-1", "preview-2")
+
+
+@pytest.mark.asyncio
+async def test_preview_transient_edit_failure_retries_once_before_degrading():
+    """A single failed edit retries the same bubble before degrading.
+
+    Previously the first failed edit immediately degraded to a fresh send,
+    costing one scattered bubble per transient ReadError/flood blip. One
+    plain retry absorbs the blip; only a second failure takes the
+    degraded path. "message is not modified" never retries (it returns as
+    a successful no-op before reaching this path).
+    """
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    adapter.edit_message = AsyncMock(
+        side_effect=[
+            RuntimeError("transient"),
+            SimpleNamespace(success=True, message_id="preview-1"),
+        ]
+    )
+    consumer = _consumer(adapter)
+
+    consumer.on_commentary("Checking the repo.")
+    consumer.on_commentary("Still checking, now with detail.")
+    consumer.finish()
+    await consumer.run()
+
+    # The retry succeeded, so no degraded fresh send happened.
+    adapter.send.assert_awaited_once()
+    assert adapter.edit_message.await_count == 2
+    assert (
+        "Still checking, now with detail."
+        in adapter.edit_message.await_args_list[-1].kwargs["content"]
+    )
+    assert consumer.commentary_preview_message_ids == ("preview-1",)
 
 
 @pytest.mark.asyncio
