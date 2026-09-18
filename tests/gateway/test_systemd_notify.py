@@ -8,7 +8,7 @@ import socket
 import pytest
 
 
-@pytest.mark.linux_only
+@pytest.mark.linux_only  # abstract (NUL-prefixed) AF_UNIX names are a Linux kernel feature
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     """Linux systemd abstract sockets have no AF_UNIX filesystem binding.
 

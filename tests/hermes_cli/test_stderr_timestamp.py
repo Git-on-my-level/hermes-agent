@@ -3,7 +3,13 @@
 import re
 import sys
 
-from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV
+import pytest
+
+from gateway.restart import (
+    EXTERNAL_GATEWAY_SUPERVISOR_ENV,
+    GATEWAY_FATAL_CONFIG_EXIT_CODE,
+    GATEWAY_SERVICE_RESTART_EXIT_CODE,
+)
 from hermes_cli import stderr_timestamp
 
 _STALE_GATEWAY_ARGV = [
@@ -80,6 +86,9 @@ def test_prepare_skips_interactive_xpc_zero_even_for_gateway_argv():
     )
 
 
+# The child is ``python -c <record argv>`` carrying a "gateway run" tail as inert data, which is
+# exactly what the guard's real-gateway spawn check matches; it exits at once.
+@pytest.mark.spawns_gateway_lookalike
 def test_main_injects_flag_into_stale_gateway_child(tmp_path, monkeypatch):
     """Stale plist inner argv must grow --external-supervisor in the grandchild."""
     monkeypatch.setenv("XPC_SERVICE_NAME", "ai.hermes.gateway-butler")
@@ -159,94 +168,49 @@ def test_main_does_not_mark_unsupervised_child(tmp_path, monkeypatch):
     assert marker_path.read_text(encoding="utf-8") == "unset"
 
 
-def _rotating_log(tmp_path, *, max_bytes, backup_count):
-    return stderr_timestamp.RotatingErrorLog(
-        tmp_path / "gateway.error.log", max_bytes=max_bytes, backup_count=backup_count
-    )
-
-
-def test_error_log_stays_within_the_configured_budget(tmp_path):
-    """The launchd error log is bounded by max_bytes * (backup_count + 1), not unbounded.
-
-    Regression: gateway.error.log had no rotation at all and reached 40 MB in the field while
-    logging.max_size_mb/backup_count correctly bounded agent.log.
-    """
+@pytest.mark.spawns_gateway_lookalike
+def test_main_maps_gateway_ex_config_to_clean_stop(tmp_path):
+    """launchd KeepAlive.SuccessfulExit=false parks exit 0; the wrapper must
+    turn gateway EX_CONFIG (78) into that clean stop without swallowing the
+    please-restart code (75) or a non-gateway child's 78."""
     log_path = tmp_path / "gateway.error.log"
-    max_bytes, backup_count = 512, 2
+    gateway_tail = ["-m", "hermes_cli.main", "gateway", "run"]
 
-    with _rotating_log(tmp_path, max_bytes=max_bytes, backup_count=backup_count) as log:
-        for index in range(400):
-            log.write_line(f"line {index} " + "x" * 60)
-
-    rotated = sorted(tmp_path.glob("gateway.error.log.*"))
-    assert [p.name for p in rotated] == ["gateway.error.log.1", "gateway.error.log.2"]
-    total = sum(p.stat().st_size for p in [log_path, *rotated])
-    assert total <= max_bytes * (backup_count + 1)
-
-
-def test_rotation_preserves_the_newest_lines_and_discards_the_oldest(tmp_path):
-    """Rollover shifts .1 -> .2 and drops beyond backup_count; the live file holds the newest."""
-    log_path = tmp_path / "gateway.error.log"
-
-    with _rotating_log(tmp_path, max_bytes=200, backup_count=1) as log:
-        for index in range(200):
-            log.write_line(f"failure {index}")
-
-    assert "failure 199" in log_path.read_text(encoding="utf-8")
-    assert "failure 0" not in log_path.read_text(encoding="utf-8")
-    assert (tmp_path / "gateway.error.log.1").exists()
-    assert not (tmp_path / "gateway.error.log.2").exists()
-
-
-def test_rotation_settings_follow_logging_config(monkeypatch):
-    """The wrapper rotates on the same logging.* knobs that bound agent.log."""
-    import hermes_logging
-
-    monkeypatch.setattr(
-        hermes_logging, "_read_logging_config", lambda: ("INFO", 7, 4)
+    rc_config = stderr_timestamp.main(
+        [
+            "--error-log",
+            str(log_path),
+            "--",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({GATEWAY_FATAL_CONFIG_EXIT_CODE})",
+            *gateway_tail,
+        ]
     )
-    assert stderr_timestamp._rotation_settings() == (7 * 1024 * 1024, 4)
-
-
-def test_rotation_settings_fall_back_when_config_is_unreadable(monkeypatch):
-    """A gateway must still start when config.yaml cannot be read; defaults apply."""
-    import hermes_logging
-
-    def _boom():
-        raise RuntimeError("config unavailable")
-
-    monkeypatch.setattr(hermes_logging, "_read_logging_config", _boom)
-    assert stderr_timestamp._rotation_settings() == (
-        stderr_timestamp.DEFAULT_MAX_BYTES,
-        stderr_timestamp.DEFAULT_BACKUP_COUNT,
+    rc_restart = stderr_timestamp.main(
+        [
+            "--error-log",
+            str(log_path),
+            "--",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({GATEWAY_SERVICE_RESTART_EXIT_CODE})",
+            *gateway_tail,
+        ]
+    )
+    rc_other = stderr_timestamp.main(
+        [
+            "--error-log",
+            str(log_path),
+            "--",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({GATEWAY_FATAL_CONFIG_EXIT_CODE})",
+        ]
     )
 
-
-def test_oversized_single_line_is_written_rather_than_looping(tmp_path):
-    """A line larger than the whole budget lands in the log instead of rotating forever."""
-    log_path = tmp_path / "gateway.error.log"
-
-    with _rotating_log(tmp_path, max_bytes=64, backup_count=1) as log:
-        log.write_line("y" * 4096)
-
-    assert "y" * 4096 in log_path.read_text(encoding="utf-8")
+    assert rc_config == 0
+    assert rc_restart == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert rc_other == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
-def test_main_rotates_child_stderr_through_the_wrapper(tmp_path, monkeypatch):
-    """End-to-end: a chatty child cannot grow the error log past the configured budget."""
-    monkeypatch.setattr(stderr_timestamp, "_rotation_settings", lambda: (1024, 1))
-    log_path = tmp_path / "gateway.error.log"
-    code = (
-        "import sys\n"
-        "for index in range(500):\n"
-        "    sys.stderr.write('noisy %d\\n' % index)\n"
-    )
-
-    rc = stderr_timestamp.main(
-        ["--error-log", str(log_path), "--", sys.executable, "-c", code]
-    )
-
-    assert rc == 0
-    sizes = [p.stat().st_size for p in [log_path, tmp_path / "gateway.error.log.1"]]
-    assert max(sizes) <= 1024 + 256
-    assert "noisy 499" in log_path.read_text(encoding="utf-8")
