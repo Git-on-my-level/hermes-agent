@@ -333,3 +333,77 @@ def test_format_commentary_waiting_label_includes_effort_when_present():
         GatewayRunner._format_commentary_waiting_label()
         == "Waiting for model..."
     )
+
+
+@pytest.mark.asyncio
+async def test_preview_recovers_editability_after_transient_edit_failure():
+    """One failed edit must not silence in-place edits for the rest of the run.
+
+    The re-ported preview treated any edit failure as permanent: a single
+    transient Telegram ReadError degraded every later commentary item to a
+    fresh send, scattering one run across multiple bubbles (RCA 2026-09-18).
+    After the degraded fresh send lands, its bubble is a normal editable
+    message and the next commentary must edit it in place again.
+    """
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        side_effect=[
+            SimpleNamespace(success=True, message_id="preview-1"),
+            SimpleNamespace(success=True, message_id="preview-2"),
+        ]
+    )
+    adapter.edit_message = AsyncMock(
+        side_effect=[
+            RuntimeError("transient network error"),
+            SimpleNamespace(success=True, message_id="preview-2"),
+        ]
+    )
+    consumer = _consumer(adapter)
+
+    consumer.on_commentary("First.")
+    consumer.on_commentary("Second survives the outage.")
+    consumer.on_commentary("Third edits the fallback bubble in place.")
+    consumer.finish()
+    await consumer.run()
+
+    # First commentary creates the bubble; the failed edit degrades the
+    # second to a fresh send; the third edits that fallback bubble.
+    assert [call.kwargs["content"] for call in adapter.send.await_args_list] == [
+        "First.",
+        "First.\n\nSecond survives the outage.",
+    ]
+    recovered = adapter.edit_message.await_args_list[-1]
+    assert recovered.kwargs["message_id"] == "preview-2"
+    assert "Third edits the fallback bubble in place." in recovered.kwargs["content"]
+    assert consumer.commentary_preview_message_ids == ("preview-1", "preview-2")
+
+
+@pytest.mark.asyncio
+async def test_preview_edit_not_modified_is_a_successful_noop():
+    """Telegram's "message is not modified" 400 must not break the preview.
+
+    Editing the bubble to text it already shows happens on retry paths; it is
+    a no-op success, and treating it as an edit failure degraded the stack to
+    fresh sends for the rest of the run (RCA 2026-09-18).
+    """
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    adapter.edit_message = AsyncMock(
+        side_effect=RuntimeError("Bad Request: message is not modified")
+    )
+    consumer = _consumer(adapter)
+
+    consumer.on_commentary("Checking the repo.")
+    consumer.on_commentary("Checking the repo.")  # de-dup guard eats exact repeats
+    consumer.on_commentary("Still checking, now with detail.")
+    consumer.finish()
+    await consumer.run()
+
+    # The stack still edits the same bubble; no fresh sends after the first.
+    assert adapter.send.await_count == 1
+    assert consumer.commentary_preview_message_ids == ("preview-1",)
+    assert consumer.already_sent is False
