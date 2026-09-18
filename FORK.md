@@ -72,6 +72,18 @@ Re-port a fork commit only if all hold:
 Drop or move to `~/.hermes` when upstream landed an equivalent (GLM-5.3
 catalog, mcp 2.x HTTP, patient Z.AI 429s, curated-before-fuzzy).
 
+## Keep-list check
+
+After every upstream sync, before pushing `fork/prod`, run:
+
+```bash
+python3 scripts/check_fork_features.py
+```
+
+It asserts each keep-list file/symbol is still present (commentary preview
+mixin, resolver, plumb-throughs, contract tests). Exit 0 = intact; exit 1
+prints one line per missing item — re-port it before pushing.
+
 ## Deploy channel (`hermes update` / `/update`)
 
 Runtime agents on this fork should track the reviewed deploy tip, not raw
