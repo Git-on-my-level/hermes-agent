@@ -3065,7 +3065,11 @@ class TestInboundMediaAuthorizationGate:
         parent = tmp_path
         private_parts = []
         for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
+            # Cap the per-component length so the chain stays creatable on
+            # any TMPDIR (macOS components are limited to 255 bytes); the
+            # path still ends up far longer than the 900-char error bound
+            # the assertions care about, which is what this test exercises.
+            part = f"private-{index}-" + ("x" * 120)
             private_parts.append(part)
             parent = parent / part
             parent.mkdir()

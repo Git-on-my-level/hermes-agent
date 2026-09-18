@@ -203,7 +203,23 @@ class StreamCommentaryPreviewMixin:
                             kwargs["metadata"] = metadata
                     except (TypeError, ValueError):
                         pass
-                result = await self.adapter.edit_message(**kwargs)
+                # One retry before degrading: a single transient edit
+                # failure (ReadError, flood-control blip) must not cost the
+                # run a degraded fresh-send bubble — one plain retry on the
+                # same bubble absorbs the blip without scattering bubbles
+                # across the chat. "message is not modified" never retries:
+                # it is a successful no-op handled below.
+                try:
+                    result = await self.adapter.edit_message(**kwargs)
+                except Exception as e:
+                    if "not modified" in str(e).lower():
+                        raise
+                    logger.debug("Commentary preview edit failed: %s", e)
+                    result = None
+                if not getattr(result, "success", False):
+                    # Exactly one retry (raised or success=False); a second
+                    # failure falls through to the degrade path below.
+                    result = await self.adapter.edit_message(**kwargs)
                 if getattr(result, "success", False):
                     updated_ids = self._track_commentary_preview_result(result)
                     if len(updated_ids) == 1:

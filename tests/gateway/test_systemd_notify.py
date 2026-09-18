@@ -8,10 +8,13 @@ import socket
 import pytest
 
 
-@pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
-)
+@pytest.mark.linux_only
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
+    """Linux systemd abstract sockets have no AF_UNIX filesystem binding.
+
+    ``linux_only``: the abstract-namespace ``\\0``-prefixed bind genuinely
+    fails on macOS/BSD (FileNotFoundError), so this runs on Linux only.
+    """
     name = "\0hermes-test-notify"
     receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     receiver.bind(name)
