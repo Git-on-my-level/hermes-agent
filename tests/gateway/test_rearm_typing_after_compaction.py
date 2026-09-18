@@ -75,6 +75,8 @@ async def test_status_callback_compacted_rearms_typing(monkeypatch):
         _loop_for_step=asyncio.get_running_loop(),
         _cleanup_progress=False,
         _cleanup_msg_ids=[],
+        mute_notification_reply=False,
+        user_config={},
         source=SimpleNamespace(platform=SimpleNamespace(value="telegram")),
         _run_still_current=lambda: True,
     )
@@ -110,6 +112,8 @@ async def test_compacted_rearm_runs_even_when_status_text_suppressed(monkeypatch
         _loop_for_step=asyncio.get_running_loop(),
         _cleanup_progress=False,
         _cleanup_msg_ids=[],
+        mute_notification_reply=False,
+        user_config={},
         source=SimpleNamespace(platform=SimpleNamespace(value="telegram")),
         _run_still_current=lambda: True,
     )

@@ -1066,6 +1066,72 @@ def _repair_live_gateway_preflight(
     return _result("skipped", current, detail)
 
 
+def _windows_runtime_holders() -> tuple[bool, str]:
+    if platform.system() != "Windows":
+        return False, ""
+    main_module = sys.modules.get("hermes_cli.main")
+    detector = getattr(main_module, "_detect_venv_python_processes", None)
+    if detector is None:
+        return True, "cannot verify Windows venv holders from this update context"
+    try:
+        holders = detector()
+    except Exception as exc:
+        return True, f"could not verify Windows venv holders: {exc}"
+    if holders:
+        pids = ", ".join(str(item[0]) for item in holders[:6])
+        return True, f"other Hermes processes still hold the venv (PID {pids})"
+    return False, ""
+
+
+def _windows_runtime_self_lock(live: Path) -> tuple[bool, str]:
+    """Detect the one holder the generic scan is blind to: THIS process.
+
+    ``_detect_venv_python_processes`` excludes the calling process and its ancestors on purpose
+    (``hermes update`` itself runs from the venv python), which is correct for the dependency-sync
+    path where only a *loaded* ``.pyd`` image blocks the rewrite and a fresh child dodges it.
+
+    For the whole-venv park rename that exemption is fatal: Windows keeps the image of any executable a
+    running process was started from mapped until that process exits, so a directory containing the
+    updater's own ``python.exe`` (or a waiting ``hermes.exe`` launcher ancestor) can never be renamed from
+    inside the updater. The retry loop in ``_cut_over_candidate`` cannot help against that — the lock is
+    structural, not transient (#93032).
+    """
+    if platform.system() != "Windows":
+        return False, ""
+    try:
+        live_res = str(live.resolve())
+    except OSError:
+        live_res = str(live)
+    live_res = live_res.lower().rstrip(os.sep) + os.sep
+
+    def _under_live(path_value: str | None) -> bool:
+        if not path_value:
+            return False
+        try:
+            resolved = str(Path(path_value).resolve()).lower()
+        except (OSError, ValueError):
+            return resolved.startswith(live_res)
+        return resolved.startswith(live_res)
+
+    why = "Windows cannot rename a directory while a process executes from inside it"
+    exe = sys.executable
+    if _under_live(exe):
+        return True, f"the updater itself runs from the live venv it must replace ({exe}); {why}"
+    # Belt-and-braces: the venv\Scripts\hermes.exe launcher stays mapped while it waits for this
+    # child, so an ancestor started from the venv blocks the rename too.
+    with contextlib.suppress(Exception):
+        import psutil
+        for anc in psutil.Process().parents():
+            try:
+                anc_exe = anc.exe()
+            except Exception:
+                continue
+            if _under_live(anc_exe):
+                return True, (
+                    f"ancestor process PID {anc.pid} runs from the live venv ({anc_exe}); {why}")
+    return False, ""
+
+
 def _repair_windows_preflight(
     root: Path, live: Path, current: SQLiteRuntimeInfo) -> RuntimeRepairResult | None:
     """Defer the repair when Windows holders make the venv rename impossible; else ``None``."""
