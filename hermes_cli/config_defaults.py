@@ -1405,6 +1405,10 @@ DEFAULT_CONFIG = {
     "goals": {
         # Infer a goal from the agent's commitment after a real user turn (opt-in).
         "auto_infer": False,
+        # Opt-in gateway behavior: start or replace the standing goal with each
+        # ordinary external user message. Slash commands and synthetic turns never
+        # activate it.
+        "auto_start": False,
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
