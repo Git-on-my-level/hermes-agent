@@ -5082,6 +5082,30 @@ def _vision_auto_route(
 _ZAI_OPENAI_VISION_URLS = ("https://open.bigmodel.cn/api/paas/v4", "https://api.z.ai/api/paas/v4")
 
 
+def _zai_runtime_vision_urls() -> Tuple[str, ...]:
+    """Endpoint the ZAI key actually works on, resolved the same way chat traffic resolves it.
+
+    General and Coding Plan balances bill separately, so a Coding Plan key returns 429 error 1113
+    (insufficient balance) on the general /api/paas/v4 endpoints while the SAME key succeeds on
+    /api/coding/paas/v4. ``resolve_api_key_provider_credentials`` already resolves the working
+    endpoint (env override → probe cache in auth.json → pool entry); prefer it and keep the
+    general statics as fallback.
+    """
+    urls: list = []
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+        creds = resolve_api_key_provider_credentials("zai")
+    except Exception:
+        creds = None
+    resolved = str((creds or {}).get("base_url", "")).strip().rstrip("/")
+    if resolved:
+        urls.append(resolved)
+    for url in _ZAI_OPENAI_VISION_URLS:
+        if url not in urls:
+            urls.append(url)
+    return tuple(urls)
+
+
 def resolve_vision_provider_client(
     provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
     api_key: Optional[str] = None, async_mode: bool = False,
@@ -5111,7 +5135,7 @@ def resolve_vision_provider_client(
         sync_client, default_model = _resolve_strict_vision_backend(requested, resolved_model)
         return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode)
     if requested == "zai":
-        for _zai_url in _ZAI_OPENAI_VISION_URLS:
+        for _zai_url in _zai_runtime_vision_urls():
             client, final_model = _get_cached_client(
                 requested, resolved_model, async_mode, base_url=_zai_url,
                 api_key=resolved_api_key or None, api_mode="chat_completions", main_runtime=runtime,
