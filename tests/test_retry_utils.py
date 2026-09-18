@@ -169,6 +169,52 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def _zai_concurrency_error():
+    """The glm-5.3-flash production shape: 429 code 1302 concurrency cap."""
+    return SimpleNamespace(
+        status_code=429,
+        body={"error": {"code": "1302", "message": "Rate limit reached for requests"}},
+    )
+
+
+def test_zai_concurrency_429_reaches_long_tier(monkeypatch):
+    """Regression (2026-09-18 fleet outage): glm-5.3-flash 429 code 1302 must get the
+    long-backoff schedule within the retry ceiling — on the old glm-5.2/1305-only
+    predicate it fell through to policy=default (3 tries, ~10s) and the turn died."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    ceiling = zai_coding_overload_retry_ceiling()
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model="glm-5.3-flash",
+            error=_zai_concurrency_error(),
+            default_wait=1.0,
+        )
+        if policy == "zai_coding_overload_long":
+            long_waits.append(_wait)
+
+    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+def test_non_coding_plan_429_still_fails_fast():
+    """The wide predicate must not swallow ordinary 429s: different endpoint,
+    non-GLM model, or plain quota bodies keep the default short backoff."""
+    from agent.retry_utils import is_zai_coding_plan_429
+
+    err = _zai_concurrency_error()
+    assert not is_zai_coding_plan_429(
+        base_url="https://api.openai.com/v1", model="gpt-5", error=err)
+    assert not is_zai_coding_plan_429(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="gpt-5", error=err)
+    assert not is_zai_coding_plan_429(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3-flash",
+        error=SimpleNamespace(status_code=500, body=err.body))
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
