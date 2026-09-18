@@ -225,6 +225,23 @@ class StreamCommentaryPreviewMixin:
                             self._commentary_preview_entries = list(entries)
                     return True
             except Exception as e:
+                # Telegram's "message is not modified" 400 means the bubble
+                # already shows exactly this text — a successful no-op, not a
+                # broken preview. Recording it as an edit failure would
+                # degrade the stack to fresh sends for the rest of the run
+                # (one new bubble per commentary item).
+                if "not modified" in str(e).lower():
+                    self._commentary_preview_last_text = text
+                    if is_placeholder:
+                        self._commentary_preview_is_placeholder = True
+                        self._commentary_placeholder_sent = True
+                        self._commentary_preview_entries = []
+                    else:
+                        self._commentary_preview_is_placeholder = False
+                        self._commentary_placeholder_sent = True
+                        if entries is not None:
+                            self._commentary_preview_entries = list(entries)
+                    return True
                 logger.debug("Commentary preview edit failed: %s", e)
 
             # Preserve the old bubble as a breadcrumb and degrade this
@@ -268,6 +285,12 @@ class StreamCommentaryPreviewMixin:
                     message_ids = self._track_commentary_preview_result(result)
                     if len(message_ids) == 1:
                         self._commentary_preview_message_id = message_ids[0]
+                        # Re-acquire editability after a degraded fresh send:
+                        # the fallback bubble is a normal editable message, so
+                        # one transient edit failure (ReadError, flood control)
+                        # must not silence in-place edits for the rest of the
+                        # run — that is what scattered a single run into one
+                        # new bubble per commentary item (see RCA 2026-09-18).
                         self._commentary_preview_edit_supported = True
                         self._commentary_preview_last_text = text
                         if is_placeholder:
