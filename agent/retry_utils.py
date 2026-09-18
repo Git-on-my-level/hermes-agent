@@ -91,11 +91,16 @@ def _error_text(error: Any) -> str:
 def is_zai_coding_plan_429(*, base_url: str | None, model: str | None, error: Any) -> bool:
     """True for any 429 from the Z.AI Coding Plan endpoint (any GLM model): the
     plan's concurrency/overload 429 family (codes 1302 and 1305) persists for
-    minutes, so all of it needs the long-backoff schedule, not fast-fail."""
+    minutes, so all of it needs the long-backoff schedule, not fast-fail.
+
+    Match the ``/coding/paas/v4`` path so both first-class Coding Plan hosts
+    (``api.z.ai`` and ``open.bigmodel.cn``) get the schedule, without widening
+    to general ``/paas/v4`` 429s.
+    """
     text = _error_text(error)
     return (
         getattr(error, "status_code", None) == 429
-        and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
+        and "/coding/paas/v4" in (base_url or "").lower()
         and ("glm" in (model or "").lower())
         and ("1302" in text or "1305" in text or "rate limit" in text or "temporarily overloaded" in text)
     )

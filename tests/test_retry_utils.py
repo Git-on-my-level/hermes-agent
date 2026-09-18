@@ -200,6 +200,30 @@ def test_zai_concurrency_429_reaches_long_tier(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def test_zai_china_coding_plan_429_reaches_long_tier(monkeypatch):
+    """China Coding Plan lives on open.bigmodel.cn/api/coding/paas/v4; a
+    glm-5.3-flash 1302 there must get the same long-backoff schedule as Global,
+    not the default short window that a host-literal ``api.z.ai`` check would
+    leave it on."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    ceiling = zai_coding_overload_retry_ceiling()
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+            model="glm-5.3-flash",
+            error=_zai_concurrency_error(),
+            default_wait=1.0,
+        )
+        if policy == "zai_coding_overload_long":
+            long_waits.append(_wait)
+
+    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
 def test_non_coding_plan_429_still_fails_fast():
     """The wide predicate must not swallow ordinary 429s: different endpoint,
     non-GLM model, or plain quota bodies keep the default short backoff."""
@@ -213,6 +237,12 @@ def test_non_coding_plan_429_still_fails_fast():
     assert not is_zai_coding_plan_429(
         base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3-flash",
         error=SimpleNamespace(status_code=500, body=err.body))
+    # General (non-coding) Z.AI hosts share the /paas/v4 suffix; matching the
+    # Coding Plan path must not widen to them.
+    assert not is_zai_coding_plan_429(
+        base_url="https://api.z.ai/api/paas/v4", model="glm-5.3-flash", error=err)
+    assert not is_zai_coding_plan_429(
+        base_url="https://open.bigmodel.cn/api/paas/v4", model="glm-5.3-flash", error=err)
 
 
 # ---------------------------------------------------------------------------
