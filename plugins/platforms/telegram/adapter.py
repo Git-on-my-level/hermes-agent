@@ -6379,6 +6379,21 @@ class TelegramAdapter(BasePlatformAdapter):
         await self.handle_message(event)
         return True
 
+    def _enqueue_media_event(self, event: MessageEvent, where: str) -> None:
+        """Debounce a non-album media event (voice/audio/video/document) like a photo burst.
+
+        Fork keep-list. Photo bursts already buffer here, but AV/document items dispatched
+        immediately, so a multi-item paste (screenshots + a voice note) straddled the busy
+        boundary and became N separate turns (upstream #114363 keeps each *already-separated*
+        follow-up its own FIFO turn; this closes the window one level up, at the adapter).
+        Error notes (oversize, unreadable, cache failure) stay immediate via
+        ``_dispatch_with_text`` — they never join a content burst.
+        """
+        if self._should_drop_delayed_delivery():
+            self._hold_inbound_event(event, where=where)
+            return
+        self._enqueue_photo_event(self._photo_batch_key(event, None), event)
+
     @staticmethod
     def _set_cached_media(event: MessageEvent, path: str, mime: str, mtype: MessageType, log_fmt: str) -> None:
         event.media_urls = [path]
@@ -6435,7 +6450,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._set_cached_media(
                     event, await cache_video_from_bytes_async(bytes(video_bytes), ext=ext), SUPPORTED_VIDEO_TYPES[ext], MessageType.VIDEO,
                     "[Telegram] Cached user video document at %s")
-                await self.handle_message(event)
+                self._enqueue_media_event(event, "document-enqueue")
                 return True
             # Any file type is accepted (authorization is the gate, not the extension); unknown types get
             # application/octet-stream. Image documents already returned above.
@@ -6525,7 +6540,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
             return
-        await self.handle_message(event)
+        if not event.media_urls:
+            # Download failed (user + agent both surfaced a note) — deliver immediately,
+            # never batch an error notice into a content burst.
+            await self.handle_message(event)
+            return
+        self._enqueue_media_event(event, "media-enqueue")
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
