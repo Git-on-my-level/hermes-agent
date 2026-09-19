@@ -60,6 +60,37 @@ async def test_send_to_a_new_topic_is_not_queued_behind_another_topics_in_flight
 
 
 @pytest.mark.asyncio
+async def test_general_topic_and_no_metadata_share_one_fifo():
+    """Telegram's General topic IS thread 1 and General replies often arrive with no thread
+    metadata — both render in the same view, so both must serialize on the bare chat key."""
+    adapter = _adapter()
+    order: list = []
+    gate = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_send_message(text: str, **_kw):
+        tag = text.split()[0]
+        order.append(("start", tag))
+        if tag == "FIRST":
+            gate.set()
+            await release.wait()
+        order.append(("done", tag))
+        return MagicMock(message_id=len(order))
+
+    adapter._bot.send_message = fake_send_message
+    first = asyncio.create_task(adapter.send("chat", "FIRST general", metadata={"thread_id": "1"}))
+    await asyncio.wait_for(gate.wait(), timeout=3)
+    second = asyncio.create_task(adapter.send("chat", "SECOND anchored"))  # no thread metadata
+    done, _ = await asyncio.wait({second}, timeout=2)
+
+    assert second not in done, f"General topic and no-metadata sends must share one FIFO: {order}"
+    release.set()
+    await first
+    await second
+    assert order == [("start", "FIRST"), ("done", "FIRST"), ("start", "SECOND"), ("done", "SECOND")], order
+
+
+@pytest.mark.asyncio
 async def test_same_topic_concurrent_sends_still_serialize_in_order():
     """Upstream's #114396 guarantee holds within one topic: A A A B B B, never interleaved."""
     adapter = _adapter()

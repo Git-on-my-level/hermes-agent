@@ -42,10 +42,21 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "commentary_mode",
         "stream_consumer commentary_mode config plumb-through",
     ),
+    (
+        "plugins/platforms/telegram/adapter.py",
+        'if thread_id and thread_id != "1":',
+        "telegram per-stream send lock keyed chat+topic (General=1 stays chat-wide)",
+    ),
+    (
+        "plugins/platforms/telegram/adapter.py",
+        "async with self._chat_send_lock(chat_id, metadata):",
+        "telegram send() takes the topic-scoped chat send lock",
+    ),
 ]
 
 TEST_FILES = [
     "tests/gateway/test_stream_consumer_commentary_preview.py",
+    "tests/gateway/test_telegram_topic_scoped_send_lock.py",
 ]
 
 

@@ -5249,11 +5249,15 @@ class TelegramAdapter(BasePlatformAdapter):
         a new topic's waiting placeholder queued seconds behind another topic's media upload or
         chunked final. Topic ids partition the conversation views the interleave bug can appear in,
         so same-stream ordering (the bug's fix) is preserved while cross-topic sends run in parallel.
-        A send without topic metadata takes the bare chat key (unchanged upstream shape).
+        Sends without topic metadata AND Telegram's General topic (thread 1) take the bare chat key,
+        because both render in the same view and must share one FIFO.
         """
         thread_id = self._metadata_thread_id(metadata)
         key = str(normalize_telegram_chat_id(chat_id))
-        if thread_id:
+        # Telegram's General topic IS thread 1, and replies to it often arrive with NO thread
+        # metadata at all — both shapes render in the same view, so both must share one lock or
+        # General-topic chunks can interleave with no-metadata sends to the same chat.
+        if thread_id and thread_id != "1":
             key = f"{key}:{thread_id}"
         locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
         owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
