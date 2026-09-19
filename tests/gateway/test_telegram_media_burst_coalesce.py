@@ -16,6 +16,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import _event_media_is_stt_input
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -78,6 +79,40 @@ class TestMediaBurstCoalesce:
         merged = adapter.handle_message.await_args.args[0]
         assert merged.media_urls == ["/tmp/a.jpg", "/tmp/v1.ogg"]
         assert "shot" in (merged.text or "")
+
+    @pytest.mark.asyncio
+    async def test_later_document_keeps_not_inlined_flag(self, adapter):
+        """A following large text document must keep media_text_inlined=False so
+        inbound notes do not claim its content was included below."""
+        doc = _media_event("/tmp/notes.txt", "text/plain", MessageType.DOCUMENT)
+        doc.media_text_inlined = [False]
+        adapter._enqueue_media_event(
+            _media_event("/tmp/a.jpg", "image/jpeg", MessageType.PHOTO, text="shot"),
+            "media-enqueue")
+        adapter._enqueue_media_event(doc, "document-enqueue")
+
+        await _drain(adapter)
+
+        merged = adapter.handle_message.await_args.args[0]
+        assert merged.media_urls == ["/tmp/a.jpg", "/tmp/notes.txt"]
+        assert merged.media_text_inlined == [None, False]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("first_type", [MessageType.DOCUMENT, MessageType.AUDIO])
+    async def test_voice_followup_promotes_type_so_stt_is_not_skipped(self, adapter, first_type):
+        """DOCUMENT/AUDIO veto automatic STT for the whole event; a mixed paste
+        that then adds a voice note must promote the surviving type to VOICE."""
+        first_mime = "text/plain" if first_type == MessageType.DOCUMENT else "audio/mpeg"
+        adapter._enqueue_media_event(
+            _media_event("/tmp/first.bin", first_mime, first_type), "media-enqueue")
+        adapter._enqueue_media_event(
+            _media_event("/tmp/v1.ogg", "audio/ogg", MessageType.VOICE), "media-enqueue")
+
+        await _drain(adapter)
+
+        merged = adapter.handle_message.await_args.args[0]
+        assert merged.message_type == MessageType.VOICE
+        assert _event_media_is_stt_input(merged, 1) is True
 
     @pytest.mark.asyncio
     async def test_events_outside_the_window_stay_separate_turns(self, adapter):

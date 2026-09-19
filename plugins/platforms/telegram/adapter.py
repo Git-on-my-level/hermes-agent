@@ -6308,15 +6308,32 @@ class TelegramAdapter(BasePlatformAdapter):
             lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)))
 
     def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
-        """Merge ``event`` into ``pending[key]`` (media + caption) or seed it."""
+        """Merge ``event`` into ``pending[key]`` (media + caption + inline flags) or seed it."""
         existing = pending.get(key)
         if existing is None:
             pending[key] = event
             return
+
+        def _padded_inline_flags(msg: MessageEvent) -> list:
+            flags = list(getattr(msg, "media_text_inlined", []) or [])
+            return flags + [None] * (len(msg.media_urls) - len(flags))
+
+        # Pad before extending URLs so flags stay aligned with media_urls (same
+        # contract as merge_pending_message_event). Missing False would make
+        # inbound notes claim a later large text document was inlined.
+        existing.media_text_inlined = _padded_inline_flags(existing)
+        incoming_inline_flags = _padded_inline_flags(event)
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
+        existing.media_text_inlined.extend(incoming_inline_flags)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
+        # AUDIO/DOCUMENT veto automatic STT for the whole event; a following
+        # voice note in a mixed paste must still be transcribed.
+        if event.message_type == MessageType.VOICE and existing.message_type in {
+            MessageType.AUDIO, MessageType.DOCUMENT,
+        }:
+            existing.message_type = MessageType.VOICE
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
