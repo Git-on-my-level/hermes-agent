@@ -44,8 +44,13 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ),
     (
         "plugins/platforms/telegram/adapter.py",
-        'if thread_id and thread_id != "1":',
-        "telegram per-stream send lock keyed chat+topic (General=1 stays chat-wide)",
+        "_message_thread_id_for_send(self._metadata_thread_id(metadata))",
+        "telegram send lock keyed by chat plus topic (General topic 1 shares the bare chat FIFO)",
+    ),
+    (
+        "plugins/platforms/telegram/adapter.py",
+        'key = f"{key}:{thread_id}"',
+        "telegram send lock chat-plus-topic key construction",
     ),
     (
         "plugins/platforms/telegram/adapter.py",

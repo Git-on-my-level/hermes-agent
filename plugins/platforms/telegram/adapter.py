@@ -5250,14 +5250,13 @@ class TelegramAdapter(BasePlatformAdapter):
         chunked final. Topic ids partition the conversation views the interleave bug can appear in,
         so same-stream ordering (the bug's fix) is preserved while cross-topic sends run in parallel.
         Sends without topic metadata AND Telegram's General topic (thread 1) take the bare chat key,
-        because both render in the same view and must share one FIFO.
+        because both render in the same view and must share one FIFO. General is omitted by
+        ``_message_thread_id_for_send`` (sendMessage rejects ``message_thread_id=1``), so the lock
+        uses that same Bot-API-normalized thread id.
         """
-        thread_id = self._metadata_thread_id(metadata)
+        thread_id = self._message_thread_id_for_send(self._metadata_thread_id(metadata))
         key = str(normalize_telegram_chat_id(chat_id))
-        # Telegram's General topic IS thread 1, and replies to it often arrive with NO thread
-        # metadata at all — both shapes render in the same view, so both must share one lock or
-        # General-topic chunks can interleave with no-metadata sends to the same chat.
-        if thread_id and thread_id != "1":
+        if thread_id:
             key = f"{key}:{thread_id}"
         locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
         owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
