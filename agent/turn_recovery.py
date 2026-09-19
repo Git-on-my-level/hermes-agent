@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
-from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
+from agent.retry_utils import is_zai_coding_plan_429, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason
 from agent.message_sanitization import (
     _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
@@ -1579,9 +1579,10 @@ def route_classified_error(
         if classified.reason == FailoverReason.rate_limit else None
     )
     _is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
-    # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
-    # directly so the long backoff runs, and raise the ceiling to reach it.
-    _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
+    # Z.AI Coding Plan 429s (overload 1305 or concurrency 1302) persist for minutes —
+    # far beyond the default 3-attempt window. Detect the whole family so the long
+    # backoff runs, and raise the ceiling to reach it.
+    _is_zai_coding_overload = is_zai_coding_plan_429(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
