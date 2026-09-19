@@ -1117,9 +1117,10 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_with_dm_topic_reply_anchor_retry(
         self, send_fn: Any, send_kwargs: Dict[str, Any], metadata: Optional[Dict[str, Any]],
         reply_to_message_id: Optional[int], media_label: str, reset_media: Optional[Any] = None) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor. Serialized per chat with
-        ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
-        async with self._chat_send_lock(send_kwargs.get("chat_id")):
+        """Retry stale private-topic media replies once without the topic anchor. Serialized per
+        conversation stream with ``send()`` so a file upload cannot land between two chunks of the text
+        it accompanies."""
+        async with self._chat_send_lock(send_kwargs.get("chat_id"), metadata):
             try:
                 return await send_fn(**send_kwargs)
             except Exception as send_err:
@@ -3481,9 +3482,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        # One chat at a time (held only around the API calls, never across the reconnect wait above), so
-        # two concurrent split replies to one chat cannot interleave their chunks (#114396).
-        async with self._chat_send_lock(chat_id):
+        # One stream at a time (held only around the API calls, never across the reconnect wait above), so
+        # two concurrent split replies to one conversation cannot interleave their chunks (#114396; fork:
+        # scoped to chat+topic so independent forum topics don't queue behind each other).
+        async with self._chat_send_lock(chat_id, metadata):
             return await self._send_text_locked(chat_id, content, reply_to, metadata)
 
     async def _send_text_locked(
@@ -3593,7 +3595,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         delivered = list(raw.get("delivered_message_ids") or ())
         prior = len(delivered)
-        async with self._chat_send_lock(chat_id):
+        async with self._chat_send_lock(chat_id, metadata):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
@@ -5236,11 +5238,23 @@ class TelegramAdapter(BasePlatformAdapter):
     # ``object.__new__()`` (no __init__).
 
     @contextlib.asynccontextmanager
-    async def _chat_send_lock(self, chat_id: Any):
-        """FIFO per-chat gate around outgoing API calls, reentrant within one asyncio task (media paths
-        nest: send_voice → send_document, and ``super().send_*`` fallbacks reach ``send()``; a plain
-        ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends for good)."""
+    async def _chat_send_lock(self, chat_id: Any, metadata: Optional[Dict[str, Any]] = None):
+        """FIFO per-conversation-stream gate around outgoing API calls, reentrant within one asyncio
+        task (media paths nest: send_voice → send_document, and ``super().send_*`` fallbacks reach
+        ``send()``; a plain ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends
+        for good).
+
+        Fork keep-list: keyed by chat + topic, not chat alone. The upstream lock (#114396) is
+        chat-granular, which serializes a forum group's independent topic streams behind each other —
+        a new topic's waiting placeholder queued seconds behind another topic's media upload or
+        chunked final. Topic ids partition the conversation views the interleave bug can appear in,
+        so same-stream ordering (the bug's fix) is preserved while cross-topic sends run in parallel.
+        A send without topic metadata takes the bare chat key (unchanged upstream shape).
+        """
+        thread_id = self._metadata_thread_id(metadata)
         key = str(normalize_telegram_chat_id(chat_id))
+        if thread_id:
+            key = f"{key}:{thread_id}"
         locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
         owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
         task = asyncio.current_task()
