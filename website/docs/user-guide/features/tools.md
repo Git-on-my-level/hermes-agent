@@ -30,7 +30,7 @@ High-level categories:
 | **Automation & delivery** | `cronjob`, `send_message` | Scheduled tasks plus optional outbound cross-platform delivery. `send_message` is default-off and has side effects; enable it explicitly per platform before an agent can use it. |
 | **Integrations** | `ha_*`, MCP server tools | Home Assistant, MCP, and other integrations. |
 
-For the authoritative code-derived registry, see [Built-in Tools Reference](/reference/tools-reference) and [Toolsets Reference](/reference/toolsets-reference).
+For the authoritative code-derived registry, see [Built-in Tools Reference](../../reference/tools-reference.md) and [Toolsets Reference](../../reference/toolsets-reference.md).
 
 :::tip Nous Tool Gateway
 Paid [Nous Portal](https://portal.nousresearch.com) subscribers can use web search, image generation, TTS, and browser automation through the **[Tool Gateway](tool-gateway.md)** — no separate API keys needed. Run `hermes model` to enable it, or configure individual tools with `hermes tools`.
@@ -69,7 +69,7 @@ The gateway must be running (or the session must already be a messaging
 session) before the schema is exposed. Cron delivery, `hermes send`, and the
 gateway notifier remain separate operator-controlled delivery paths.
 
-See [Toolsets Reference](/reference/toolsets-reference) for the full set, including platform presets such as `hermes-cli`, `hermes-telegram`, and dynamic MCP toolsets like `mcp-<server>`.
+See [Toolsets Reference](../../reference/toolsets-reference.md) for the full set, including platform presets such as `hermes-cli`, `hermes-telegram`, and dynamic MCP toolsets like `mcp-<server>`.
 
 ## Tool result annotations
 
