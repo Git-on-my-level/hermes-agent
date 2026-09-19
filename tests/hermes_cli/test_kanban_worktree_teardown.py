@@ -21,9 +21,31 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_connect as kbc
 
 
+def _real_git_binary() -> str:
+    """Bypass the host's managed-git wrapper (omi-workspace) for hermetic temp-dir tests.
+
+    The wrapper refuses `git worktree add` outside the host's managed worktree roots, which
+    would make these upstream tests fail on fleet hosts for policy reasons that have nothing
+    to do with the code under test.
+    """
+    import shutil
+    for candidate in ("/opt/homebrew/bin/git", "/usr/bin/git"):
+        try:
+            with open(candidate, "rb") as fh:
+                if b"omi-workspace managed git wrapper" not in fh.read(256):
+                    return candidate
+        except OSError:
+            continue
+    found = shutil.which("git")
+    return found or "git"
+
+
+_GIT_BIN = _real_git_binary()
+
+
 def _git(*args: str, cwd: str | None = None) -> str:
     result = subprocess.run(
-        ["git", *args],
+        [_GIT_BIN, *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -38,6 +60,29 @@ def _git(*args: str, cwd: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _bypass_managed_git_wrapper(monkeypatch: pytest.MonkeyPatch):
+    """Route kanban_db_workspace._git at the real git for this module.
+
+    On fleet hosts PATH git is the omi-workspace managed wrapper, which refuses
+    `git worktree add` into hermetic tmp dirs. These tests exercise upstream
+    teardown semantics, not host worktree policy.
+    """
+    import hermes_cli.kanban_db_workspace as _kbw
+
+    real_git = subprocess.run
+
+    def _unwrapped_git(repo_root, *args, timeout):
+        return real_git(
+            [_GIT_BIN, "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+
+    monkeypatch.setattr(_kbw, "_git", _unwrapped_git)
 
 
 @pytest.fixture
