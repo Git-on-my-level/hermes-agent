@@ -42,6 +42,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "commentary_mode",
         "stream_consumer commentary_mode config plumb-through",
     ),
+    (
+        ".github/workflows/fork-ci.yml",
+        "ubuntu-latest",
+        "fork CI uses standard runners (not 96-core)",
+    ),
+    (
+        "scripts/fork_ci_apply.sh",
+        "gh workflow disable",
+        "post-sync script disables upstream-oriented workflows",
+    ),
 ]
 
 TEST_FILES = [
