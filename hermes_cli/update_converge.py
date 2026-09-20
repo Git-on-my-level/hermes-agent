@@ -287,8 +287,8 @@ def converge_plist_path() -> Path:
     return home / "Library" / "LaunchAgents" / f"{converge_label()}.plist"
 
 
-def generate_converge_plist(settings: Optional[ConvergeSettings] = None) -> str:
-    from hermes_cli.gateway import _service_venv_dir, _stable_service_working_dir
+def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[ConvergeSettings, str, str, str, Path]:
+    from hermes_cli.gateway import _service_venv_dir
     from hermes_constants import get_hermes_home
 
     settings = settings or load_converge_settings()
@@ -297,6 +297,13 @@ def generate_converge_plist(settings: Optional[ConvergeSettings] = None) -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     venv_dir = _service_venv_dir()
     hermes_bin = str(Path(venv_dir) / "bin" / "hermes")
+    return settings, hermes_home, venv_dir, hermes_bin, log_dir
+
+
+def generate_converge_plist(settings: Optional[ConvergeSettings] = None) -> str:
+    from hermes_cli.gateway import _stable_service_working_dir
+
+    settings, hermes_home, venv_dir, hermes_bin, log_dir = _converge_exec_env(settings)
     label = converge_label()
     working_dir = _stable_service_working_dir()
     interval = settings.interval
@@ -335,17 +342,103 @@ def generate_converge_plist(settings: Optional[ConvergeSettings] = None) -> str:
 """
 
 
-def install_converge_agent(*, force: bool = False) -> int:
-    """Write and load the macOS LaunchAgent. No-op (0) on non-macOS."""
-    if sys.platform != "darwin":
-        print("converge agent install is macOS LaunchAgent-only; on Linux run `hermes update --converge -y` from a systemd timer.")
-        return 0
-    from hermes_cli.gateway import _launchd_domain, _launchctl_bootstrap, _refuse_temp_home_service_write
+def _systemd_user_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
 
-    settings = load_converge_settings()
-    if not settings.enabled and not force:
-        print("updates.converge is false — not installing (pass install --force to write the plist anyway).")
-        return 1
+
+def generate_converge_systemd_service(settings: Optional[ConvergeSettings] = None) -> str:
+    from hermes_cli.gateway import _stable_service_working_dir
+
+    settings, hermes_home, venv_dir, hermes_bin, log_dir = _converge_exec_env(settings)
+    working_dir = _stable_service_working_dir()
+    log_path = log_dir / "converge.log"
+    return f"""[Unit]
+Description=Hermes update converge tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={hermes_bin} update --converge -y
+WorkingDirectory={working_dir}
+Environment=HERMES_HOME={hermes_home}
+Environment=VIRTUAL_ENV={venv_dir}
+StandardOutput=append:{log_path}
+StandardError=append:{log_path}
+Nice=10
+"""
+
+
+def generate_converge_systemd_timer(settings: Optional[ConvergeSettings] = None) -> str:
+    settings = settings or load_converge_settings()
+    return f"""[Unit]
+Description=Hermes update converge timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={settings.interval}
+Persistent=true
+Unit=hermes-converge.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _install_linux_converge(settings: ConvergeSettings) -> int:
+    unit_dir = _systemd_user_dir()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    service_path = unit_dir / "hermes-converge.service"
+    timer_path = unit_dir / "hermes-converge.timer"
+    service_path.write_text(generate_converge_systemd_service(settings), encoding="utf-8")
+    timer_path.write_text(generate_converge_systemd_timer(settings), encoding="utf-8")
+    cmds = [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "hermes-converge.timer"],
+    ]
+    for cmd in cmds:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip().splitlines()
+            print(f"⚠ Wrote {timer_path} but `{' '.join(cmd)}` failed: {err[-1] if err else r.returncode}")
+            print("  Enable lingering if this host has no user systemd session: loginctl enable-linger $USER")
+            return 1
+    print(f"✓ Converge timer installed: hermes-converge.timer every {settings.interval}s")
+    print(f"  {timer_path}")
+    return 0
+
+
+def _uninstall_linux_converge() -> int:
+    subprocess.run(
+        ["systemctl", "--user", "disable", "--now", "hermes-converge.timer"],
+        capture_output=True, timeout=30, check=False,
+    )
+    unit_dir = _systemd_user_dir()
+    removed = False
+    for name in ("hermes-converge.timer", "hermes-converge.service"):
+        path = unit_dir / name
+        if path.exists():
+            path.unlink()
+            removed = True
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=30, check=False)
+    print("✓ Removed hermes-converge.timer" if removed else "converge timer was not installed")
+    return 0
+
+
+def _launchd_converge_domains() -> list[str]:
+    """Prefer Aqua ``gui/<uid>`` so SSH installs are not stuck in ``user/`` (bootstrap exit 5)."""
+    from hermes_cli.gateway import _launchd_domain
+
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper
+    ordered: list[str] = []
+    for domain in (f"gui/{uid}", f"user/{uid}", _launchd_domain()):
+        if domain and domain not in ordered:
+            ordered.append(domain)
+    return ordered
+
+
+def _install_macos_converge(settings: ConvergeSettings) -> int:
+    from hermes_cli.gateway import _launchctl_bootstrap, _refuse_temp_home_service_write
+
     plist_path = converge_plist_path()
     body = generate_converge_plist(settings)
     if _refuse_temp_home_service_write(body, "converge launchd plist"):
@@ -353,39 +446,50 @@ def install_converge_agent(*, force: bool = False) -> int:
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(body, encoding="utf-8")
     label = converge_label()
-    domain = _launchd_domain()
-    try:
-        import subprocess
-
+    last_err = ""
+    for domain in _launchd_converge_domains():
         subprocess.run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             check=False, timeout=30, capture_output=True,
         )
-        _launchctl_bootstrap(domain, plist_path, label, timeout=30)
-    except Exception as e:
-        print(f"⚠ Wrote {plist_path} but launchctl load failed: {e}")
+        try:
+            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
+            print(f"✓ Converge agent installed: {label} every {settings.interval}s ({domain})")
+            print(f"  {plist_path}")
+            return 0
+        except Exception as e:
+            last_err = str(e)
+            continue
+    print(f"⚠ Wrote {plist_path} but launchctl load failed: {last_err}")
+    return 1
+
+
+def install_converge_agent(*, force: bool = False) -> int:
+    """Install the out-of-tree converge ticker (LaunchAgent on macOS, systemd user timer on Linux)."""
+    settings = load_converge_settings()
+    if not settings.enabled and not force:
+        print("updates.converge is false — not installing (pass install --force to write the unit anyway).")
         return 1
-    print(f"✓ Converge agent installed: {label} every {settings.interval}s")
-    print(f"  {plist_path}")
-    return 0
+    if sys.platform == "darwin":
+        return _install_macos_converge(settings)
+    if sys.platform.startswith("linux"):
+        return _install_linux_converge(settings)
+    print(f"converge agent install is not supported on {sys.platform}")
+    return 1
 
 
 def uninstall_converge_agent() -> int:
+    if sys.platform.startswith("linux"):
+        return _uninstall_linux_converge()
     if sys.platform != "darwin":
         return 0
-    from hermes_cli.gateway import _launchd_domain
-
     plist_path = converge_plist_path()
     label = converge_label()
-    try:
-        import subprocess
-
+    for domain in _launchd_converge_domains():
         subprocess.run(
-            ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
+            ["launchctl", "bootout", f"{domain}/{label}"],
             check=False, timeout=30, capture_output=True,
         )
-    except Exception:
-        pass
     if plist_path.exists():
         plist_path.unlink()
         print(f"✓ Removed {plist_path}")
@@ -396,7 +500,7 @@ def uninstall_converge_agent() -> int:
 
 def maybe_install_converge_agent() -> None:
     """Best-effort hook from ``hermes gateway install`` when converge is enabled."""
-    if sys.platform != "darwin":
+    if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
         return
     if not load_converge_settings().enabled:
         return
@@ -421,5 +525,8 @@ def cmd_converge(args: Any) -> None:
         print(f"action={d.action} reason={d.reason}")
         if sys.platform == "darwin":
             print(f"plist={converge_plist_path()} exists={converge_plist_path().exists()}")
+        elif sys.platform.startswith("linux"):
+            timer = _systemd_user_dir() / "hermes-converge.timer"
+            print(f"timer={timer} exists={timer.exists()}")
         return
     cmd_converge_tick(args)

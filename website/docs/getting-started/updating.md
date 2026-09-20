@@ -36,7 +36,7 @@ Idle converge follows the configured update channel (`updates.remote` / `updates
 
 ```bash
 hermes config set updates.converge true
-hermes converge install                       # macOS LaunchAgent; ticks hermes update --converge
+hermes converge install                       # macOS LaunchAgent or Linux systemd --user timer
 # optional freeze: echo '<40-char-sha>' > ~/.hermes/updates.pin
 ```
 
