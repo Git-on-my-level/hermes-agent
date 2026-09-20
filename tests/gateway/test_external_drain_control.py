@@ -72,6 +72,20 @@ class TestSuppressNotification:
         assert dc.drain_notification_suppressed() is True
 
 
+class TestClearUpdateConvergeDrain:
+    def test_drops_converge_marker_only(self, home):
+        dc.write_drain_request(principal="update-converge", suppress_notification=True)
+        assert dc.drain_requested() is True
+        assert dc.clear_update_converge_drain() is True
+        assert dc.drain_requested() is False
+        assert dc.read_drain_request() is None
+
+    def test_leaves_dashboard_marker(self, home):
+        dc.write_drain_request(principal="nas")
+        assert dc.clear_update_converge_drain() is False
+        assert dc.drain_requested() is True
+
+
 # ---------------------------------------------------------------------------
 # Instantiation-epoch staleness (NS-570: orphaned marker on durable volume)
 # ---------------------------------------------------------------------------
