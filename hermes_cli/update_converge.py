@@ -279,7 +279,7 @@ def converge_label() -> str:
 def converge_plist_path() -> Path:
     import pwd
 
-    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     return home / "Library" / "LaunchAgents" / f"{converge_label()}.plist"
 
 
