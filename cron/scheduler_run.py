@@ -1,7 +1,10 @@
 """Execution of one agent-backed cron fire; scheduler.py keeps the public entry point."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from cron.scheduler import _CancelEventLike
 
 
 def run_job(
@@ -39,7 +42,9 @@ def run_job(
         return early
     from run_agent import AIAgent
 
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    from cron.continuation import cron_session_id
+    _cron_session_id = cron_session_id(
+        job, f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -73,7 +78,11 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
-        final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        continuation_notice = None
+        if result.get("continuation_ready") and not result.get("interrupted") and not result.get("failed"):
+            from cron.continuation import continue_cron_job
+            continuation_notice = continue_cron_job(job, agent, prompt)
+        final_response = continuation_notice or _final_response_from_result(result, job_id, job_name, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
@@ -82,6 +91,12 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
+        if isinstance(e, TimeoutError) and getattr(agent, "_cron_idle_timed_out", False):
+            from cron.continuation import continue_cron_job
+            notice = continue_cron_job(
+                job, agent, prompt, idle=True, future=_worker_state.get("future"))
+            if notice:
+                return False, _run_doc_header(job, job_name, job_id, prompt) + notice, notice, notice
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where

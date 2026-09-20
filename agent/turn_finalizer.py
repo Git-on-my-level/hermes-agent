@@ -452,6 +452,12 @@ def finalize_turn(
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
 
+    from agent.continuation import budget_handoff
+    checkpoint_response = budget_handoff(
+        agent, messages, final_response, api_call_count, interrupted, failed, _turn_exit_reason)
+    if checkpoint_response is not None:
+        final_response, _turn_exit_reason = checkpoint_response, "continuation_handoff"
+
     final_response, _turn_exit_reason, preserved_verification_fallback = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
         interrupted=interrupted, failed=failed, messages=messages,
@@ -475,6 +481,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and getattr(agent, "_continuation_ready", False) is not True
         and not interrupted
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
     )
@@ -565,6 +572,7 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
+        "continuation_ready": getattr(agent, "_continuation_ready", False) is True and not interrupted and not failed,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,

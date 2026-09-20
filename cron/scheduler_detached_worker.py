@@ -32,7 +32,8 @@ def defer_teardown_to_running_worker(
             _teardown_cron_agent(agent, job_id)
 
     # Runs inline if the worker finished between done() and here — still exactly once.
-    future.add_done_callback(_finish)
+    from agent.memory_provider import ctx_bound
+    future.add_done_callback(ctx_bound(_finish))
     return True
 
 

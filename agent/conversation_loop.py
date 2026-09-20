@@ -1452,6 +1452,9 @@ def _run_conversation_turn(
             user_message, persist_user_message
         )
 
+    from agent.continuation import seed_unstarted_continuation
+    user_message = seed_unstarted_continuation(agent, user_message, conversation_history)
+
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False

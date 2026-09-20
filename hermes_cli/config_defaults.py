@@ -19,6 +19,8 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
+    # Opt-in fresh-session handoffs for long gateway and cron runs.
+    "continuation": {"enabled": False, "max_per_origin": 3, "soft_budget_fraction": 0.9},
     "model": "",
     "providers": {},
     "fallback_providers": [],

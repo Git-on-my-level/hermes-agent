@@ -186,6 +186,8 @@ def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) 
 
     # Persist exactly the checkpoint text the next model call will see, before stamping
     # this tool result as durable. Already-written rows must never be rewritten later.
+    from agent.continuation import maybe_request_handoff
+    maybe_request_handoff(agent, messages)
     _maybe_inject_run_budget_wrapup(agent, messages)
     _maybe_inject_iteration_budget_warning(agent, messages)
     try:

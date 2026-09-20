@@ -105,6 +105,12 @@ def finish_text_response(
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
 
+    if getattr(agent, "_continuation_wrapup", False) is True and final_response.strip():
+        from agent.continuation import finish_handoff
+        final_response = finish_handoff(agent, messages, final_response, "soft_budget")
+        _turn_exit_reason = "continuation_handoff"
+        return _verdict("break")
+
     # Think-block-only / empty content: recovery path.
     if not agent._has_content_after_think_block(final_response):
         _ev = recover_empty_response(

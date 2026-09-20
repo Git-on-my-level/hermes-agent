@@ -1323,6 +1323,9 @@ def _apply_agent_section(agent, _agent_cfg):
     with suppress(Exception):
         agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
 
+    from agent.continuation import ContinuationPolicy
+    agent.continuation_policy = ContinuationPolicy.from_config(_agent_cfg)
+
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(
         _agent_section.get("budget_warning_ratio")
