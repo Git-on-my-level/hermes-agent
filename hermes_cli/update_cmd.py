@@ -885,6 +885,37 @@ def _pull_updates(
     return pre_pull_sha
 
 
+def _reset_to_update_pin(git_cmd, pin: str, remote: str, branch: str):
+    """Reset HEAD to ``pin`` if it is an ancestor of ``remote/branch``.
+
+    Returns the pre-reset SHA when HEAD moved, else None (already there).
+    Exits 1 when the pin is missing or off-channel.
+    """
+    from hermes_cli.update_converge import normalize_pin
+
+    pin = normalize_pin(pin)
+    if not pin:
+        print("✗ --sha is not a git commit id")
+        sys.exit(1)
+    resolved = _git_run(git_cmd, ["rev-parse", "--verify", f"{pin}^{{commit}}"])
+    if resolved.returncode != 0:
+        print(f"✗ Pin {pin} is not a commit on this checkout (fetch {remote}/{branch} first)")
+        sys.exit(1)
+    sha = resolved.stdout.strip()
+    tip = f"{remote}/{branch}"
+    if _git_run(git_cmd, ["merge-base", "--is-ancestor", sha, tip]).returncode != 0:
+        print(f"✗ Pin {sha[:12]} is not an ancestor of {tip}")
+        sys.exit(1)
+    pre = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    if pre == sha:
+        return None
+    print(f"→ Pinning checkout to {sha[:12]} (channel {tip})")
+    if _git_run(git_cmd, ["reset", "--hard", sha]).returncode != 0:
+        print(f"✗ git reset --hard {sha[:12]} failed")
+        sys.exit(1)
+    return pre
+
+
 @dataclass
 class _CheckoutPlan:
     """What the pre-pull checkout phase decided (see ``_prepare_checkout_for_update``)."""
@@ -1335,6 +1366,12 @@ def _post_swap_argv_tail(args) -> list[str]:
     branch = getattr(args, "branch", None)
     if branch:
         tail += ["--branch", str(branch)]
+    remote = getattr(args, "remote", None)
+    if remote:
+        tail += ["--remote", str(remote)]
+    sha = getattr(args, "sha", None)
+    if sha:
+        tail += ["--sha", str(sha)]
     return tail
 
 
@@ -1632,6 +1669,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
             remote=remote, _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
+
+        pin = str(getattr(args, "sha", None) or "").strip()
+        if pin:
+            moved_from = _reset_to_update_pin(git_cmd, pin, remote, branch)
+            if moved_from is None:
+                commit_count = 0
+            else:
+                _apply_pulled_update(
+                    git_cmd, branch, moved_from, _plan, opts, gateway_mode=gateway_mode,
+                    is_fork=is_fork, desktop_dir=desktop_dir,
+                    had_desktop_app_before_update=had_desktop_app_before_update,
+                    pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
+                    _windows_gateway_resume=_windows_gateway_resume, remote=remote, args=args)
+                return
 
         if commit_count == 0:
             _finish_already_up_to_date(

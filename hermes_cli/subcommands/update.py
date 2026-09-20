@@ -80,6 +80,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "Pair with a separate restart step (e.g. a cron that runs 10-15 min later).",
     )
     update_parser.add_argument(
+        "--converge", action="store_true", default=False,
+        help="Idle/after-turn tick: apply updates.pin (or HERMES_HOME/updates.pin) if "
+            "updates.converge is true. Skips when busy (until converge_busy_sla) or dirty. "
+            "Silent on no-op. Intended for the ai.hermes.converge LaunchAgent.",
+    )
+    update_parser.add_argument(
+        "--sha", default=None, metavar="SHA",
+        help="Install this commit instead of the channel tip. The SHA must be an ancestor "
+            "of the configured updates.remote/updates.branch (or --remote/--branch).",
+    )
+    update_parser.add_argument(
         "--post-swap", default=None, metavar="FILE", help=argparse.SUPPRESS,
         # Internal: the pre-pull interpreter re-executes itself here after the code swap so the
         # rest of the update runs on the pulled code (hermes_cli/update_handoff.py).

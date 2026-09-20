@@ -30,6 +30,18 @@ hermes config set updates.check false
 
 This suppresses both cached update notices and passive update-check network requests. The default is `true`. Explicit `hermes update --check` and `hermes update` still work; this setting does not control the Desktop application's updater.
 
+### Converge onto a pinned SHA
+
+To apply a **specific commit** when the gateway is idle (or after the current turn past a cap), pin it locally — Hermes does not poll GitHub HEAD and has no fleet-manager dependency:
+
+```bash
+hermes config set updates.converge true
+echo '<40-char-sha>' > ~/.hermes/updates.pin   # or: hermes config set updates.pin <sha>
+hermes converge install                       # macOS LaunchAgent; ticks hermes update --converge
+```
+
+The tick is silent when already current, busy (until `updates.converge_busy_sla`, default 6h), or the tree is dirty. Set `updates.skip_gateway_restart: true` on a coordinator that must not recycle its own messaging gateway. `hermes update --sha <sha>` installs that commit immediately (must be an ancestor of `updates.remote`/`updates.branch`).
+
 ### What happens during an update
 
 When you run `hermes update`, the following steps occur:
