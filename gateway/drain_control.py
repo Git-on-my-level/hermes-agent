@@ -92,6 +92,19 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
         return False
 
 
+def clear_update_converge_drain(*, home: Optional[Path] = None) -> bool:
+    """Drop a leftover update-converge marker so a fresh gateway accepts turns.
+
+    On macOS ``epoch`` is empty (no /proc), so a marker survives SIGUSR1 restart
+    and the new process would stay in external drain until max-age (1h).
+    Dashboard drains (other principals) are left alone.
+    """
+    body = read_drain_request(home=home)
+    if not body or body.get("principal") != "update-converge":
+        return False
+    return clear_drain_request(home=home)
+
+
 def _marker_is_expired(body: dict[str, Any]) -> bool:
     """True iff ``requested_at`` parses AND is older than the max-age.
 

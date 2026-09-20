@@ -33,6 +33,8 @@ class ConvergeSettings:
     interval: int
     busy_sla: float
     skip_gateway_restart: bool
+    remote: str = ""
+    branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,8 @@ def load_converge_settings(cfg: Optional[dict[str, Any]] = None) -> ConvergeSett
         interval=max(60, interval),
         busy_sla=max(0.0, sla),
         skip_gateway_restart=bool(updates.get("skip_gateway_restart")),
+        remote=str(updates.get("remote") or "").strip(),
+        branch=str(updates.get("branch") or "").strip(),
     )
 
 
@@ -108,15 +112,28 @@ def decide_converge(
     dirty: bool,
     busy: bool,
     pin_age_s: float,
+    target_sha: str = "",
 ) -> ConvergeDecision:
-    """Pure policy. ``pin_age_s`` is how long this pin has been visible on the host."""
+    """Pure policy. ``pin_age_s`` is how long this pin has been visible on the host.
+
+    ``target_sha`` is the channel-tip commit when ``settings.pin`` is empty.
+    Without it, channel-tip cannot prove already-current and must update.
+    """
     if not settings.enabled:
         return ConvergeDecision("skip", "disabled")
     if not settings.pin:
         if dirty:
             return ConvergeDecision("skip", "dirty_tree")
+        desired = normalize_pin(target_sha)
+        if desired:
+            at_tip = prefixes_match(checkout_sha, desired)
+            live_at_tip = prefixes_match(live_sha, desired) if live_sha else at_tip
+            if at_tip and (live_at_tip or settings.skip_gateway_restart):
+                return ConvergeDecision("skip", "already_current")
         if busy and pin_age_s < settings.busy_sla:
             return ConvergeDecision("skip", "busy")
+        if desired and prefixes_match(checkout_sha, desired):
+            return ConvergeDecision("restart", "stale_runtime")
         return ConvergeDecision("update", "channel_tip")
     pin = settings.pin
     if dirty and not prefixes_match(checkout_sha, pin):
@@ -223,10 +240,37 @@ def _log_tick(message: str) -> None:
         logger.debug("converge log write failed", exc_info=True)
 
 
+def channel_tip_sha(project_root: Path, remote: str = "", branch: str = "") -> str:
+    """Best-effort tracking-ref SHA. Empty if git cannot resolve it."""
+    ref = f"{remote}/{branch}" if remote and branch else "@{u}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", ref],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return normalize_pin(r.stdout) if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") -> None:
+    """Refresh the tracking ref used by channel-tip. Failures are skip-safe."""
+    if not remote or not branch:
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", str(project_root), "fetch", "--prune", remote, branch],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("channel-tip fetch failed: %s", e)
+
+
 def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = None) -> ConvergeDecision:
     settings = settings or load_converge_settings()
     pin = settings.pin
     age = pin_age_seconds(pin or "channel") if settings.enabled else 0.0
+    target = "" if pin else channel_tip_sha(project_root, settings.remote, settings.branch)
     return decide_converge(
         settings=settings,
         checkout_sha=checkout_sha(project_root),
@@ -234,6 +278,7 @@ def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = 
         dirty=checkout_is_dirty(project_root),
         busy=gateway_is_busy(),
         pin_age_s=age,
+        target_sha=target,
     )
 
 
@@ -251,6 +296,8 @@ def cmd_converge_tick(args: Any) -> None:
     from hermes_cli.main import PROJECT_ROOT, cmd_update
 
     settings = load_converge_settings()
+    if settings.enabled and not settings.pin:
+        fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
     decision = decide_from_live(PROJECT_ROOT, settings)
     _log_tick(f"action={decision.action} reason={decision.reason} pin={decision.pin[:12]}")
     if decision.action == "skip":
@@ -265,12 +312,20 @@ def cmd_converge_tick(args: Any) -> None:
     if settings.skip_gateway_restart:
         args.no_gateway_restart = True
     _mark_planned_drain()
-    if decision.action == "restart":
-        from hermes_cli.update_cmd_fleet import _restart_gateway_fleet_after_update
+    try:
+        if decision.action == "restart":
+            from hermes_cli.update_cmd_fleet import _restart_gateway_fleet_after_update
 
-        _restart_gateway_fleet_after_update(None, gateway_mode=False)
-        return
-    cmd_update(args)
+            _restart_gateway_fleet_after_update(None, gateway_mode=False)
+            return
+        cmd_update(args)
+    finally:
+        try:
+            from gateway.drain_control import clear_update_converge_drain
+
+            clear_update_converge_drain()
+        except Exception:
+            logger.debug("update-converge drain marker clear after tick failed", exc_info=True)
 
 
 def converge_label() -> str:

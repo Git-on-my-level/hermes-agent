@@ -1415,6 +1415,12 @@ class GatewayStartupMixin:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
+        try:
+            from gateway.drain_control import clear_update_converge_drain
+
+            clear_update_converge_drain()
+        except Exception:
+            logger.debug("update-converge drain marker clear at startup failed", exc_info=True)
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
     async def start(self) -> bool:

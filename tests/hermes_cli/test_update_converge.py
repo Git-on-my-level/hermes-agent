@@ -56,6 +56,22 @@ def test_empty_pin_follows_channel_tip():
     assert d.action == "update" and d.reason == "channel_tip"
 
 
+def test_empty_pin_skips_when_already_on_tip():
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
+def test_empty_pin_restarts_stale_runtime():
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN2, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN,
+    )
+    assert d.action == "restart" and d.reason == "stale_runtime"
+
+
 def test_already_current_skips():
     d = decide_converge(
         settings=_s(), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
