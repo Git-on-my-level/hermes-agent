@@ -182,7 +182,7 @@ Tools for driving desktop [Projects](../user-guide/cli.md) — named, multi-fold
 
 ## `messaging` toolset
 
-Default-off on every platform — enable it explicitly with `hermes tools` (or `platform_toolsets`) for the platform that should expose it. See [Toolsets Reference](/reference/toolsets-reference#messaging).
+Default-off on every platform — enable it explicitly with `hermes tools` (or `platform_toolsets`) for the platform that should expose it. See [Toolsets Reference](toolsets-reference.md#messaging).
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
