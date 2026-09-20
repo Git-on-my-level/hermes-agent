@@ -131,3 +131,22 @@ def test_pin_age_resets_on_new_pin(tmp_path):
     assert aged == 300.0
     reset = pin_age_seconds(PIN2, home=tmp_path, now=1400.0)
     assert reset == 0.0
+
+
+def test_linux_timer_unit_text():
+    from hermes_cli.update_converge import generate_converge_systemd_timer
+
+    text = generate_converge_systemd_timer(_s(interval=120))
+    assert "OnUnitActiveSec=120" in text
+    assert "Unit=hermes-converge.service" in text
+    assert "WantedBy=timers.target" in text
+
+
+def test_linux_service_runs_converge_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.update_converge import generate_converge_systemd_service
+
+    text = generate_converge_systemd_service(_s())
+    assert "update --converge -y" in text
+    assert "Type=oneshot" in text
+    assert f"HERMES_HOME={tmp_path}" in text
