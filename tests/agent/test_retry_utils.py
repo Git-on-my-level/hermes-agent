@@ -214,7 +214,6 @@ def test_zai_concurrency_429_window_covers_sustained_storms():
     sustained 1302 storms that cleared after ~10 min; a manual re-prompt completed.
     The widened schedule must cover a >=10-minute throttle window without human help."""
     from agent.retry_utils import (
-        zai_coding_overload_retry_ceiling,
         _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
         _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
     )
@@ -222,13 +221,12 @@ def test_zai_concurrency_429_window_covers_sustained_storms():
     # Every tier must strictly increase so waits keep widening (no plateau below the cap).
     tiers = list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
     assert tiers == sorted(tiers) and len(set(tiers)) == len(tiers)
-    # Worst-case survival window: short retries (~14s) + full long tier with the
-    # final tier held for the ceiling's extra attempt(s) must exceed 10 minutes.
+    # Worst-case survival window: short retries (~14s) + the long-tier waits the
+    # loop actually sleeps. The ceiling's +1 is the give-up check
+    # (retry_count >= ceiling) and never waits — neighboring tests already
+    # prove long waits equal the tuple over range(1, ceiling).
     short_window = sum(min(2.0 * 2 ** n, 60.0) for n in range(_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS))
-    last_tier = tiers[-1]
-    ceiling = zai_coding_overload_retry_ceiling()
-    extra_held = ceiling - _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS - len(tiers)
-    total = short_window + sum(tiers) + max(extra_held, 0) * last_tier
+    total = short_window + sum(tiers)
     assert total >= 600, f"survival window {total}s < 10min; storms will still kill turns"
 
 
