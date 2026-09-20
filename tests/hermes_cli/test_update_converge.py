@@ -43,8 +43,17 @@ def test_prefixes_match_short_and_long():
 def test_skip_when_disabled_or_unpinned():
     d = decide_converge(settings=_s(enabled=False), checkout_sha="1", live_sha="", dirty=False, busy=False, pin_age_s=0)
     assert d.action == "skip" and d.reason == "disabled"
+
+
+def test_empty_pin_follows_channel_tip():
     d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=False, pin_age_s=0)
-    assert d.action == "skip" and d.reason == "no_pin"
+    assert d.action == "update" and d.reason == "channel_tip"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=True, busy=False, pin_age_s=0)
+    assert d.action == "skip" and d.reason == "dirty_tree"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=True, pin_age_s=10)
+    assert d.action == "skip" and d.reason == "busy"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=True, pin_age_s=21600)
+    assert d.action == "update" and d.reason == "channel_tip"
 
 
 def test_already_current_skips():

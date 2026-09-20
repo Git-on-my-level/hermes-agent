@@ -113,7 +113,11 @@ def decide_converge(
     if not settings.enabled:
         return ConvergeDecision("skip", "disabled")
     if not settings.pin:
-        return ConvergeDecision("skip", "no_pin")
+        if dirty:
+            return ConvergeDecision("skip", "dirty_tree")
+        if busy and pin_age_s < settings.busy_sla:
+            return ConvergeDecision("skip", "busy")
+        return ConvergeDecision("update", "channel_tip")
     pin = settings.pin
     if dirty and not prefixes_match(checkout_sha, pin):
         return ConvergeDecision("skip", "dirty_tree", pin)
@@ -222,7 +226,7 @@ def _log_tick(message: str) -> None:
 def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = None) -> ConvergeDecision:
     settings = settings or load_converge_settings()
     pin = settings.pin
-    age = pin_age_seconds(pin) if pin else 0.0
+    age = pin_age_seconds(pin or "channel") if settings.enabled else 0.0
     return decide_converge(
         settings=settings,
         checkout_sha=checkout_sha(project_root),

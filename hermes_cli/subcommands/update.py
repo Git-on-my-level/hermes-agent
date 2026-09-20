@@ -81,9 +81,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     )
     update_parser.add_argument(
         "--converge", action="store_true", default=False,
-        help="Idle/after-turn tick: apply updates.pin (or HERMES_HOME/updates.pin) if "
-            "updates.converge is true. Skips when busy (until converge_busy_sla) or dirty. "
-            "Silent on no-op. Intended for the ai.hermes.converge LaunchAgent.",
+        help="Idle/after-turn tick when updates.converge is true. Applies updates.pin if set, "
+            "else the configured update channel tip. Skips when busy (until converge_busy_sla) "
+            "or dirty. Silent on no-op. Intended for the ai.hermes.converge LaunchAgent.",
     )
     update_parser.add_argument(
         "--sha", default=None, metavar="SHA",

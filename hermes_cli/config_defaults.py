@@ -2231,7 +2231,7 @@ DEFAULT_CONFIG = {
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,
-        # Idle converge onto a local pin (updates.pin or HERMES_HOME/updates.pin). Off by default.
+        # Idle converge onto the update channel tip, or updates.pin if set. Off by default.
         "converge": False,
         "pin": "",
         "pin_file": "",

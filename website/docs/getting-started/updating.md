@@ -32,15 +32,15 @@ This suppresses both cached update notices and passive update-check network requ
 
 ### Converge onto a pinned SHA
 
-To apply a **specific commit** when the gateway is idle (or after the current turn past a cap), pin it locally — Hermes does not poll GitHub HEAD and has no fleet-manager dependency:
+Idle converge follows the configured update channel (`updates.remote` / `updates.branch`, stock `origin/main`) unless a pin is set:
 
 ```bash
 hermes config set updates.converge true
-echo '<40-char-sha>' > ~/.hermes/updates.pin   # or: hermes config set updates.pin <sha>
 hermes converge install                       # macOS LaunchAgent; ticks hermes update --converge
+# optional freeze: echo '<40-char-sha>' > ~/.hermes/updates.pin
 ```
 
-The tick is silent when already current, busy (until `updates.converge_busy_sla`, default 6h), or the tree is dirty. Set `updates.skip_gateway_restart: true` on a coordinator that must not recycle its own messaging gateway. `hermes update --sha <sha>` installs that commit immediately (must be an ancestor of `updates.remote`/`updates.branch`).
+No pin → channel tip. A pin (`updates.pin` or `{HERMES_HOME}/updates.pin`) wins. The tick is silent when already current, busy (until `updates.converge_busy_sla`, default 6h), or the tree is dirty. Set `updates.skip_gateway_restart: true` on a coordinator that must not recycle its own messaging gateway. `hermes update --sha <sha>` installs that commit immediately (must be an ancestor of the update channel).
 
 ### What happens during an update
 

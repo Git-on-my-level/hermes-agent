@@ -9,9 +9,9 @@ def build_converge_parser(subparsers, *, cmd_converge: Callable) -> None:
         "converge",
         help="Converge this install onto updates.pin when idle",
         description=(
-            "Apply a locally pinned SHA (config updates.pin or HERMES_HOME/updates.pin) "
-            "when the gateway is idle, or after the current turn past updates.converge_busy_sla. "
-            "Does not poll GitHub HEAD and has no fleetctl dependency."
+            "When idle (or after the current turn past converge_busy_sla), apply "
+            "updates.pin if set, else the configured update channel tip "
+            "(updates.remote/updates.branch). No fleetctl dependency."
         ),
     )
     sub = p.add_subparsers(dest="converge_action")
