@@ -7,7 +7,7 @@ from typing import Callable
 def build_converge_parser(subparsers, *, cmd_converge: Callable) -> None:
     p = subparsers.add_parser(
         "converge",
-        help="Converge this install onto updates.pin when idle",
+        help="Converge this install onto the update channel (or a pin) when idle",
         description=(
             "When idle (or after the current turn past converge_busy_sla), apply "
             "updates.pin if set, else the configured update channel tip "
