@@ -147,7 +147,10 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     extended ceiling, at least one attempt reaches the long-backoff tier and the
     full 30/60/90/120s schedule is exercised."""
     monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
-    from agent.retry_utils import zai_coding_overload_retry_ceiling
+    from agent.retry_utils import (
+        zai_coding_overload_retry_ceiling,
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+    )
 
     err = _zai_overload_error()
     ceiling = zai_coding_overload_retry_ceiling()
@@ -166,7 +169,9 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
             long_waits.append(_wait)
 
     assert long_waits, "long-backoff tier never reached within the retry ceiling"
-    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+    # Ratchet: every long-tier entry must be exercised, so widening the schedule
+    # updates this list automatically instead of silently truncating it.
+    assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
 
 
 def _zai_concurrency_error():
@@ -177,12 +182,16 @@ def _zai_concurrency_error():
     )
 
 
+
 def test_zai_concurrency_429_reaches_long_tier(monkeypatch):
     """Regression (2026-09-18 fleet outage): glm-5.3-flash 429 code 1302 must get the
     long-backoff schedule within the retry ceiling — on the old glm-5.2/1305-only
     predicate it fell through to policy=default (3 tries, ~10s) and the turn died."""
     monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
-    from agent.retry_utils import zai_coding_overload_retry_ceiling
+    from agent.retry_utils import (
+        zai_coding_overload_retry_ceiling,
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+    )
 
     ceiling = zai_coding_overload_retry_ceiling()
     long_waits = []
@@ -197,7 +206,30 @@ def test_zai_concurrency_429_reaches_long_tier(monkeypatch):
         if policy == "zai_coding_overload_long":
             long_waits.append(_wait)
 
-    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+    assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+
+
+def test_zai_concurrency_429_window_covers_sustained_storms():
+    """Regression (2026-09-20): the 30/60/90/120s window (~6 min) still died during
+    sustained 1302 storms that cleared after ~10 min; a manual re-prompt completed.
+    The widened schedule must cover a >=10-minute throttle window without human help."""
+    from agent.retry_utils import (
+        zai_coding_overload_retry_ceiling,
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+        _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
+    )
+
+    # Every tier must strictly increase so waits keep widening (no plateau below the cap).
+    tiers = list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+    assert tiers == sorted(tiers) and len(set(tiers)) == len(tiers)
+    # Worst-case survival window: short retries (~14s) + full long tier with the
+    # final tier held for the ceiling's extra attempt(s) must exceed 10 minutes.
+    short_window = sum(min(2.0 * 2 ** n, 60.0) for n in range(_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS))
+    last_tier = tiers[-1]
+    ceiling = zai_coding_overload_retry_ceiling()
+    extra_held = ceiling - _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS - len(tiers)
+    total = short_window + sum(tiers) + max(extra_held, 0) * last_tier
+    assert total >= 600, f"survival window {total}s < 10min; storms will still kill turns"
 
 
 def test_zai_china_coding_plan_429_reaches_long_tier(monkeypatch):
@@ -206,7 +238,10 @@ def test_zai_china_coding_plan_429_reaches_long_tier(monkeypatch):
     not the default short window that a host-literal ``api.z.ai`` check would
     leave it on."""
     monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
-    from agent.retry_utils import zai_coding_overload_retry_ceiling
+    from agent.retry_utils import (
+        zai_coding_overload_retry_ceiling,
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+    )
 
     ceiling = zai_coding_overload_retry_ceiling()
     long_waits = []
@@ -221,7 +256,7 @@ def test_zai_china_coding_plan_429_reaches_long_tier(monkeypatch):
         if policy == "zai_coding_overload_long":
             long_waits.append(_wait)
 
-    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+    assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
 
 
 def test_non_coding_plan_429_still_fails_fast():

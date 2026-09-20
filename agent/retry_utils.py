@@ -22,11 +22,13 @@ _jitter_lock = threading.Lock()
 # reached for requests", a concurrency cap, observed on glm-5.3-flash). Both persist
 # for minutes — far longer than the ~10s a default 3-attempt/2s-base backoff covers —
 # so after ``_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS`` normal retries the wait widens
-# progressively; the cap stays interactive-friendly (a TUI message should fail
-# visibly in minutes).
+# progressively. 2026-09-20: sustained 1302 storms on glm-5.3-flash still outlasted
+# the original 30/60/90/120s window (~8 attempts, ~6 min) — turns died and a manual
+# re-prompt minutes later completed — so the schedule now extends with 180s/300s and
+# holds 300s for any further attempts (~16 min worst case before giving up).
 # The short count is shared by ``adaptive_rate_limit_backoff`` and
 # ``zai_coding_overload_retry_ceiling`` so the two cannot silently desync.
-_ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
+_ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0, 180.0, 300.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
 
