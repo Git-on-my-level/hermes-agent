@@ -396,7 +396,7 @@ def _install_linux_converge(settings: ConvergeSettings) -> int:
         ["systemctl", "--user", "enable", "--now", "hermes-converge.timer"],
     ]
     for cmd in cmds:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip().splitlines()
             print(f"⚠ Wrote {timer_path} but `{' '.join(cmd)}` failed: {err[-1] if err else r.returncode}")
