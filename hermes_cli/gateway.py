@@ -4248,6 +4248,11 @@ def launchd_install(force: bool = False):
     print()
     print("✓ Service installed and loaded!")
     _clear_launchd_unsupported_marker()
+    try:
+        from hermes_cli.update_converge import maybe_install_converge_agent
+        maybe_install_converge_agent()
+    except Exception:
+        pass
     print()
     print("Next steps:")
     print("  hermes gateway status             # Check status")

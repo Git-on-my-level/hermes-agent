@@ -2231,6 +2231,13 @@ DEFAULT_CONFIG = {
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,
+        # Idle converge onto the update channel tip, or updates.pin if set. Off by default.
+        "converge": False,
+        "pin": "",
+        "pin_file": "",
+        "converge_interval": 1800,
+        "converge_busy_sla": 21600,
+        "skip_gateway_restart": False,
     },
     # LSP diagnostics (pyright, gopls, rust-analyzer...) in the post-write lint check of
     # write_file/patch. Runs only when the cwd or edited file is inside a git worktree; otherwise
