@@ -713,6 +713,20 @@ class TestLaunchdServiceRecovery:
 
         def fake_run(cmd, check=False, **kwargs):
             run_calls.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                # Success is domain-scoped: launchctl print <domain>/<label>
+                # must show a live pid, not just a registered definition.
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "ai.hermes.gateway = {\n"
+                        "\tactive count = 1\n"
+                        "\tpid = 5150\n"
+                        "\tstate = running\n"
+                        "};"
+                    ),
+                    stderr="",
+                )
             if cmd[:2] == ["launchctl", "list"]:
                 # Post-bootstrap launchd reports a supervised PID; without one
                 # the success check correctly refuses to stop retrying.
@@ -724,6 +738,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli.time, "sleep", lambda *_a, **_k: None)
 
         assert gateway_cli.refresh_launchd_plist_if_needed() is True
 

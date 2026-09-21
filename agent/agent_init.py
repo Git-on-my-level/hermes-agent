@@ -1060,9 +1060,9 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # renaming only its wire declaration would leave the deferred schemas
     # unreachable. Returning the pre-assembly list keeps every configured
     # tool directly available, while all non-xAI routes retain Tool Search.
-    _xai_responses = agent.api_mode == "codex_responses" and (
-        agent.provider in {"xai", "xai-oauth"}
-        or agent._base_url_hostname == "api.x.ai"
+    _xai_responses = getattr(agent, "api_mode", None) == "codex_responses" and (
+        getattr(agent, "provider", None) in {"xai", "xai-oauth"}
+        or getattr(agent, "_base_url_hostname", None) == "api.x.ai"
     )
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
@@ -1322,6 +1322,9 @@ def _apply_agent_section(agent, _agent_cfg):
     agent._skill_nudge_interval = 10
     with suppress(Exception):
         agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
+
+    from agent.continuation import ContinuationPolicy
+    agent.continuation_policy = ContinuationPolicy.from_config(_agent_cfg)
 
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(

@@ -191,7 +191,13 @@ def test_cli_and_cron_share_plugin_target_normalization(plugin_platform, monkeyp
 def test_send_message_remains_host_only(plugin_platform):
     from tools.registry import registry
 
-    assert registry.get_entry("send_message") is None
+    name, _entry, _seen = plugin_platform
+    entry = registry.get_entry("send_message")
+    # Host-owned opt-in messaging tool — plugins must not replace or add one.
+    assert entry is not None
+    assert entry.toolset == "messaging"
+    assert entry.handler is send_message_tool
+    assert registry.get_entry(name) is None
 
 
 def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkeypatch):
@@ -249,8 +255,10 @@ with patch("gateway.config.load_gateway_config", return_value=config), \
                                               "message": "hello", "subject": "hi"}))
 from cron.scheduler_delivery import _resolve_single_delivery_target
 cron = _resolve_single_delivery_target({}, "fmsg:@Alice@Example.COM")
+entry = registry.get_entry("send_message")
 print(json.dumps({"host_send": host_send, "cron": cron,
-                  "model_registered": registry.get_entry("send_message") is not None}))
+                  "model_registered": entry is not None,
+                  "toolset": getattr(entry, "toolset", None)}))
 '''
     env = dict(os.environ)
     env.update({
@@ -269,4 +277,5 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
-    assert payload["model_registered"] is False
+    assert payload["model_registered"] is True
+    assert payload["toolset"] == "messaging"

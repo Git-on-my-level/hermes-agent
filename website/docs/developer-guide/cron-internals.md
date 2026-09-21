@@ -202,7 +202,7 @@ never left without a trigger.** The built-in provider lives in core
 accidentally removed.
 
 What "firing" *means* (job execution + delivery) is unchanged and shared by all
-providers — it stays in `scheduler.run_job()` / `scheduler._deliver_result()`.
+providers — it stays in `scheduler.run_job()` (implemented in `scheduler_run.py`) / `scheduler._deliver_result()`.
 A provider only controls the trigger, never execution.
 
 In CLI mode, cron jobs only fire when `hermes cron` commands are run or during active CLI sessions.

@@ -512,6 +512,7 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_mute_post_response", False), ("_unicode_sanitization_passes", 0),
     ("_tool_guardrail_halt_decision", None), ("_vision_supported", True),
     ("_iteration_budget_warning_injected", False),
+    ("_continuation_wrapup", False), ("_continuation_ready", False),
     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
     ("_pre_verify_nudges", 0),
 )
