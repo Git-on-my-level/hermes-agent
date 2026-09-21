@@ -34,7 +34,7 @@ jobs:
     name: Python tests
     if: github.repository == 'Git-on-my-level/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -78,7 +78,7 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh
         env:
-          HERMES_TEST_WORKERS: "4"
+          HERMES_TEST_WORKERS: "8"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
