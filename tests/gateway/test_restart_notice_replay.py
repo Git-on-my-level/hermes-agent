@@ -96,6 +96,27 @@ async def test_planned_restart_notice_reaches_home_channel(boot_notice, live):
 
 
 @pytest.mark.asyncio
+async def test_quiet_planned_restart_notice_is_retired_silently(boot_notice):
+    """A quiet drain restart consumes the marker WITHOUT the online broadcast.
+
+    Shutdown stamps ``quiet`` into the marker when a drain marker with
+    suppress_notification=true is active, so the routine fleet converge does
+    not announce "♻️ Gateway online" after every silent restart.
+    """
+    runner, marker = boot_notice
+    adapter = _adapter()
+    runner.adapters[Platform.DISCORD] = adapter
+    data = json.loads(marker.read_text(encoding="utf-8"))
+    data["quiet"] = True
+    marker.write_text(json.dumps(data), encoding="utf-8")
+
+    await _boot(runner)
+
+    adapter.send.assert_not_called()
+    assert not marker.exists(), "quiet marker must still be consumed so nothing replays later"
+
+
+@pytest.mark.asyncio
 async def test_partial_delivery_is_persisted_and_not_repeated(boot_notice):
     runner, marker = boot_notice
     telegram, discord = _adapter(), _adapter()
