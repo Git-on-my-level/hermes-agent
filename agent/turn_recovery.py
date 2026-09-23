@@ -1728,6 +1728,7 @@ def route_classified_error(
     status_code = getattr(api_error, "status_code", None)
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ClassifiedErrorVerdict:
+        nonlocal max_retries
         return ClassifiedErrorVerdict(
             action=action, result=result, status_code=status_code, messages=messages,
             active_system_prompt=active_system_prompt, conversation_history=conversation_history,

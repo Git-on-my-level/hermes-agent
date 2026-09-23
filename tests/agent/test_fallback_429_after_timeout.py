@@ -94,7 +94,7 @@ class TestFallbackChainResetOnTransportRecovery:
 
 
 
-    def test_run_conversation_fallbacks_on_429_after_timeout_recovery(self):
+    def test_run_conversation_fallbacks_on_429_after_timeout_recovery(self, monkeypatch):
         """Full loop regression for #32646.
 
         Start the turn with the fallback chain already burned, matching
@@ -113,6 +113,14 @@ class TestFallbackChainResetOnTransportRecovery:
         ]
         agent = _make_agent_with_fallback(fb_chain)
         agent._api_max_retries = 2
+        # #56 raises the retry ceiling for Z.AI Coding sustained outages so
+        # timeouts ride the long backoff instead of exhausting. This test
+        # exercises the *transport-recovery* contract (#32646), which only
+        # runs on exhaustion — pin the ceiling back to the short path.
+        monkeypatch.setattr(
+            "agent.turn_recovery.zai_coding_overload_retry_ceiling",
+            lambda *a, **k: 2,
+        )
 
         calls = []
 

@@ -347,6 +347,8 @@ def test_expect_output_allows_a_declared_quiet_tick_via_wake_gate(hermes_env):
 
 def test_expect_output_roundtrips_through_the_cronjob_tool(hermes_env):
     """The agent-facing door writes and clears the same field the scheduler reads."""
+    import json
+
     from cron.jobs import get_job
     from tools.cronjob_tools import cronjob
 

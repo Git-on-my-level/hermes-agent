@@ -1087,7 +1087,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "expect_output", "attach_to_session",
-    "paused_reason", "pinned", "all")
+    "paused_reason", "pinned")
 
 
 def _cronjob_handler(args, **kw):
