@@ -954,6 +954,12 @@ class GatewayNotificationsMixin:
                 return
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("quiet"):
+                    # The shutdown side asked to stay quiet (drain marker with
+                    # suppress_notification=true): retire the marker, no broadcast.
+                    logger.info("Planned-restart online notice skipped: quiet drain restart")
+                    path.unlink(missing_ok=True)
+                    return
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.

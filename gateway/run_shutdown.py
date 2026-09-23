@@ -902,6 +902,15 @@ class GatewayShutdownMixin:
         """
         if not job_ids:
             return 0
+        # A quiet drain suppresses the interrupted-job chatter too (same contract as the
+        # per-session pings above).
+        with _log_suppressed(logging.DEBUG, "drain_notification_suppressed check failed: %s"):
+            from gateway.drain_control import drain_notification_suppressed
+            if drain_notification_suppressed():
+                logger.info(
+                    "Interrupted-cron-job notices suppressed by drain marker (suppress_notification=true)"
+                )
+                return 0
         try:
             from cron.jobs import get_job
             from cron.scheduler import _resolve_delivery_targets
@@ -1009,6 +1018,16 @@ class GatewayShutdownMixin:
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
+        # A quiet drain (routine fleet auto-update) suppresses the restart chatter ENTIRELY:
+        # per-session interrupt pings AND the home-channel broadcast. Current-epoch marker only;
+        # a failing check fails toward the louder behaviour.
+        with _log_suppressed(logging.DEBUG, "drain_notification_suppressed check failed: %s"):
+            from gateway.drain_control import drain_notification_suppressed
+            if drain_notification_suppressed():
+                logger.info(
+                    "Shutdown notifications suppressed by drain marker (suppress_notification=true)"
+                )
+                return
         restart_source = self._restart_command_source if self._restart_requested else None
         msg = (
             "⚠️ Hermes is shutting down — your current task will be interrupted. "
@@ -1074,15 +1093,6 @@ class GatewayShutdownMixin:
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
-        # A quiet drain (routine fleet auto-update) suppresses ONLY the home-channel broadcast; per-session
-        # pings above stay. Current-epoch marker only; a failing check fails toward the louder behaviour.
-        with _log_suppressed(logging.DEBUG, "drain_notification_suppressed check failed: %s"):
-            from gateway.drain_control import drain_notification_suppressed
-            if drain_notification_suppressed():
-                logger.info(
-                    "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
-                )
-                return
         # Snapshot adapters: adapter.send() can hit a fatal path (_handle_fatal) that pops the adapter
         # from self.adapters -> ``RuntimeError: dictionary changed size during iteration``.
         for platform, adapter in list(self.adapters.items()):
@@ -2058,12 +2068,16 @@ class GatewayShutdownMixin:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                from gateway.drain_control import drain_notification_suppressed
                 atomic_json_write(
                     _planned_restart_notification_path(),
                     {
                         "requested_at": time.time(),
                         "via_service": bool(self._restart_via_service),
                         "detached": bool(self._restart_detached),
+                        # A quiet drain stays quiet across the restart: the booting gateway
+                        # skips the "♻️ Gateway online" broadcast when this is set.
+                        "quiet": drain_notification_suppressed(),
                     },
                     indent=None,
                 )
