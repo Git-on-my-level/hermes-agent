@@ -102,6 +102,27 @@ separate maintainer step; agents never merge upstream themselves.
 
 Override for one shot: `hermes update --remote origin --branch main`.
 
+## Fork CI (keep-list)
+
+Upstream `ci.yaml` orchestrates 96-core Linux, Windows, macOS, nix, docker,
+and docs lanes. This fork does not have those runners — PRs sat queued on
+`ubuntu-latest-96-core` indefinitely.
+
+Do **not** patch `ci.yaml` (upstream rewrites it weekly). Instead:
+
+- Additive workflow: `.github/workflows/fork-ci.yml` (ruff + Linux pytest on
+  `ubuntu-latest`). No-op on `NousResearch/hermes-agent`.
+- GitHub-side disable of every other workflow, applied by
+  `scripts/fork_ci_apply.sh` (idempotent; re-run after each upstream sync
+  because GitHub auto-enables newly added workflow files).
+
+```bash
+scripts/fork_ci_apply.sh
+```
+
+Keep-list files: `fork-ci.yml`, `scripts/fork_ci_apply.sh`. Sync conflict
+surface is zero against `ci.yaml`.
+
 ## Documentation verification
 
 ```bash

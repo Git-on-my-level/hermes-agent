@@ -57,6 +57,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "async with self._chat_send_lock(chat_id, metadata):",
         "telegram send() takes the topic-scoped chat send lock",
     ),
+    (
+        ".github/workflows/fork-ci.yml",
+        "ubuntu-latest",
+        "fork CI uses standard runners (not 96-core)",
+    ),
+    (
+        "scripts/fork_ci_apply.sh",
+        "gh workflow disable",
+        "post-sync script disables upstream-oriented workflows",
+    ),
 ]
 
 TEST_FILES = [
