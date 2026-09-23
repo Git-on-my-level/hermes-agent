@@ -1216,8 +1216,11 @@ def compute_error_backoff(
             _wait_reason = "Rate limited"
         _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
         # Long waits (30s–300s) must surface immediately; buffering them leaves the
-        # user silent for minutes. Applies to both 429 and transport families.
-        if (_backoff_policy or "").endswith("_long"):
+        # user silent for minutes. Applies to both 429 and transport families —
+        # including a provider Retry-After, which skips the `_long` policy label.
+        if (_backoff_policy or "").endswith("_long") or (
+            _retry_after is not None and _retry_after > 60
+        ):
             agent._emit_diagnostic_status(_rate_limit_status)
         else:
             agent._buffer_diagnostic_status(_rate_limit_status)
