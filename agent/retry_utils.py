@@ -154,6 +154,96 @@ def is_zai_coding_plan_429(*, base_url: str | None, model: str | None, error: An
     )
 
 
+# Peak-load drops on the Coding Plan endpoint often never return a 429. Studio
+# logs them as ``error=Connection error.`` (OpenAI ``APIConnectionError``,
+# sometimes with a DNS cause) and the turn dies at ``policy=default`` attempt
+# 1/3–2/3. Same schedule as the 429 family — do not invent a second tuple.
+# ponytail: a genuinely offline Mac on a GLM Coding Plan turn waits this same
+# ~16 min window, because peak-load resets and DNS failures share that wrapper.
+# Upgrade path: split on cause-chain DNS markers once a peak-load sample lacks them.
+_ZAI_CODING_TRANSPORT_TYPES = frozenset({
+    "APIConnectionError", "APITimeoutError",
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "ReadError", "WriteError", "WriteTimeout",
+    "RemoteProtocolError", "PoolTimeout", "NetworkError",
+    "ConnectionError", "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError",
+    "TimeoutError", "ConnectTimeoutError", "ReadTimeoutError",
+})
+_ZAI_CODING_GATEWAY_TIMEOUT_STATUSES = frozenset({502, 503, 504, 524})
+_ZAI_CODING_SSL_CERT_MARKERS = (
+    "certificate verify failed",
+    "certificate_verify_failed",
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "self signed certificate",
+    "certificate has expired",
+)
+_ZAI_CODING_TRANSPORT_TEXT_MARKERS = (
+    "connection error",
+    "connection refused",
+    "connection reset",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname provided",
+    "getaddrinfo failed",
+    "network is unreachable",
+    "network unreachable",
+)
+
+
+def _zai_coding_glm(base_url: str | None, model: str | None) -> bool:
+    return "/coding/paas/v4" in (base_url or "").lower() and "glm" in (model or "").lower()
+
+
+def _exception_chain(error: Any):
+    current = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+
+def is_zai_coding_plan_transport_failure(*, base_url: str | None, model: str | None, error: Any) -> bool:
+    """True for Coding Plan GLM connection/timeout drops that are not HTTP 429s.
+
+    Peak load presents as ``Connection error.`` / read timeouts / 502–524, classified
+    as timeout, and the 429-only predicate leaves them on the 3-attempt default.
+    4xx (including 429) and TLS cert failures stay fail-fast.
+    """
+    if error is None or not _zai_coding_glm(base_url, model):
+        return False
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        return False
+    chain = list(_exception_chain(error))
+    text = " ".join(str(part) for part in chain if part is not None).lower()
+    if any(marker in text for marker in _ZAI_CODING_SSL_CERT_MARKERS):
+        return False
+    if isinstance(status, int) and status in _ZAI_CODING_GATEWAY_TIMEOUT_STATUSES:
+        return True
+    names = {type(part).__name__ for part in chain}
+    if names & _ZAI_CODING_TRANSPORT_TYPES:
+        return True
+    if not isinstance(status, int) and any(marker in text for marker in _ZAI_CODING_TRANSPORT_TEXT_MARKERS):
+        return True
+    return False
+
+
+def is_zai_coding_sustained_outage(*, base_url: str | None, model: str | None, error: Any) -> bool:
+    """True when a Coding Plan GLM call should use the long-backoff ceiling.
+
+    Covers the 429 family and the connection/timeout family. ``is_zai_coding_plan_429``
+    stays the narrow 429 predicate (tests and any external reader).
+    """
+    return is_zai_coding_plan_429(
+        base_url=base_url, model=model, error=error,
+    ) or is_zai_coding_plan_transport_failure(
+        base_url=base_url, model=model, error=error,
+    )
+
+
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
     """True only for the narrow Z.AI Coding Plan overload shape (429 + code
     1305 / "temporarily overloaded"), so ordinary quota 429s still fail fast."""
@@ -170,16 +260,24 @@ def adaptive_rate_limit_backoff(
     attempt: int, *, base_url: str | None, model: str | None, error: Any, default_wait: float,
     short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
 ) -> tuple[float, str | None]:
-    """``(wait_seconds, reason_label)``: ``default_wait`` for most providers; Z.AI Coding 429s (concurrency
-    1302 or overload 1305, any GLM model) keep ``short_attempts`` short retries, then 30→60→90→120s with
-    light jitter. ``attempt`` is 1-based."""
-    if not is_zai_coding_plan_429(base_url=base_url, model=model, error=error):
+    """``(wait_seconds, reason_label)``: ``default_wait`` for most providers.
+
+    Z.AI Coding Plan GLM failures that persist for minutes — 429s (1302/1305) and
+    connection/timeout drops — keep ``short_attempts`` short retries, then the shared
+    long tuple. ``attempt`` is 1-based. Policy labels stay distinct so logs can tell
+    a 429 from a connection drop.
+    """
+    if is_zai_coding_plan_429(base_url=base_url, model=model, error=error):
+        family = "zai_coding_overload"
+    elif is_zai_coding_plan_transport_failure(base_url=base_url, model=model, error=error):
+        family = "zai_coding_transport"
+    else:
         return default_wait, None
     if attempt <= short_attempts:
-        return default_wait, "zai_coding_overload_short"
+        return default_wait, f"{family}_short"
     idx = min(attempt - short_attempts - 1, len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) - 1)
     base_delay = _ZAI_CODING_OVERLOAD_LONG_BACKOFF[idx]
-    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
+    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), f"{family}_long"
 
 
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:

@@ -278,6 +278,148 @@ def test_non_coding_plan_429_still_fails_fast():
         base_url="https://open.bigmodel.cn/api/paas/v4", model="glm-5.3-flash", error=err)
 
 
+class APIConnectionError(Exception):
+    """Stand-in for the OpenAI SDK type the Studio log stringifies as 'Connection error.'"""
+
+    def __init__(self, message: str = "Connection error."):
+        super().__init__(message)
+        self.message = message
+        self.status_code = None
+
+
+def _zai_connection_error():
+    """Production shape: APIConnectionError('Connection error.') on the coding endpoint."""
+    return APIConnectionError("Connection error.")
+
+
+def _zai_connection_error_with_dns_cause():
+    """Screenshot shape: the same wrapper, cause chain carries a DNS marker.
+
+    api_error_summary then says 'You may be offline.' Peak-load drops and a
+    genuinely offline Mac share this wrapper; both must reach the long schedule
+    on the Coding Plan GLM route (other providers stay fail-fast).
+    """
+    err = APIConnectionError("Connection error.")
+    err.__cause__ = OSError("nodename nor servname provided, or not known")
+    return err
+
+
+_CODING = "https://api.z.ai/api/coding/paas/v4"
+_GLM = "glm-5.3-flash"
+
+
+def test_zai_connection_error_reaches_long_tier(monkeypatch):
+    """Regression: Coding Plan GLM 'Connection error.' died at policy=default, attempt 1/3–2/3.
+
+    The 429 long-backoff never admitted it. The same ceiling must now exercise every
+    long-tier wait under policy=zai_coding_transport_long.
+    """
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import (
+        zai_coding_overload_retry_ceiling,
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF,
+    )
+
+    err = _zai_connection_error()
+    ceiling = zai_coding_overload_retry_ceiling()
+    policies = []
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt, base_url=_CODING, model=_GLM, error=err, default_wait=1.0,
+        )
+        policies.append(policy)
+        if policy == "zai_coding_transport_long":
+            long_waits.append(_wait)
+
+    assert policies[:3] == ["zai_coding_transport_short"] * 3
+    assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+    # Default window is 3 attempts / ~10s. The raised ceiling must outlast it.
+    assert ceiling > 3
+
+
+def test_zai_connection_error_dns_cause_still_long_backoff(monkeypatch):
+    """The user-facing 'You may be offline' summary walks a DNS cause. Same schedule."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling, _ZAI_CODING_OVERLOAD_LONG_BACKOFF
+
+    err = _zai_connection_error_with_dns_cause()
+    ceiling = zai_coding_overload_retry_ceiling()
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+            model=_GLM,
+            error=err,
+            default_wait=1.0,
+        )
+        if policy == "zai_coding_transport_long":
+            long_waits.append(_wait)
+    assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+
+
+def test_zai_transport_predicate_does_not_swallow_unrelated_failures():
+    """Wrong endpoint, non-GLM, general /paas/v4, 4xx, plain 500, and TLS certs stay off the schedule."""
+    from agent.retry_utils import is_zai_coding_plan_transport_failure, is_zai_coding_sustained_outage
+
+    conn = _zai_connection_error()
+    assert not is_zai_coding_plan_transport_failure(
+        base_url="https://api.openai.com/v1", model=_GLM, error=conn)
+    assert not is_zai_coding_plan_transport_failure(
+        base_url=_CODING, model="gpt-5", error=conn)
+    assert not is_zai_coding_plan_transport_failure(
+        base_url="https://api.z.ai/api/paas/v4", model=_GLM, error=conn)
+    assert not is_zai_coding_plan_transport_failure(
+        base_url=_CODING, model=_GLM,
+        error=SimpleNamespace(status_code=400, message="bad request"))
+    assert not is_zai_coding_plan_transport_failure(
+        base_url=_CODING, model=_GLM,
+        error=SimpleNamespace(status_code=500, message="internal error"))
+    # 429 stays on the 429 predicate, not the transport one.
+    assert not is_zai_coding_plan_transport_failure(
+        base_url=_CODING, model=_GLM, error=_zai_concurrency_error())
+    cert = APIConnectionError("certificate verify failed")
+    assert not is_zai_coding_plan_transport_failure(base_url=_CODING, model=_GLM, error=cert)
+    assert not is_zai_coding_sustained_outage(base_url=_CODING, model=_GLM, error=cert)
+    # Gateway timeouts on the coding GLM route are the same family.
+    assert is_zai_coding_plan_transport_failure(
+        base_url=_CODING, model=_GLM,
+        error=SimpleNamespace(status_code=504, message="gateway timeout"))
+
+
+def test_route_classified_error_raises_ceiling_for_connection_error():
+    """The policy function is not enough: the loop gives up at max_retries before the long tier.
+
+    route_classified_error must raise the ceiling for the logged connection error, or the
+    turn still dies at 3.
+    """
+    from agent.error_classifier import FailoverReason
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+    from agent.turn_recovery import route_classified_error
+    from agent.turn_retry_state import TurnRetryState
+
+    class _Agent:
+        compression_enabled = True
+        model = _GLM
+        _fallback_index = 0
+        _fallback_chain = ()
+
+    err = _zai_connection_error()
+    verdict = route_classified_error(
+        _Agent(), err, SimpleNamespace(reason=FailoverReason.timeout, is_auth=False), TurnRetryState(),
+        error_msg="Connection error.", error_context={}, recovered_with_pool=False,
+        base_url=_CODING, model=_GLM, messages=[], api_messages=[], system_message="",
+        active_system_prompt="", conversation_history=[], retry_count=0, max_retries=3,
+        compression_attempts=0, max_compression_attempts=2, api_call_count=1,
+        effective_task_id=None,
+    )
+    assert verdict.action == "fallthrough"
+    assert verdict.is_zai_coding_overload is True
+    assert verdict.max_retries == zai_coding_overload_retry_ceiling()
+    assert verdict.max_retries > 3
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
