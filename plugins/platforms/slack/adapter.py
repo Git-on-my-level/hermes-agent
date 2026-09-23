@@ -1685,13 +1685,19 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _register_plugin_action_handlers(self) -> None:
         """Wire ``ctx.register_slack_action_handler`` callbacks; each is wrapped so a plugin
-        exception is logged and slack_bolt still sees a clean ack."""
+        exception is logged and slack_bolt still sees a clean ack. Idempotent per ``AsyncApp``:
+        a ``(action_id, plugin)`` already registered on the live app is skipped, so the late
+        re-wire (#87770) never stacks a second listener that would run the callback twice."""
         try:
             from hermes_cli.plugins import get_plugin_manager
             _plugin_handlers = get_plugin_manager().get_slack_action_handlers()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("[Slack] Could not load plugin action handlers: %s", e)
             _plugin_handlers = []
+        if self._plugin_actions_app is not self._app:
+            self._plugin_actions_app, self._plugin_actions_wired = self._app, set()
+        _plugin_handlers = [(a, cb, n) for a, cb, n in _plugin_handlers
+                            if (repr(a), n) not in self._plugin_actions_wired]
         # Closure factory: slack_bolt passes ``None`` for unrecognised listener params, so loop
         # vars captured as default args (``_cb=_cb``) would be silently clobbered at dispatch.
         def _make_wrapper(cb, plugin_name):
@@ -1712,10 +1718,22 @@ class SlackAdapter(BasePlatformAdapter):
 
         for _action_id, _cb, _plugin_name in _plugin_handlers:
             self._app.action(_action_id)(_make_wrapper(_cb, _plugin_name))
+            self._plugin_actions_wired.add((repr(_action_id), _plugin_name))
             logger.debug(
                 "[Slack] Registered plugin action handler %s (from %s)", _action_id, _plugin_name)
         if _plugin_handlers:
             logger.info("[Slack] Wired %d plugin action handler(s)", len(_plugin_handlers))
+
+    # ``(repr(action_id), plugin)`` pairs registered on ``_plugin_actions_app``; reset per AsyncApp.
+    _plugin_actions_app: Any = None
+    _plugin_actions_wired: set = frozenset()
+
+    def rewire_plugin_handlers(self) -> None:
+        """Late plugin loads carry both registries: action handlers and ``register_platform_handler``
+        factories (base). Both are per-app idempotent."""
+        if self._app is not None and self._plugin_actions_app is self._app:
+            self._register_plugin_action_handlers()
+        super().rewire_plugin_handlers()
 
     @staticmethod
     def _new_web_client(token: str, proxy_url: Optional[str]) -> Any:
@@ -5961,30 +5979,24 @@ class SlackAdapter(BasePlatformAdapter):
     def _build_thread_session_key(
         self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "", *,
         chat_type: str = "group") -> Optional[str]:
-        """Thread session key via ``build_session_key()`` (honours per-user isolation).
-        ``chat_type`` must come from the event's ``channel_type``, not the ID prefix (MPIM ids
-        start with ``G``)."""
-        session_store = getattr(self, "_session_store", None)
-        if not session_store:
+        """Thread session key through the adapter seam (``_source_session_key``: per-user isolation
+        from the adapter config the runner seeded, owner-profile namespace). ``chat_type`` must come
+        from the event's ``channel_type``, not the ID prefix (MPIM ids start with ``G``)."""
+        if not getattr(self, "_session_store", None):
             return None
         try:
-            from gateway.session import build_session_key
             source = self._thread_session_source(channel_id, thread_ts, user_id, team_id, chat_type)
-            store_cfg = getattr(session_store, "config", None)
-            return build_session_key(
-                source, group_sessions_per_user=getattr(store_cfg, "group_sessions_per_user", True),
-                thread_sessions_per_user=getattr(store_cfg, "thread_sessions_per_user", False),
-                profile=self._session_key_profile(source))
+            return self._source_session_key(source)
         except Exception:
             return None
 
-    @staticmethod
     def _thread_session_source(
-        channel_id: str, thread_ts: str, user_id: str, team_id: str, chat_type: str) -> Any:
-        from gateway.session import SessionSource
-        return SessionSource(
-            platform=Platform.SLACK, chat_id=channel_id, chat_type=chat_type, user_id=user_id,
-            thread_id=thread_ts, scope_id=team_id or None)
+        self, channel_id: str, thread_ts: str, user_id: str, team_id: str, chat_type: str) -> Any:
+        # ``build_source``: transport provenance + profile route, so the thread key canonicalizes
+        # like the message that started the thread.
+        return self.build_source(
+            chat_id=channel_id, chat_type=chat_type, user_id=user_id, thread_id=thread_ts,
+            scope_id=team_id or None)
 
     def _thread_rehydration_key(
         self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "") -> str:
