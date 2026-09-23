@@ -34,7 +34,8 @@ jobs:
     name: Python tests
     if: github.repository == 'Git-on-my-level/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Post-sync suite grew past 40k tests; 45m started cancelling runs at ~80%.
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
