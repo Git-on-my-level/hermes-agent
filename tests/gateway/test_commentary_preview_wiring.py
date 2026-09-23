@@ -56,7 +56,7 @@ def test_setup_stream_consumer_passes_waiting_label_for_telegram_preview():
             self.config = None
             self._adapter = MagicMock()
 
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return self._adapter
 
     ctx = _preview_ctx()
