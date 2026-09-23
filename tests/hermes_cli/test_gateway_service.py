@@ -724,12 +724,13 @@ class TestLaunchdServiceRecovery:
 
         def fake_run(cmd, check=False, **kwargs):
             run_calls.append(cmd)
-            if cmd[:2] == ["launchctl", "list"]:
-                # Post-bootstrap launchd reports a supervised PID; without one
-                # the success check correctly refuses to stop retrying.
+            if cmd[:2] == ["launchctl", "print"]:
+                # Post-bootstrap launchd reports a supervised pid (domain-scoped
+                # probe); without one the success check correctly refuses to stop
+                # retrying.
                 return SimpleNamespace(
                     returncode=0,
-                    stdout='{\n\t"PID" = 5150;\n\t"Label" = "ai.hermes.gateway";\n};',
+                    stdout="ai.hermes.gateway = {\n\tpid = 5150\n};\n",
                     stderr="",
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")

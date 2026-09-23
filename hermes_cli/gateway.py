@@ -3483,6 +3483,8 @@ from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-export
     _launchd_reload_budget,
     _launchctl_supervised_pid,
     _launchctl_label_supervising_process,
+    _launchctl_domain_supervising_process,
+    _wait_for_launchd_label_unloaded,
     _retry_launchctl_bootstrap_until_registered,
     _launchd_unsupported_marker_path,
     _write_launchd_unsupported_marker,
