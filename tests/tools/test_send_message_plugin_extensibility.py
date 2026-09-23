@@ -264,4 +264,7 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
-    assert payload["model_registered"] is False
+    # Fork keeps send_message as an opt-in ``messaging``-toolset model tool (6abcf1a075),
+    # so the registry entry IS present in a fresh process — unlike upstream, which
+    # removed the model-tool registration entirely.
+    assert payload["model_registered"] is True
