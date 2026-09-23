@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
-from agent.retry_utils import is_zai_coding_plan_429, zai_coding_overload_retry_ceiling
+from agent.retry_utils import is_zai_coding_sustained_outage, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason
 from agent.message_sanitization import (
     _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
@@ -1156,6 +1156,8 @@ def interruptible_backoff_sleep(
 _ZAI_POLICY_NOTES = {
     "zai_coding_overload_long": " (Z.AI Coding overload adaptive long backoff)",
     "zai_coding_overload_short": " (Z.AI Coding overload short retry)",
+    "zai_coding_transport_long": " (Z.AI Coding transport adaptive long backoff)",
+    "zai_coding_transport_short": " (Z.AI Coding transport short retry)",
 }
 
 
@@ -1206,9 +1208,19 @@ def compute_error_backoff(
         )
     if _adaptive:
         _policy_note = _ZAI_POLICY_NOTES.get(_backoff_policy or "", "")
-        _wait_reason = "Provider overloaded" if is_zai_coding_overload and not is_rate_limited else "Rate limited"
+        if (_backoff_policy or "").startswith("zai_coding_transport"):
+            _wait_reason = "Provider unreachable"
+        elif is_zai_coding_overload and not is_rate_limited:
+            _wait_reason = "Provider overloaded"
+        else:
+            _wait_reason = "Rate limited"
         _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
-        if _backoff_policy == "zai_coding_overload_long":
+        # Long waits (30s–300s) must surface immediately; buffering them leaves the
+        # user silent for minutes. Applies to both 429 and transport families —
+        # including a provider Retry-After, which skips the `_long` policy label.
+        if (_backoff_policy or "").endswith("_long") or (
+            _retry_after is not None and _retry_after > 60
+        ):
             agent._emit_diagnostic_status(_rate_limit_status)
         else:
             agent._buffer_diagnostic_status(_rate_limit_status)
@@ -1584,10 +1596,12 @@ def route_classified_error(
         if classified.reason == FailoverReason.rate_limit else None
     )
     _is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
-    # Z.AI Coding Plan 429s (overload 1305 or concurrency 1302) persist for minutes —
-    # far beyond the default 3-attempt window. Detect the whole family so the long
-    # backoff runs, and raise the ceiling to reach it.
-    _is_zai_coding_overload = is_zai_coding_plan_429(base_url=str(base_url), model=model, error=api_error)
+    # Z.AI Coding Plan peak-load failures persist for minutes: 429s (1302/1305) and
+    # connection/timeout drops that otherwise die at policy=default, 3 short attempts.
+    # Raise the ceiling so the shared long backoff is reachable. No fallback is added.
+    _is_zai_coding_overload = is_zai_coding_sustained_outage(
+        base_url=str(base_url), model=model, error=api_error,
+    )
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
