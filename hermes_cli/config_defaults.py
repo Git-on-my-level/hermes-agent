@@ -2060,6 +2060,15 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        # What a resumed turn does after a restart/shutdown marks a session: "continue" finishes
+        # the interrupted work (no human prod needed), "ask" reports the restore and waits for
+        # direction (platform interactive_resume default). The restart-loop breaker and
+        # delivery-ledger dedup still apply in "continue" mode.
+        "resume_mode": "continue",
+        # How old a shutdown/restart resume marker may be (seconds) and still fire the boot
+        # auto-resume turn. 24h covers an overnight reboot; the restart-loop breaker still
+        # caps runaway resume loops.
+        "resume_freshness_secs": 86400,
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,

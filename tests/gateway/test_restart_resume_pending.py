@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from types import SimpleNamespace
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import SendResult
@@ -1324,3 +1325,94 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
 
+
+
+# ---------------------------------------------------------------------------
+# gateway.resume_mode: "continue" finishes the interrupted work without a
+# human prod; "ask" keeps the report-and-ask behavior. Loader: run.py raw
+# config (no DEFAULT_CONFIG merge), so the reader is exercised directly.
+# ---------------------------------------------------------------------------
+
+
+class TestResumeModeInteractive:
+    def test_continue_mode_resumes_noninteractive(self):
+        """gateway.resume_mode: continue -> the note tells the model to FINISH
+        the interrupted task; no 'ask what next' prod round trip."""
+        from gateway.run_turn_runner import TurnRunner
+        tctx = SimpleNamespace(
+            user_config={"gateway": {"resume_mode": "continue"}},
+            source=make_restart_source(),
+        )
+        tr = TurnRunner.__new__(TurnRunner)
+        tr._ctx = tctx
+        tr._runner = MagicMock()
+        # Adapter lookup must not even be needed in continue mode.
+        tr._runner._delivery_adapter_for.side_effect = AssertionError(
+            "continue mode must not consult the adapter"
+        )
+        assert tr._resume_note_interactive() is False
+
+    def test_ask_mode_keeps_interactive(self):
+        """gateway.resume_mode: ask -> restore report + ask, the old behavior."""
+        from gateway.run_turn_runner import TurnRunner
+        tctx = SimpleNamespace(
+            user_config={"gateway": {"resume_mode": "ask"}},
+            source=make_restart_source(),
+        )
+        tr = TurnRunner.__new__(TurnRunner)
+        tr._ctx = tctx
+        tr._runner = MagicMock()
+        tr._runner._delivery_adapter_for.return_value = SimpleNamespace(
+            interactive_resume=True)
+        assert tr._resume_note_interactive() is True
+
+    def test_unset_falls_back_to_adapter_default(self):
+        """No resume_mode key -> the adapter's interactive_resume decides
+        (upstream parity)."""
+        from gateway.run_turn_runner import TurnRunner
+        tctx = SimpleNamespace(user_config={}, source=make_restart_source())
+        tr = TurnRunner.__new__(TurnRunner)
+        tr._ctx = tctx
+        tr._runner = MagicMock()
+        tr._runner._delivery_adapter_for.return_value = SimpleNamespace(
+            interactive_resume=False)
+        assert tr._resume_note_interactive() is False
+        tr._runner._delivery_adapter_for.return_value = SimpleNamespace(
+            interactive_resume=True)
+        assert tr._resume_note_interactive() is True
+
+    def test_continue_note_tells_the_model_to_finish(self):
+        """The continue-mode note owns the 'no prod' contract: CONTINUE the
+        interrupted task, never re-run ledgered tool calls, never ack-and-ask."""
+        note = build_resume_recovery_note("shutdown_timeout", "", interactive=False)
+        assert "CONTINUE the interrupted task" in note
+        assert "ask" not in note.lower().replace("ask what", "ASK_WHAT") or "No user is present" in note
+        assert "do NOT emit a 'session restored' acknowledgement" in note
+
+
+class TestResumeFreshnessSecs:
+    def test_default_is_none_so_note_window_applies(self, tmp_path, monkeypatch):
+        """No config -> None -> the scheduler keeps the existing note window."""
+        import gateway.run as gateway_run_mod
+        monkeypatch.setattr(gateway_run_mod, "_hermes_home", tmp_path)
+        from gateway.run_shutdown import GatewayShutdownMixin
+        runner = MagicMock(spec=GatewayShutdownMixin)
+        assert GatewayShutdownMixin._resume_freshness_secs(runner) is None
+
+    def test_scalar_config_widens_the_window(self, tmp_path, monkeypatch):
+        import gateway.run as gateway_run_mod
+        monkeypatch.setattr(gateway_run_mod, "_hermes_home", tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  resume_freshness_secs: 86400\n", encoding="utf-8")
+        from gateway.run_shutdown import GatewayShutdownMixin
+        runner = MagicMock(spec=GatewayShutdownMixin)
+        assert GatewayShutdownMixin._resume_freshness_secs(runner) == 86400.0
+
+    def test_zero_disables_the_widening(self, tmp_path, monkeypatch):
+        import gateway.run as gateway_run_mod
+        monkeypatch.setattr(gateway_run_mod, "_hermes_home", tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  resume_freshness_secs: 0\n", encoding="utf-8")
+        from gateway.run_shutdown import GatewayShutdownMixin
+        runner = MagicMock(spec=GatewayShutdownMixin)
+        assert GatewayShutdownMixin._resume_freshness_secs(runner) is None

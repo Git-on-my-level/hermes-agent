@@ -575,9 +575,14 @@ class GatewayStartupMixin:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
-        sessions with a running agent are skipped so none is resumed twice."""
+        sessions with a running agent are skipped so none is resumed twice.
+
+        ``gateway.resume_freshness_secs`` (default 24h) widens the scheduler window beyond the
+        note-injection freshness so an overnight reboot still resumes; the restart-loop breaker
+        and delivery-ledger dedup keep "resume" from becoming a loop.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
-        window = _auto_continue_freshness_window()
+        window = self._resume_freshness_secs() or _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
             return 0

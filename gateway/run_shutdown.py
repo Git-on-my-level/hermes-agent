@@ -337,6 +337,25 @@ class GatewayShutdownMixin:
             return None
         return section if isinstance(section, dict) else None
 
+    def _resume_freshness_secs(self) -> Optional[float]:
+        """``gateway.resume_freshness_secs``: how old a shutdown/restart resume marker may be and
+        still fire the boot auto-resume turn. Default 24h (an overnight reboot must resume);
+        the restart-loop breaker still caps runaway resume loops. None -> caller's fallback."""
+        from gateway.run import _load_gateway_config
+        try:
+            user_cfg = _load_gateway_config()
+            gw = user_cfg.get("gateway") if isinstance(user_cfg, dict) else None
+            raw = gw.get("resume_freshness_secs") if isinstance(gw, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def _scale_to_zero_idle_timeout_seconds(self) -> float:
         from gateway.scale_to_zero import parse_idle_timeout_seconds
         stz = self._gateway_cfg_section("scale_to_zero")
