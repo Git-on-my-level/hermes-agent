@@ -1674,7 +1674,19 @@ class TurnRunner:
 
     def _resume_note_interactive(self) -> bool:
         """Interactive platforms report the restore and ask what next; event platforms (webhook,
-        API server) continue the work — nobody is present to answer."""
+        API server) continue the work — nobody is present to answer.
+
+        ``gateway.resume_mode``: ``"continue"`` (the fork default) finishes the interrupted
+        task instead of asking — a restart must not require a human prod, and the follow-up
+        "what next?" round trip is exactly that prod. ``"ask"`` keeps the report-and-ask
+        behavior. Unset falls back to the adapter's ``interactive_resume``.
+        """
+        gw = self._ctx.user_config.get("gateway") if isinstance(self._ctx.user_config, dict) else None
+        mode = str((gw or {}).get("resume_mode") or "").strip().lower()
+        if mode == "continue":
+            return False
+        if mode == "ask":
+            return True
         return bool(getattr(self._runner._delivery_adapter_for(self._ctx.source), "interactive_resume", True))
 
     def _prepare_turn_message(self, agent_history):
