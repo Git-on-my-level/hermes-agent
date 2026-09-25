@@ -40,7 +40,15 @@ class StatusOutputMixin:
 
     def _should_start_quiet_spinner(self) -> bool:
         """True when quiet-mode spinner output has a safe sink (``_print_fn`` or a real TTY); a raw spinner
-        on a non-TTY stdout can corrupt protocol streams (ACP JSON-RPC)."""
+        on a non-TTY stdout can corrupt protocol streams (ACP JSON-RPC).
+
+        ``suppress_status_output`` (the strict machine-readable mode used by ``hermes chat -Q``) always
+        wins: it neutralizes the rendering callbacks, so without this gate a PTY stdout still animates
+        raw spinner frames into the captured stdout that mode exists to keep clean (#17, same leak class
+        as the ``[tool]``/``[done]`` lines in #93220).
+        """
+        if getattr(self, "suppress_status_output", False):
+            return False
         if self._print_fn is not None:
             return True
         try:
