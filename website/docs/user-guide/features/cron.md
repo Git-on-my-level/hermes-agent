@@ -539,7 +539,7 @@ Checks per active job:
 - a failure rate at or above 50% over at least 3 runs in the retention window
   (`cron.executions_retention_days`, default 14),
 - a paused/disabled job that other active jobs chain via `context_from` (their runs read
-  stale context), or a paused `expect_output` watchdog (a capability gone dark),
+  stale context),
 - orphaned `cron/output/<id>/` directories with no matching job record.
 
 Doctor never mutates jobs or state — it only reports. The one exception is opt-in:

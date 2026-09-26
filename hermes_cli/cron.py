@@ -824,8 +824,7 @@ def _cron_doctor_orphan_output_dirs(jobs: List[Dict[str, Any]]) -> List[tuple]:
 
 def _cron_doctor_pause_propagation_findings(jobs: List[Dict[str, Any]]) -> List[str]:
     """What goes dark when a job is paused (#37 §4): dependents chained via ``context_from``
-    read a paused job's last output forever, and a paused ``expect_output`` watchdog is a
-    capability that is dark, not just a context source that is stale."""
+    read a paused job's last output forever — stale context, reported per dependent."""
     from cron.jobs import list_jobs
 
     all_jobs = list_jobs(include_disabled=True)
@@ -844,21 +843,13 @@ def _cron_doctor_pause_propagation_findings(jobs: List[Dict[str, Any]]) -> List[
         if not state and source_job.get("enabled", True):
             continue
         paused_days = _paused_age_days(source_job)
-        dark_note = ""
-        if source_job.get("no_agent") and source_job.get("expect_output"):
-            dark_note = (" It declares expect_output — a watchdog that cannot bark is "
-                         "dark, not quiet.")
         for dependent in dependents.get(source_id, []):
             if not dependent.get("enabled", True) or dependent.get("state") in ("paused", "completed"):
                 continue
             findings.append(
                 f"job '{dependent.get('name') or dependent.get('id')}' chains context_from "
                 f"'{source_job.get('name') or source_id}' which is {state or 'disabled'} "
-                f"for {paused_days} — its runs read stale context.{dark_note}")
-        if dark_note and not dependents.get(source_id):
-            findings.append(
-                f"expect_output watchdog '{source_job.get('name') or source_id}' is "
-                f"{state or 'disabled'} — dark for {paused_days}.{dark_note}")
+                f"for {paused_days} — its runs read stale context.")
     return findings
 
 

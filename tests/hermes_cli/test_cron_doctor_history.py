@@ -129,7 +129,9 @@ def test_pause_propagation_flags_context_from_dependent(store):
     assert "stale context" in findings[0]
 
 
-def test_expect_output_watchdog_pause_flagged_as_dark(store, monkeypatch):
+def test_expect_output_watchdog_pause_is_fork_only_noop_upstream(store, monkeypatch):
+    """Upstream has no ``expect_output`` job field (fork PR #33): an unknown field on a paused
+    no_agent job without dependents produces NO finding here."""
     from hermes_time import now as hermes_now
 
     watchdog = jobs.create_job(
@@ -145,8 +147,7 @@ def test_expect_output_watchdog_pause_flagged_as_dark(store, monkeypatch):
 
     findings = _cron_doctor_pause_propagation_findings(jobs.list_jobs(include_disabled=False))
 
-    assert len(findings) == 1
-    assert "watchdog" in findings[0] and "dark" in findings[0]
+    assert findings == []
 
 
 def test_doctor_prune_reaps_orphans_and_reports(store, monkeypatch, capsys):
