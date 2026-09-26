@@ -84,7 +84,10 @@ def valid_refname(name: str) -> bool:
 
 
 def _run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    # text=True alone decodes with the Windows locale codec (cp936/cp1252).
+    proc = subprocess.run(
+        argv, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
         raise SystemExit(
