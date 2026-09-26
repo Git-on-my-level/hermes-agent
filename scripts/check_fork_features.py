@@ -67,11 +67,17 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "gh workflow disable",
         "post-sync script disables upstream-oriented workflows",
     ),
+    (
+        "scripts/prune_fork_branches.py",
+        "--force-with-lease",
+        "guarded branch deletion for the retention apply pass",
+    ),
 ]
 
 TEST_FILES = [
     "tests/gateway/test_stream_consumer_commentary_preview.py",
     "tests/gateway/test_telegram_topic_scoped_send_lock.py",
+    "tests/scripts/test_prune_fork_branches.py",
 ]
 
 
@@ -93,7 +99,9 @@ def main() -> int:
         for line in missing:
             print(line)
         return 1
-    print(f"OK: fork keep-list intact ({len(KEEP_LIST)} code checks, {len(TEST_FILES)} test file)")
+    print(
+        f"OK: fork keep-list intact ({len(KEEP_LIST)} code checks, {len(TEST_FILES)} test file)"
+    )
     return 0
 
 
