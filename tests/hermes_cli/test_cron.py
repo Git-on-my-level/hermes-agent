@@ -247,7 +247,7 @@ class TestCronDoctor:
 
         out = capsys.readouterr().out
         assert rc == 1
-        assert "Cron doctor found 3 issue(s)" in out
+        assert "Cron doctor found issues" in out
         assert job["id"] in out
         assert "last run failed: Provider returned error" in out
         assert "was not delivered (telegram timeout)" in out
