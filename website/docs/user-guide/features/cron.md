@@ -533,11 +533,28 @@ Checks per active job:
   gateway down, or a wedged fire-claim),
 - script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
 - `no_agent` job with no script,
-- configured `workdir` that no longer exists.
+- configured `workdir` that no longer exists,
+- executions recorded for a job that no longer exists (ghost executions — a job firing
+  while absent from the store is invisible to the per-job checks by construction),
+- a failure rate at or above 50% over at least 3 runs in the retention window
+  (`cron.executions_retention_days`, default 14),
+- a paused/disabled job that other active jobs chain via `context_from` (their runs read
+  stale context), or a paused `expect_output` watchdog (a capability gone dark),
+- orphaned `cron/output/<id>/` directories with no matching job record.
 
-Doctor never mutates jobs or state — it only reports. Pair it with
-`hermes cron incidents` (durable failure records) and `hermes cron runs`
-(attempt ledger) when digging into a flagged job.
+Doctor never mutates jobs or state — it only reports. The one exception is opt-in:
+`hermes cron doctor --prune` removes the orphaned output directories it reports. Pair it
+with `hermes cron incidents` (durable failure records) and `hermes cron runs` (attempt
+ledger) when digging into a flagged job.
+
+### Execution history retention
+
+The attempt ledger (`cron/executions.db`) keeps terminal runs for
+`cron.executions_retention_days` (default 14) rather than a fixed row count — a count-only
+cap made retention a function of the noisiest job on the host, and no failure rate was
+computable. `cron.executions_min_per_job` (default 10) additionally keeps that many newest
+terminal rows per job past the cutoff, so a weekly job's history is never starved by a
+2-minute watchdog. The row ceiling stays as a growth backstop.
 
 ## Delivery options
 

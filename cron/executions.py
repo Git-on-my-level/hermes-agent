@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -26,6 +26,13 @@ from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
+# Terminal rows are pruned primarily by AGE (RETENTION_DAYS; 0/negative disables the time rule),
+# secondarily by the row-count backstop below. A pure row cap made retention a function of the
+# noisiest job on the host — two 2-minute watchdogs evicted every daily job's history inside a
+# day, so no failure rate was computable. A per-job floor (MIN_PER_JOB) keeps the N newest
+# terminal rows per job past the time cutoff so a weekly job is never starved by a busy one.
+RETENTION_DAYS = 14.0
+MIN_PER_JOB = 10
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
@@ -170,7 +177,48 @@ def _claim_age_seconds(claimed_at: str) -> float:
     return (_hermes_now() - datetime.fromisoformat(claimed_at)).total_seconds()
 
 
+def _terminal_retention_days() -> float:
+    """``cron.executions_retention_days``; non-positive disables time pruning (row cap only)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return float(cron_cfg.get("executions_retention_days", RETENTION_DAYS))
+    except Exception:
+        return float(RETENTION_DAYS)
+
+
+def _terminal_min_per_job() -> int:
+    """``cron.executions_min_per_job``; 0 disables the per-job floor."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return max(0, int(cron_cfg.get("executions_min_per_job", MIN_PER_JOB)))
+    except Exception:
+        return max(0, int(MIN_PER_JOB))
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    # Time rule first (never guess into deletion: a row with no parseable terminal stamp is
+    # kept), then the per-job floor, then the row-count backstop.
+    retention_days = _terminal_retention_days()
+    if retention_days > 0:
+        cutoff = (_hermes_now() - timedelta(days=retention_days)).isoformat()
+        storable: List[str] = [
+            row["id"] for row in conn.execute(
+                """SELECT id, finished_at FROM executions
+                   WHERE status IN ('completed','failed','unknown')"""
+            ).fetchall()
+            if _finished_at_within(row["finished_at"], cutoff)
+        ]
+        floor = _terminal_min_per_job()
+        if floor > 0:
+            storable = _apply_per_job_floor(conn, storable, floor)
+        if storable:
+            placeholders = ",".join("?" for _ in storable)
+            conn.execute(
+                f"DELETE FROM executions WHERE id IN ({placeholders})", storable)
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
@@ -179,6 +227,42 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
+
+
+def _finished_at_within(finished_at: Any, cutoff_iso: str) -> bool:
+    """True when ``finished_at`` is a timestamp STRICTLY OLDER than the cutoff. Unparseable or
+    missing stamps return False — a row we cannot date is never pruned by the time rule."""
+    if not isinstance(finished_at, str) or not finished_at.strip():
+        return False
+    try:
+        finished = datetime.fromisoformat(finished_at)
+        cutoff = datetime.fromisoformat(cutoff_iso)
+    except ValueError:
+        return False
+    if finished.tzinfo is None or cutoff.tzinfo is None:
+        return False
+    return finished < cutoff
+
+
+def _apply_per_job_floor(
+    conn: sqlite3.Connection, prunable_ids: List[str], floor: int,
+) -> List[str]:
+    """Drop from *prunable_ids* each job's ``floor`` newest terminal rows (they stay)."""
+    protected: set[str] = set()
+    per_job_counts: Dict[str, int] = {}
+    id_set = set(prunable_ids)
+    for row in conn.execute(
+        """SELECT id, job_id FROM executions
+           WHERE status IN ('completed','failed','unknown')
+           ORDER BY job_id, finished_at DESC, claimed_at DESC, id DESC"""
+    ).fetchall():
+        if row["id"] not in id_set:
+            continue  # already surviving (young enough or underivable stamp)
+        job_id = row["job_id"]
+        if per_job_counts.get(job_id, 0) < floor:
+            protected.add(row["id"])
+            per_job_counts[job_id] = per_job_counts.get(job_id, 0) + 1
+    return [rid for rid in prunable_ids if rid not in protected]
 
 
 def create_execution(

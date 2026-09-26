@@ -190,7 +190,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_notepad.add_argument("key", nargs="?", help="Notepad key (get/set/delete)")
     cron_notepad.add_argument("value", nargs="?", help="Value to store (set)")
 
-    cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
+    cron_doctor_parser = cron_subparsers.add_parser(
+        "doctor", help="Check scheduled jobs for common health issues")
+    _flag(cron_doctor_parser, "--prune",
+        help="Remove orphaned cron/output/ directories reported by doctor (destructive)")
 
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
