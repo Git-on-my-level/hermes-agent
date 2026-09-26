@@ -117,11 +117,28 @@ def test_per_job_floor_keeps_newest_rows_beyond_retention(ledger, monkeypatch):
 
 def test_row_cap_still_bounds_growth_as_backstop(ledger, monkeypatch):
     monkeypatch.setattr(ledger, "_terminal_retention_days", lambda: 0.0)  # time pruning off
+    monkeypatch.setattr(ledger, "_terminal_min_per_job", lambda: 0)
     monkeypatch.setattr(ledger, "MAX_TERMINAL_EXECUTIONS", 3)
     for index in range(8):
         _finish(ledger, f"job-{index}")
 
     assert len(_terminal_rows(ledger)) == 3
+
+
+def test_row_cap_does_not_starve_quiet_job_below_floor(ledger, monkeypatch):
+    """In-window noisy jobs must not evict a quiet job's floor via the host-wide cap."""
+    monkeypatch.setattr(ledger, "_terminal_retention_days", lambda: 14.0)
+    monkeypatch.setattr(ledger, "_terminal_min_per_job", lambda: 1)
+    monkeypatch.setattr(ledger, "MAX_TERMINAL_EXECUTIONS", 5)
+    _finish(ledger, "quiet")
+    for _ in range(8):
+        _finish(ledger, "watchdog-a")
+        _finish(ledger, "watchdog-b")
+
+    jobs = [r["job_id"] for r in _terminal_rows(ledger)]
+    assert "quiet" in jobs
+    assert jobs.count("quiet") == 1
+    assert len(jobs) == 5
 
 
 def test_time_pruning_disabled_by_nonpositive_retention(ledger, monkeypatch):

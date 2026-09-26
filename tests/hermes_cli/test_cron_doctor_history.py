@@ -98,6 +98,27 @@ def test_failure_rate_below_threshold_not_reported(store):
     assert _cron_doctor_history_findings([]) == []
 
 
+def test_failure_rate_ignores_rows_outside_retention_window(store, monkeypatch):
+    monkeypatch.setattr(executions, "_terminal_retention_days", lambda: 14.0)
+    job = jobs.create_job(prompt="x", schedule="every 1h")
+    for index in range(3):
+        _ledger_row(store, job["id"], status="failed", age_days=20 + index)
+    _ledger_row(store, job["id"], status="completed", age_days=1)
+    _ledger_row(store, job["id"], status="completed", age_days=2)
+
+    assert _cron_doctor_history_findings([]) == []
+
+
+def test_failure_rate_window_matches_configured_retention_days(store, monkeypatch):
+    monkeypatch.setattr(executions, "_terminal_retention_days", lambda: 30.0)
+    job = jobs.create_job(prompt="x", schedule="every 1h")
+    for index in range(3):
+        _ledger_row(store, job["id"], status="failed", age_days=20 + index)
+
+    findings = _cron_doctor_history_findings([])
+    assert any("failed 3/3 runs in the last 30 days" in line for line in findings)
+
+
 def test_orphan_output_dirs_reported_excluding_known_records(store):
     job = jobs.create_job(prompt="x", schedule="every 1h")
     (store.OUTPUT_DIR / job["id"]).mkdir(parents=True)
@@ -147,6 +168,26 @@ def test_expect_output_watchdog_pause_flagged_as_dark(store, monkeypatch):
 
     assert len(findings) == 1
     assert "watchdog" in findings[0] and "dark" in findings[0]
+
+
+def test_completed_oneshot_is_not_reported_as_dark(store):
+    source = jobs.create_job(
+        prompt="watch", schedule="every 5m", name="oneshot-watch",
+        script="watch.py", no_agent=True)
+    dependent = jobs.create_job(prompt="dep", schedule="every 1h", name="dep-job")
+    records = jobs.load_jobs()
+    for record in records:
+        if record["id"] == source["id"]:
+            record["expect_output"] = True
+            record["state"] = "completed"
+            record["enabled"] = False
+        if record["id"] == dependent["id"]:
+            record["context_from"] = [source["id"]]
+    jobs.save_jobs(records)
+
+    findings = _cron_doctor_pause_propagation_findings(jobs.list_jobs(include_disabled=False))
+
+    assert findings == []
 
 
 def test_doctor_prune_reaps_orphans_and_reports(store, monkeypatch, capsys):

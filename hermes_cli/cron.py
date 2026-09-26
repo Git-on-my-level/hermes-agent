@@ -4,7 +4,7 @@ import contextlib
 import json
 import re
 import sys
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -746,13 +746,19 @@ def _cron_doctor_history_findings(jobs: List[Dict[str, Any]]) -> List[str]:
     try:
         try:
             rows = conn.execute(
-                "SELECT job_id, status FROM executions").fetchall()
+                "SELECT job_id, status, finished_at FROM executions").fetchall()
         except Exception:
             return []
     finally:
         conn.close()
     if not rows:
         return []
+
+    retention_days = _history_window_days()
+    cutoff_iso = None
+    if retention_days > 0:
+        from hermes_time import now as hermes_now
+        cutoff_iso = (hermes_now() - timedelta(days=retention_days)).isoformat()
 
     known_ids = {str(job.get("id")) for job in list_jobs(include_disabled=True)}
     ghost_running: Dict[str, int] = {}
@@ -767,6 +773,9 @@ def _cron_doctor_history_findings(jobs: List[Dict[str, Any]]) -> List[str]:
             else:
                 ghost_terminal[job_id] = ghost_terminal.get(job_id, 0) + 1
         elif status in ("completed", "failed"):
+            if cutoff_iso is not None and not executions_module._finished_at_on_or_after(
+                    row["finished_at"], cutoff_iso):
+                continue
             attempt_windows.setdefault(job_id, []).append(1 if status == "failed" else 0)
 
     findings: List[str] = []
@@ -782,24 +791,30 @@ def _cron_doctor_history_findings(jobs: List[Dict[str, Any]]) -> List[str]:
         findings.append(
             f"{terminal} execution record(s) for unknown job '{job_id}' — "
             "the job is gone but its history remains")
+    window = _failure_rate_window_label(retention_days)
     for job_id, outcomes in sorted(attempt_windows.items()):
         total = len(outcomes)
         failed = sum(outcomes)
         if total >= 3 and failed / total >= 0.5:
             findings.append(
-                f"job '{job_id}' failed {failed}/{total} runs in the last "
-                f"{_history_window_days()} days")
+                f"job '{job_id}' failed {failed}/{total} runs {window}")
     return findings
 
 
-def _history_window_days() -> str:
-    """The failure-rate window, formatted for the finding line (mirrors ledger retention)."""
+def _history_window_days() -> float:
+    """Configured ``cron.executions_retention_days``; non-positive means no time window."""
     try:
         from cron import executions as executions_module
-        days = float(executions_module.RETENTION_DAYS)
+        return float(executions_module._terminal_retention_days())
     except Exception:
-        days = 14.0
-    return f"{days:g}"
+        return 14.0
+
+
+def _failure_rate_window_label(days: float) -> str:
+    """User-facing window for the failure-rate finding (matches the filter)."""
+    if days > 0:
+        return f"in the last {days:g} days"
+    return "in retained history"
 
 
 def _cron_doctor_orphan_output_dirs(jobs: List[Dict[str, Any]]) -> List[tuple]:
@@ -841,6 +856,8 @@ def _cron_doctor_pause_propagation_findings(jobs: List[Dict[str, Any]]) -> List[
         if active:
             continue
         state = str(source_job.get("state") or "").strip()
+        if state == "completed":
+            continue  # finished one-shot, not a paused/disabled capability
         if not state and source_job.get("enabled", True):
             continue
         paused_days = _paused_age_days(source_job)

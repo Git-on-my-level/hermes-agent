@@ -30,7 +30,8 @@ EXECUTIONS_FILE: Optional[Path] = None
 # secondarily by the row-count backstop below. A pure row cap made retention a function of the
 # noisiest job on the host — two 2-minute watchdogs evicted every daily job's history inside a
 # day, so no failure rate was computable. A per-job floor (MIN_PER_JOB) keeps the N newest
-# terminal rows per job past the time cutoff so a weekly job is never starved by a busy one.
+# terminal rows per job through BOTH the time cutoff and the row-count backstop so a weekly
+# job is never starved by a busy one.
 RETENTION_DAYS = 14.0
 MIN_PER_JOB = 10
 MAX_TERMINAL_EXECUTIONS = 1000
@@ -201,8 +202,10 @@ def _terminal_min_per_job() -> int:
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     # Time rule first (never guess into deletion: a row with no parseable terminal stamp is
-    # kept), then the per-job floor, then the row-count backstop.
+    # kept), then the per-job floor, then the row-count backstop. The floor also applies to
+    # the backstop: in-window noisy jobs would otherwise still starve quiet ones.
     retention_days = _terminal_retention_days()
+    floor = _terminal_min_per_job()
     if retention_days > 0:
         cutoff = (_hermes_now() - timedelta(days=retention_days)).isoformat()
         storable: List[str] = [
@@ -212,36 +215,80 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
             ).fetchall()
             if _finished_at_within(row["finished_at"], cutoff)
         ]
-        floor = _terminal_min_per_job()
         if floor > 0:
             storable = _apply_per_job_floor(conn, storable, floor)
-        if storable:
-            placeholders = ",".join("?" for _ in storable)
-            conn.execute(
-                f"DELETE FROM executions WHERE id IN ({placeholders})", storable)
-    conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
-    )
+        _delete_execution_ids(conn, storable)
+    _apply_row_cap(conn, floor)
+
+
+def _aware_stamps(
+    finished_at: Any, cutoff_iso: str,
+) -> Optional[tuple[datetime, datetime]]:
+    """Parse ``finished_at`` and the cutoff as aware datetimes, or None if either is unusable."""
+    if not isinstance(finished_at, str) or not finished_at.strip():
+        return None
+    try:
+        finished = datetime.fromisoformat(finished_at)
+        cutoff = datetime.fromisoformat(cutoff_iso)
+    except ValueError:
+        return None
+    if finished.tzinfo is None or cutoff.tzinfo is None:
+        return None
+    return finished, cutoff
 
 
 def _finished_at_within(finished_at: Any, cutoff_iso: str) -> bool:
     """True when ``finished_at`` is a timestamp STRICTLY OLDER than the cutoff. Unparseable or
     missing stamps return False — a row we cannot date is never pruned by the time rule."""
-    if not isinstance(finished_at, str) or not finished_at.strip():
-        return False
-    try:
-        finished = datetime.fromisoformat(finished_at)
-        cutoff = datetime.fromisoformat(cutoff_iso)
-    except ValueError:
-        return False
-    if finished.tzinfo is None or cutoff.tzinfo is None:
-        return False
-    return finished < cutoff
+    stamps = _aware_stamps(finished_at, cutoff_iso)
+    return stamps is not None and stamps[0] < stamps[1]
+
+
+def _finished_at_on_or_after(finished_at: Any, cutoff_iso: str) -> bool:
+    """True when ``finished_at`` is parseable and at least the cutoff. Unparseable → False."""
+    stamps = _aware_stamps(finished_at, cutoff_iso)
+    return stamps is not None and stamps[0] >= stamps[1]
+
+
+def _delete_execution_ids(conn: sqlite3.Connection, ids: List[str]) -> None:
+    """Delete by id in chunks so a large prune stays under SQLite's bound-variable ceiling."""
+    if not ids:
+        return
+    for start in range(0, len(ids), 900):
+        chunk = ids[start:start + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(f"DELETE FROM executions WHERE id IN ({placeholders})", chunk)
+
+
+def _apply_row_cap(conn: sqlite3.Connection, floor: int) -> None:
+    """Drop oldest terminal extras past ``MAX_TERMINAL_EXECUTIONS``, honoring the per-job floor.
+
+    Each job's ``floor`` newest terminal rows are ineligible for the cap, so two in-window
+    watchdogs cannot evict a quiet job's history. If protected rows already exceed the cap,
+    the floor wins — the cap only trims unprotected extras.
+    """
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    rows = conn.execute(
+        """SELECT id FROM executions
+           WHERE status IN ('completed','failed','unknown')
+           ORDER BY finished_at DESC, claimed_at DESC, id DESC"""
+    ).fetchall()
+    if len(rows) <= cap:
+        return
+    all_ids = [row["id"] for row in rows]
+    prunable = _apply_per_job_floor(conn, all_ids, floor) if floor > 0 else all_ids
+    extra_slots = max(0, cap - (len(all_ids) - len(prunable)))
+    prunable_set = set(prunable)
+    to_delete: List[str] = []
+    kept_extra = 0
+    for row_id in all_ids:  # newest first
+        if row_id not in prunable_set:
+            continue
+        if kept_extra < extra_slots:
+            kept_extra += 1
+            continue
+        to_delete.append(row_id)
+    _delete_execution_ids(conn, to_delete)
 
 
 def _apply_per_job_floor(
