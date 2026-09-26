@@ -2734,7 +2734,8 @@ def _sweep_completed_oneshots(
     """Prune completed one-shot records past retention (in place; True when anything was removed).
     Removed ids go into *removed_ids* so save_jobs's shrink-merge guard allows the delete. Age is
     measured from ``last_run_at``; a record without a parseable one is kept (never guess into
-    deletion)."""
+    deletion). The removed record's output directory goes with it — record retention without
+    output GC is what accumulated months of orphaned ``cron/output/<id>/`` dirs (#37)."""
     retention_days = _completed_oneshot_retention_days()
     if retention_days <= 0:
         return False
@@ -2756,12 +2757,60 @@ def _sweep_completed_oneshots(
             rid = rj.get("id")
             if removed_ids is not None and rid:
                 removed_ids.add(str(rid))
+            _rmtree_job_output_quietly(rid, context="completed-one-shot retention sweep")
             logger.info(
                 "Job '%s': pruning completed one-shot record (finished %s, retention %.1f days)",
                 rj.get("name", rj.get("id", "?")), last_run, retention_days)
         except Exception:
             logger.debug(
                 "Retention sweep skipped malformed job record %r", rj.get("id", "?"), exc_info=True)
+    return removed
+
+
+def _rmtree_job_output_quietly(job_id: Any, *, context: str) -> None:
+    """Remove ``cron/output/<job_id>/`` best-effort; failures log and never raise. The id is
+    validated by _job_output_dir (single safe path component), so the target cannot escape."""
+    if not job_id:
+        return
+    try:
+        job_output_dir = _job_output_dir(str(job_id))
+        if job_output_dir.exists():
+            shutil.rmtree(job_output_dir)
+    except Exception:
+        logger.debug(
+            "Failed to remove output directory for job %r during %s",
+            job_id, context, exc_info=True)
+
+
+def prune_orphan_output(live_job_ids: Set[str]) -> List[Tuple[str, int]]:
+    """Remove ``cron/output/`` directories whose job id is not in *live_job_ids*.
+
+    Orphans accumulate from record-removal paths that predate output GC (retention sweeps,
+    retired one-shots) and from hand-edited stores. Operator-invoked (``hermes cron doctor
+    --prune``), never the scheduler tick: deletion needs an explicit ask. Returns
+    ``(job_id, files_removed)`` pairs, sorted oldest first; failures are reported as a
+    count of -1 and left in place."""
+    removed: List[Tuple[str, int]] = []
+    output_root = _current_cron_store().output_dir
+    if not output_root.is_dir():
+        return removed
+    for child in sorted(output_root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        if child.name in live_job_ids:
+            continue
+        try:
+            file_count = sum(1 for p in child.rglob("*") if p.is_file())
+        except OSError:
+            file_count = -1
+        try:
+            shutil.rmtree(child)
+            removed.append((child.name, file_count))
+            logger.info(
+                "Pruned orphaned cron output directory %s (%s files)", child.name, file_count)
+        except OSError as exc:
+            logger.warning("Failed to prune orphaned cron output %s: %s", child.name, exc)
+            removed.append((child.name, -1))
     return removed
 
 
