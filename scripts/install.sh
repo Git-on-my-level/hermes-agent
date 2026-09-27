@@ -1545,6 +1545,27 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
 
+            # Resolve the target branch against THIS checkout's actual origin.
+            # The fork default (HERMES_INSTALL_BRANCH / prod) only exists on the
+            # fork's remote: checkouts whose origin is upstream (fresh installs
+            # from NousResearch, mirrors, synthetic fixtures) have no prod, and
+            # hard-pinning it makes every fetch/checkout/reset fail while the
+            # stage still reported success (regression from ae4c1c96d4). Follow
+            # the checkout's own default branch in that case; fail loudly when
+            # the remote is unreachable entirely.
+            if ! git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+                local default_branch
+                default_branch="$(git ls-remote --symref origin HEAD 2>/dev/null \
+                    | awk 'NR==1 && /^ref: refs\/heads\// {sub(/^ref: refs\/heads\//, ""); sub(/\t.*$/, ""); print; exit}')"
+                if [ -z "$default_branch" ]; then
+                    log_error "Branch '$BRANCH' not found on origin and the remote is unreachable."
+                    log_error "Check network access / the checkout's 'origin' remote, or pass --branch explicitly."
+                    exit 1
+                fi
+                log_warn "Branch '$BRANCH' not found on origin; following the checkout's default branch '$default_branch'."
+                BRANCH="$default_branch"
+            fi
+
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
             if [ -n "$(git status --porcelain)" ]; then
@@ -1573,8 +1594,14 @@ clone_repo() {
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
+            if ! git fetch origin "$BRANCH"; then
+                log_error "Could not fetch '$BRANCH' from origin — repository stage failed."
+                exit 1
+            fi
+            if ! git checkout "$BRANCH"; then
+                log_error "Could not check out '$BRANCH' — repository stage failed."
+                exit 1
+            fi
             # Managed installs should follow origin/$BRANCH exactly. If the
             # checkout has diverged (or has local-only commits), ff-only pull
             # cannot succeed — mirror ``hermes update`` and reset to the
