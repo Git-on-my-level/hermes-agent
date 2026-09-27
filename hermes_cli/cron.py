@@ -4,7 +4,7 @@ import contextlib
 import json
 import re
 import sys
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -645,26 +645,251 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     return issues
 
 
-def cron_doctor() -> int:
-    """Run read-only cron health checks and return a shell-friendly status."""
+def cron_doctor(args=None) -> int:
+    """Run read-only cron health checks and return a shell-friendly status.
+
+    With ``args.prune`` set, orphaned ``cron/output/`` directories are removed after being
+    reported (the only destructive path in doctor; never runs from the scheduler)."""
     from cron.jobs import list_jobs
     jobs = list_jobs(include_disabled=False)
     findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
-    if not findings:
+    history_lines = _cron_doctor_history_findings(jobs)
+    orphan_dirs = _cron_doctor_orphan_output_dirs(jobs)
+    dependency_findings = _cron_doctor_pause_propagation_findings(jobs)
+    if not findings and not history_lines and not orphan_dirs and not dependency_findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
         print(color(note, Colors.DIM))
         return 0
     issue_count = sum(len(issues) for _, issues in findings)
-    print(color(f"Cron doctor found {issue_count} issue(s) across {len(findings)} job(s):", Colors.YELLOW))
-    print()
+    if issue_count or history_lines or orphan_dirs or dependency_findings:
+        print(color("Cron doctor found issues:", Colors.YELLOW))
+        print()
     for job, issues in findings:
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {job.get('name', '(unnamed)')}")
         for issue in issues:
             print(f"    - {issue}")
+    if dependency_findings:
+        print()
+        for line in dependency_findings:
+            print(f"  {color('⚠', Colors.YELLOW)} {line}")
+    if history_lines:
+        print()
+        print(color("  Execution history:", Colors.YELLOW))
+        for line in history_lines:
+            print(f"    - {line}")
+    if orphan_dirs:
+        print()
+        print(color(f"  {len(orphan_dirs)} orphaned output director(y/ies) "
+                    f"(no matching job record):", Colors.YELLOW))
+        for job_id, file_count in orphan_dirs:
+            print(f"    - {job_id} ({'?' if file_count < 0 else file_count} file(s))")
+        if getattr(args, "prune", None):
+            from cron.jobs import prune_orphan_output
+            known_ids = _all_store_job_ids()
+            removed = prune_orphan_output(known_ids)
+            reaped = [job_id for job_id, _ in removed if _ >= 0]
+            failed = [job_id for job_id, count in removed if count < 0]
+            print(color(f"  Pruned {len(reaped)} orphaned director(y/ies).", Colors.GREEN)
+                  if reaped else color("  Nothing pruned.", Colors.DIM))
+            for job_id in failed:
+                print(color(f"  Could not prune {job_id} (see log).", Colors.YELLOW))
+        else:
+            print(color("  Run `hermes cron doctor --prune` to remove them.", Colors.DIM))
     print()
     print(color("Review the findings above, then run `hermes cron doctor` again.", Colors.DIM))
     return 1
+
+
+def _all_store_job_ids() -> set:
+    """Every job id in the store (disabled and completed included) — the set that owns output."""
+    from cron.jobs import list_jobs
+    return {str(job.get("id")) for job in list_jobs(include_disabled=True)}
+
+
+def _read_only_executions_connection():
+    """Read-only connection to this profile's executions ledger, EXECUTIONS_FILE honoured.
+
+    Returns ``None`` when the ledger does not exist yet (fresh install) — absence of history
+    is not a finding. Read-only URI mode can never write, so doctor stays safe beside a live
+    scheduler; a corrupt store is reported as no history rather than crashing the doctor."""
+    import sqlite3
+    from cron import executions as executions_module
+
+    path = executions_module.EXECUTIONS_FILE
+    if path is None:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home().resolve() / "cron" / "executions.db"
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("SELECT 1").fetchone()
+    except sqlite3.Error:
+        conn.close()
+        return None
+    return conn
+
+
+def _cron_doctor_history_findings(jobs: List[Dict[str, Any]]) -> List[str]:
+    """History-based findings the job records cannot see (#37): executions whose job no longer
+    exists (invisible to the job loop by construction), and per-job failure rates over the
+    retention window."""
+    del jobs  # live ids are resolved from the full store (disabled records still own history)
+    from cron import executions as executions_module
+    from cron.jobs import list_jobs
+
+    conn = _read_only_executions_connection()
+    if conn is None:
+        return []
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT job_id, status, finished_at FROM executions").fetchall()
+        except Exception:
+            return []
+    finally:
+        conn.close()
+    if not rows:
+        return []
+
+    retention_days = _history_window_days()
+    cutoff_iso = None
+    if retention_days > 0:
+        from hermes_time import now as hermes_now
+        cutoff_iso = (hermes_now() - timedelta(days=retention_days)).isoformat()
+
+    known_ids = {str(job.get("id")) for job in list_jobs(include_disabled=True)}
+    ghost_running: Dict[str, int] = {}
+    ghost_terminal: Dict[str, int] = {}
+    attempt_windows: Dict[str, List[int]] = {}
+    for row in rows:
+        job_id = str(row["job_id"])
+        status = str(row["status"])
+        if job_id not in known_ids:
+            if status in ("claimed", "running"):
+                ghost_running[job_id] = ghost_running.get(job_id, 0) + 1
+            else:
+                ghost_terminal[job_id] = ghost_terminal.get(job_id, 0) + 1
+        elif status in ("completed", "failed"):
+            if cutoff_iso is not None and not executions_module._finished_at_on_or_after(
+                    row["finished_at"], cutoff_iso):
+                continue
+            attempt_windows.setdefault(job_id, []).append(1 if status == "failed" else 0)
+
+    findings: List[str] = []
+    for job_id, running in sorted(ghost_running.items()):
+        terminal = ghost_terminal.get(job_id, 0)
+        findings.append(
+            f"{running} execution(s) RUNNING for unknown job '{job_id}' "
+            f"({terminal} terminal) — fired while absent from the job store; "
+            "stale scheduler or removed store?")
+    for job_id, terminal in sorted(ghost_terminal.items()):
+        if job_id in ghost_running:
+            continue
+        findings.append(
+            f"{terminal} execution record(s) for unknown job '{job_id}' — "
+            "the job is gone but its history remains")
+    window = _failure_rate_window_label(retention_days)
+    for job_id, outcomes in sorted(attempt_windows.items()):
+        total = len(outcomes)
+        failed = sum(outcomes)
+        if total >= 3 and failed / total >= 0.5:
+            findings.append(
+                f"job '{job_id}' failed {failed}/{total} runs {window}")
+    return findings
+
+
+def _history_window_days() -> float:
+    """Configured ``cron.executions_retention_days``; non-positive means no time window."""
+    try:
+        from cron import executions as executions_module
+        return float(executions_module._terminal_retention_days())
+    except Exception:
+        return 14.0
+
+
+def _failure_rate_window_label(days: float) -> str:
+    """User-facing window for the failure-rate finding (matches the filter)."""
+    if days > 0:
+        return f"in the last {days:g} days"
+    return "in retained history"
+
+
+def _cron_doctor_orphan_output_dirs(jobs: List[Dict[str, Any]]) -> List[tuple]:
+    """``cron/output/`` directories with no matching job record (any record, not just active)."""
+    from cron.jobs import list_jobs, _current_cron_store
+
+    output_root = _current_cron_store().output_dir
+    if not output_root.is_dir():
+        return []
+    known_ids = {str(job.get("id")) for job in list_jobs(include_disabled=True)}
+    orphans: List[tuple] = []
+    for child in sorted(output_root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir() or child.name in known_ids:
+            continue
+        try:
+            file_count = sum(1 for p in child.rglob("*") if p.is_file())
+        except OSError:
+            file_count = -1
+        orphans.append((child.name, file_count))
+    return orphans
+
+
+def _cron_doctor_pause_propagation_findings(jobs: List[Dict[str, Any]]) -> List[str]:
+    """What goes dark when a job is paused (#37 §4): dependents chained via ``context_from``
+    read a paused job's last output forever, and a paused ``expect_output`` watchdog is a
+    capability that is dark, not just a context source that is stale."""
+    from cron.jobs import list_jobs
+
+    all_jobs = list_jobs(include_disabled=True)
+    by_id = {str(job.get("id")): job for job in all_jobs}
+    dependents: Dict[str, List[Dict[str, Any]]] = {}
+    for job in all_jobs:
+        for source_id in (job.get("context_from") or []):
+            dependents.setdefault(str(source_id), []).append(job)
+
+    findings: List[str] = []
+    for source_id, source_job in by_id.items():
+        active = any(str(job.get("id")) == source_id for job in jobs)
+        if active:
+            continue
+        state = str(source_job.get("state") or "").strip()
+        if state == "completed":
+            continue  # finished one-shot, not a paused/disabled capability
+        if not state and source_job.get("enabled", True):
+            continue
+        paused_days = _paused_age_days(source_job)
+        dark_note = ""
+        if source_job.get("no_agent") and source_job.get("expect_output"):
+            dark_note = (" It declares expect_output — a watchdog that cannot bark is "
+                         "dark, not quiet.")
+        for dependent in dependents.get(source_id, []):
+            if not dependent.get("enabled", True) or dependent.get("state") in ("paused", "completed"):
+                continue
+            findings.append(
+                f"job '{dependent.get('name') or dependent.get('id')}' chains context_from "
+                f"'{source_job.get('name') or source_id}' which is {state or 'disabled'} "
+                f"for {paused_days} — its runs read stale context.{dark_note}")
+        if dark_note and not dependents.get(source_id):
+            findings.append(
+                f"expect_output watchdog '{source_job.get('name') or source_id}' is "
+                f"{state or 'disabled'} — dark for {paused_days}.{dark_note}")
+    return findings
+
+
+def _paused_age_days(job: Dict[str, Any]) -> str:
+    from datetime import datetime
+
+    paused_at = job.get("paused_at")
+    try:
+        delta = datetime.fromisoformat(str(paused_at))
+        from hermes_time import now as hermes_now
+        days = (hermes_now() - delta).total_seconds() / 86400
+        return f"{days:.0f}d" if days >= 1 else "less than a day"
+    except (TypeError, ValueError):
+        return "an unknown duration"
 
 
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
@@ -907,7 +1132,7 @@ def cron_notepad(args) -> int:
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
     "status": lambda a: cron_status() or 0,
-    "doctor": lambda a: cron_doctor(),
+    "doctor": lambda a: cron_doctor(a),
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),

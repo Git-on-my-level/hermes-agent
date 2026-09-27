@@ -1820,6 +1820,14 @@ DEFAULT_CONFIG = {
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,
+        # Execution-ledger terminal rows are kept for this many days (the failure-rate window
+        # `cron doctor` reports over); 0 or negative disables time pruning and keeps only the
+        # row-count backstop. Replaces the old count-only cap so a couple of 2-minute watchdogs
+        # can no longer evict a weekly job's whole history.
+        "executions_retention_days": 14,
+        # Minimum terminal rows kept PER JOB past the retention cutoff, so a quiet job is never
+        # starved by a noisy one; 0 disables the floor.
+        "executions_min_per_job": 10,
         # Timeout (seconds) for a no-agent cron script. Env: HERMES_CRON_SCRIPT_TIMEOUT. Keep in
         # sync with cron.scheduler._DEFAULT_SCRIPT_TIMEOUT.
         "script_timeout_seconds": 3600,

@@ -168,6 +168,7 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
 def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
+    monkeypatch.setattr(executions, "_terminal_min_per_job", lambda: 0)
     inflight = executions.create_execution("live", source="builtin")
     executions.mark_execution_running(inflight["id"])
     for index in range(8):
@@ -184,6 +185,7 @@ def test_recently_finished_long_running_execution_survives_retention(
 ):
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
+    monkeypatch.setattr(executions, "_terminal_min_per_job", lambda: 0)
     long_running = executions.create_execution("long-running", source="builtin")
     assert executions.mark_execution_running(long_running["id"]) is not None
     newer = executions.create_execution("newer", source="builtin")
