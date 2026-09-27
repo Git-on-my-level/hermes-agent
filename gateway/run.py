@@ -4800,11 +4800,15 @@ def _telegram_watchdog_rearm_once(adapter) -> bool:
     with it and nothing ever logs. The gateway housekeeping thread outlives adapter tasks, so it
     can see the gap and restart the watchdog; a re-armed watchdog then detects the dead poller
     itself (stall / pending-queue checks) and escalates through the normal recovery ladder.
-    Never touches a live heartbeat, a webhook-mode adapter, or a torn-down/fatal adapter.
+    Never touches a live heartbeat, a webhook-mode adapter, a torn-down/fatal adapter,
+    or one that is not yet marked connected (``_running`` is set only by ``_mark_connected``).
     """
     if adapter is None or getattr(adapter, "_webhook_mode", False):
         return False
     if getattr(adapter, "_teardown_started", False) or getattr(adapter, "has_fatal_error", False):
+        return False
+    # Silent-deaf (poller tree died) leaves the adapter marked connected; mid-connect does not.
+    if not getattr(adapter, "_running", False):
         return False
     task = getattr(adapter, "_polling_heartbeat_task", None)
     if task is not None and not task.done():
@@ -4816,36 +4820,48 @@ def _telegram_watchdog_rearm_once(adapter) -> bool:
     return True
 
 
-def _housekeeping_telegram_watchdog_rearm(adapters, loop) -> None:
+def _housekeeping_telegram_watchdog_rearm(adapters, loop, runner=None) -> None:
     """Housekeeping chore: restore the Telegram watchdog that died with its task tree.
 
     Zero Bot API calls and a no-op while healthy: every live heartbeat short-circuits this.
     See `_telegram_watchdog_rearm_once` for the failure class this closes.
+    Walks the launch map *and* every multiplex secondary (``runner._profile_adapters``);
+    ``runner.adapters`` is the launch profile only.
     """
-    if adapters is None or loop is None:
+    if loop is None:
         return
-    for platform, adapter in list(adapters.items()):
-        try:
-            platform_name = getattr(platform, "value", str(platform))
-        except Exception:
-            platform_name = str(platform)
-        if platform_name != "telegram":
+    maps = []
+    if adapters:
+        maps.append(adapters)
+    if runner is not None:
+        maps.extend((getattr(runner, "_profile_adapters", {}) or {}).values())
+    seen = set()
+    for adapter_map in maps:
+        if not adapter_map:
             continue
-
-        async def _rearm(adapter=adapter):
-            return _telegram_watchdog_rearm_once(adapter)
-
-        try:
-            fut = safe_schedule_threadsafe(_rearm(), loop, logger=logger,
-                                           log_message="Telegram watchdog re-arm scheduling error")
-        except Exception as exc:
-            logger.debug("Telegram watchdog re-arm check failed for %s: %s", platform_name, exc)
-            continue
-        if fut is not None:
+        for platform, adapter in list(adapter_map.items()):
             try:
-                fut.result(timeout=10)
+                platform_name = getattr(platform, "value", str(platform))
+            except Exception:
+                platform_name = str(platform)
+            if platform_name != "telegram" or adapter is None or id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+
+            async def _rearm(adapter=adapter):
+                return _telegram_watchdog_rearm_once(adapter)
+
+            try:
+                fut = safe_schedule_threadsafe(_rearm(), loop, logger=logger,
+                                               log_message="Telegram watchdog re-arm scheduling error")
             except Exception as exc:
-                logger.debug("Telegram watchdog re-arm failed for %s: %s", platform_name, exc)
+                logger.debug("Telegram watchdog re-arm check failed for %s: %s", platform_name, exc)
+                continue
+            if fut is not None:
+                try:
+                    fut.result(timeout=10)
+                except Exception as exc:
+                    logger.debug("Telegram watchdog re-arm failed for %s: %s", platform_name, exc)
 
 
 def _start_gateway_housekeeping(
@@ -4870,7 +4886,7 @@ def _start_gateway_housekeeping(
         # Outer-ring Telegram watchdog supervisor: the heartbeat lives in the adapter's task tree and
         # historically died WITH it (poller dead, zero log lines, gateway alive-but-deaf). The check
         # runs every tick on the gateway loop (no Bot API calls) and is a no-op while the watchdog is alive.
-        chores.append((1, "Telegram watchdog re-arm", lambda: _housekeeping_telegram_watchdog_rearm(adapters, loop)))
+        chores.append((1, "Telegram watchdog re-arm", lambda: _housekeeping_telegram_watchdog_rearm(adapters, loop, runner)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", _housekeeping_media_caches),

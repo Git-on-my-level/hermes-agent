@@ -13,12 +13,14 @@ Two regressions:
 * gateway: ``_housekeeping_telegram_watchdog_rearm`` (housekeeping thread, outside the
   adapter task tree) re-arms a dead heartbeat so the normal stall/queue detectors run
   again and escalate through the recovery ladder. No-op while alive; never touches
-  webhook-mode, torn-down, or fatal adapters.
+  webhook-mode, torn-down, fatal, or not-yet-connected adapters. Walks every served
+  profile's adapter map, not only the launch profile.
 """
 import asyncio
 import contextlib
 import logging
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -42,10 +44,11 @@ async def _cancel_heartbeat(adapter) -> None:
 
 
 def _polling_adapter() -> TelegramAdapter:
-    """Polling-mode adapter with no heartbeat running (post-loss state)."""
+    """Polling-mode adapter with no heartbeat running (post-loss connected state)."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._webhook_mode = False
     adapter._polling_heartbeat_task = None
+    adapter._running = True
     return adapter
 
 
@@ -115,6 +118,15 @@ def test_rearm_skips_non_polling_or_retired_adapters(mode):
     assert adapter._polling_heartbeat_task is None
 
 
+def test_rearm_skips_while_not_connected():
+    """``connect()`` clears webhook/teardown before ``_running``; mid-connect must not grow a watchdog."""
+    adapter = _polling_adapter()
+    adapter._running = False
+    changed = _telegram_watchdog_rearm_once(adapter)
+    assert changed is False
+    assert adapter._polling_heartbeat_task is None
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_standdown_logs_once(monkeypatch, caplog):
     """The stand-down return must log once, not silently (lost-handoff visibility)."""
@@ -169,6 +181,41 @@ def test_housekeeping_chore_noop_without_adapters_or_loop():
     """Missing adapters/loop (external providers) is a safe no-op."""
     _housekeeping_telegram_watchdog_rearm(None, None)
     _housekeeping_telegram_watchdog_rearm({}, None)
+
+
+def test_housekeeping_chore_rearms_secondary_profile_adapters():
+    """Multiplex secondaries live in ``runner._profile_adapters``, not the launch map."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    primary = secondary = None
+    try:
+        primary = _polling_adapter()
+        secondary = _polling_adapter()
+        runner = SimpleNamespace(_profile_adapters={"coder": {Platform.TELEGRAM: secondary}})
+        _housekeeping_telegram_watchdog_rearm({Platform.TELEGRAM: primary}, loop, runner)
+        for adapter in (primary, secondary):
+            task = adapter._polling_heartbeat_task
+            assert task is not None and not task.done()
+    finally:
+        tasks = []
+        for adapter in (primary, secondary):
+            if adapter is not None and adapter._polling_heartbeat_task is not None:
+                tasks.append(adapter._polling_heartbeat_task)
+        pending = {t for t in tasks if not t.done()}
+        if not pending:
+            loop.call_soon_threadsafe(loop.stop)
+        else:
+            def _stop_when_idle(_t=None):
+                pending.discard(_t)
+                if not pending:
+                    loop.call_soon_threadsafe(loop.stop)
+
+            for task in list(pending):
+                task.add_done_callback(_stop_when_idle)
+                loop.call_soon_threadsafe(task.cancel)
+        thread.join(timeout=5)
+        loop.close()
 
 
 def test_schedule_recovery_logs_breadcrumb_when_fatal_suppressed(caplog):
