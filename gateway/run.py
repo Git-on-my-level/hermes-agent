@@ -4790,6 +4790,64 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 
+def _telegram_watchdog_rearm_once(adapter) -> bool:
+    """Re-arm one Telegram adapter's dead heartbeat watchdog from outside its task tree.
+
+    Returns True when a re-arm was needed (a WARNING has been logged). The heartbeat loop is the
+    only detector for the silent-deaf failure class (#92991/#55769: poller dead, transport healthy,
+    queue empty), and it lives in the adapter's own task tree — the same tree a wedged or lost
+    recovery takes down with it. When that happens every adapter-internal recovery path is gone
+    with it and nothing ever logs. The gateway housekeeping thread outlives adapter tasks, so it
+    can see the gap and restart the watchdog; a re-armed watchdog then detects the dead poller
+    itself (stall / pending-queue checks) and escalates through the normal recovery ladder.
+    Never touches a live heartbeat, a webhook-mode adapter, or a torn-down/fatal adapter.
+    """
+    if adapter is None or getattr(adapter, "_webhook_mode", False):
+        return False
+    if getattr(adapter, "_teardown_started", False) or getattr(adapter, "has_fatal_error", False):
+        return False
+    task = getattr(adapter, "_polling_heartbeat_task", None)
+    if task is not None and not task.done():
+        return False
+    logger.warning(
+        "[%s] Telegram watchdog dead while polling (heartbeat task=%s); re-arming from gateway housekeeping",
+        getattr(adapter, "name", "telegram"), "done" if task is not None else "missing")
+    adapter._restart_task_attr("_polling_heartbeat_task", adapter._polling_heartbeat_loop())
+    return True
+
+
+def _housekeeping_telegram_watchdog_rearm(adapters, loop) -> None:
+    """Housekeeping chore: restore the Telegram watchdog that died with its task tree.
+
+    Zero Bot API calls and a no-op while healthy: every live heartbeat short-circuits this.
+    See `_telegram_watchdog_rearm_once` for the failure class this closes.
+    """
+    if adapters is None or loop is None:
+        return
+    for platform, adapter in list(adapters.items()):
+        try:
+            platform_name = getattr(platform, "value", str(platform))
+        except Exception:
+            platform_name = str(platform)
+        if platform_name != "telegram":
+            continue
+
+        async def _rearm(adapter=adapter):
+            return _telegram_watchdog_rearm_once(adapter)
+
+        try:
+            fut = safe_schedule_threadsafe(_rearm(), loop, logger=logger,
+                                           log_message="Telegram watchdog re-arm scheduling error")
+        except Exception as exc:
+            logger.debug("Telegram watchdog re-arm check failed for %s: %s", platform_name, exc)
+            continue
+        if fut is not None:
+            try:
+                fut.result(timeout=10)
+            except Exception as exc:
+                logger.debug("Telegram watchdog re-arm failed for %s: %s", platform_name, exc)
+
+
 def _start_gateway_housekeeping(
     stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None, runner=None,
     cron_thread=None,
@@ -4809,6 +4867,10 @@ def _start_gateway_housekeeping(
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
+        # Outer-ring Telegram watchdog supervisor: the heartbeat lives in the adapter's task tree and
+        # historically died WITH it (poller dead, zero log lines, gateway alive-but-deaf). The check
+        # runs every tick on the gateway loop (no Bot API calls) and is a no-op while the watchdog is alive.
+        chores.append((1, "Telegram watchdog re-arm", lambda: _housekeeping_telegram_watchdog_rearm(adapters, loop)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", _housekeeping_media_caches),
