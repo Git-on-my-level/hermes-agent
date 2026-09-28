@@ -1920,6 +1920,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """Schedule background polling recovery without failing gateway startup: a transient bootstrap
         failure degrades only this adapter; the reconnect ladder recovers in the background."""
         if self._teardown_started or self.has_fatal_error:
+            if not self._teardown_started:
+                # A set fatal flag suppresses every recovery path silently. Expected when a
+                # supervisor rebuild owns the adapter — but if that handoff is ever lost, this
+                # is the only breadcrumb the adapter will ever emit (#silent-deaf class).
+                logger.warning(
+                    "[%s] Telegram polling degraded (%s) while a fatal error is already set (%s); "
+                    "recovery suppressed. If no adapter rebuild follows, the adapter is stranded.",
+                    self.name, reason, getattr(self, "fatal_error_code", None) or "unknown")
             return
         if self._recovery_in_flight():
             logger.debug(
@@ -2180,6 +2188,15 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 if self._teardown_started or self.has_fatal_error:
+                    # Expected when a teardown or a supervisor handoff owns the adapter — but this
+                    # return was silent, so a LOST handoff looked identical to a healthy adapter:
+                    # watchdog gone, zero log lines, poller dead, gateway alive-but-deaf. Log once.
+                    if not getattr(self, "_heartbeat_standdown_logged", False):
+                        self._heartbeat_standdown_logged = True
+                        logger.warning(
+                            "[%s] Telegram watchdog standing down (teardown_started=%s, fatal_error=%s); "
+                            "the gateway must rebuild the adapter or polling stays dead",
+                            self.name, self._teardown_started, self.has_fatal_error)
                     return
                 # A recovery task hung on an unbounded await gates every other recovery path forever
                 # (alive but deaf): force retryable-fatal so the reconnector rebuilds the adapter.
