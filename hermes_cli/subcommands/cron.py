@@ -155,7 +155,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution.")
     cron_edit.add_argument("--paused-reason", dest="paused_reason",
-        help="Set the reason on an already-paused job (non-empty).")
+        help="Set the reason on an already-paused job (non-empty). "
+             "Refused when the job is not paused.")
     cron_edit.add_argument("--paused-review-after", dest="paused_review_after",
         help="YYYY-MM-DD date after which doctor flags this pause. Empty string clears it.")
     cron_edit.add_argument("--transient-notify-after", dest="transient_notify_after",

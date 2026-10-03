@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { askCronPauseReason } from './pause-reason'
 import {
   Dialog,
   DialogContent,
@@ -467,7 +468,7 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
     const isPaused = jobState(job) === 'paused'
     let pauseReason: string | undefined
     if (!isPaused) {
-      pauseReason = window.prompt(c.pauseReasonPrompt)?.trim()
+      pauseReason = (await askCronPauseReason({ confirmLabel: c.pauseTitle, prompt: c.pauseReasonPrompt })) ?? undefined
       if (!pauseReason) {
         return
       }

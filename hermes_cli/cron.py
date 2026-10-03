@@ -666,9 +666,11 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     if script and (script_issue := _script_health_issue(script)):
         issues.append(script_issue)
     workdir = str(job.get("workdir") or "").strip()
-    if workdir and not Path(workdir).expanduser().exists():
+    # Same predicate as dispatch (``_missing_workdir_result``): a file, a broken
+    # symlink, or a missing path is not a directory, so the run will be skipped.
+    if workdir and not Path(workdir).expanduser().is_dir():
         issues.append(
-            f"workdir not found: {workdir} — the scheduler records the slot and skips the run "
+            f"workdir is not a directory: {workdir} — the scheduler records the slot and skips the run "
             "(incident workdir_missing) instead of starting the agent")
     return issues
 

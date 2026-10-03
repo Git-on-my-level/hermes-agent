@@ -444,7 +444,12 @@ def _resolve_incidents_for_recovered_job(job: dict) -> None:
 
 
 def _mark_incident_alerted(incident_id: Optional[str]) -> None:
-    """Best-effort: mark incident ``alerted`` (no-op for closed; never resurrects an acked one)."""
+    """Best-effort: mark incident ``alerted``.
+
+    No-op for ``closed``, and for a ``resolved`` row that already has a
+    ``resolution_reason`` (a late alert must not reopen a retirement or removal).
+    A new failure reopens through ``upsert_incident`` instead.
+    """
     if not incident_id:
         return
     try:

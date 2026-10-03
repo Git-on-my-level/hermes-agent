@@ -33,9 +33,11 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   tool, and both pause APIs). Jobs already paused with an empty reason stay paused; doctor
   names `hermes cron edit <id> --paused-reason`. Optional `paused_review_after` (YYYY-MM-DD)
   is flagged by doctor once that day has arrived.
-- Removing a job, or a run that retires it (`completed`), resolves its open incidents
-  (`resolution_reason` set; operator `closed` rows stay closed). Pre-existing orphans are
-  `hermes cron incidents --prune-orphans` (plan) / `--apply`.
+- Removing a job, the retention sweep that drops a completed record, or a run that
+  retires the job **successfully**, resolves its open incidents (`resolution_reason` set;
+  operator `closed` rows stay closed). A failed final run leaves its incident open — that
+  failure is still unresolved. Pre-existing orphans are `hermes cron incidents
+  --prune-orphans` (plan) / `--apply`.
 - `cron.transient_notify_after` (default 1) and a per-job override withhold the *notice* for
   transient failures until N consecutive ones. The incident is still recorded as `detected`
   immediately. 1 preserves today's paging.

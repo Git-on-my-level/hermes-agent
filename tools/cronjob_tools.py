@@ -999,7 +999,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
         "type": "object",
         "properties": {
             "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
-            "paused_reason": {"type": "string", "description": "Auditable pause reason. On create, requires paused=true. On update, sets the reason on an existing pause (non-empty)."},
+            "paused_reason": {"type": "string", "description": "Auditable pause reason. On create, requires paused=true. On update, sets the reason on an existing pause (non-empty). Refused when the job is not paused."},
             "reason": {"type": "string", "description": "Required for action=pause: why the job is paused. Must be non-empty."},
             "review_after": {"type": "string", "description": "Optional for action=pause: YYYY-MM-DD date. hermes cron doctor flags the pause once this day has arrived."},
             "action": {

@@ -262,7 +262,7 @@ hermes cron tick
 
 What they do:
 
-- `pause` — keep the job but stop scheduling it. `--reason` is required and must be non-empty (an explicit empty string is rejected). Optional `--review-after YYYY-MM-DD` is stored as `paused_review_after`; `hermes cron doctor` flags the pause once that day has arrived. Jobs already paused with an empty reason keep not firing — doctor tells you to add one with `hermes cron edit <id> --paused-reason "..."`. A per-job `--transient-notify-after N` (or `cron.transient_notify_after`, default 1) withholds the chat notice for transient failures until N in a row; the incident is still recorded immediately
+- `pause` — keep the job but stop scheduling it. `--reason` is required and must be non-empty (an explicit empty string is rejected). Optional `--review-after YYYY-MM-DD` is stored as `paused_review_after`; `hermes cron doctor` flags the pause once that day has arrived. Jobs already paused with an empty reason keep not firing — doctor tells you to add one with `hermes cron edit <id> --paused-reason "..."`. That edit is refused when the job is not already paused; pause it with `--reason` instead. A per-job `--transient-notify-after N` (or `cron.transient_notify_after`, default 1) withholds the chat notice for transient failures until N in a row; the incident is still recorded immediately
 - `resume` — re-enable the job. A recurring job whose slot came due while it was paused keeps that slot due, so the next tick fires one catch-up run (or logs the skip when `cron.catch_up_missed: false`) instead of silently jumping to the next occurrence; otherwise the next future run is computed
 - `run` — trigger the job on the next scheduler tick
 - `remove` — delete it entirely

@@ -14,6 +14,7 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
+import { askCronPauseReason } from '../../cron/pause-reason'
 import { updateCronJobs } from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
@@ -259,7 +260,7 @@ function CronJobSidebarRow({
   const togglePause = async () => {
     let pauseReason: string | undefined
     if (!isPaused) {
-      pauseReason = window.prompt(c.pauseReasonPrompt)?.trim()
+      pauseReason = (await askCronPauseReason({ confirmLabel: c.pauseTitle, prompt: c.pauseReasonPrompt })) ?? undefined
       if (!pauseReason) {
         return
       }

@@ -3552,9 +3552,11 @@ export interface CronManageParams {
   continuity?: boolean | string | null
   deliver?: string | null
   profile?: string | null
+  reason?: string | null
+  review_after?: string | null
 }
 export type CronAction = 'list' | 'add' | 'remove' | 'pause' | 'resume'
-/** Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` → ``jobs``/``count`` (+ ``scoped`` when profile-scoped); ``add`` → the created job's summary + ``job``; ``remove`` → ``removed_job``; ``pause``/``resume`` → ``job``. A tool-level failure lands in ``error``. */
+/** Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` → ``jobs``/``count`` (+ ``scoped`` when profile-scoped); ``add`` → the created job's summary + ``job``; ``remove`` → ``removed_job``; ``pause``/``resume`` → ``job``. A tool-level failure (``success`` false, including a pause with no reason) is an RPC error, not a successful result with ``error``. */
 export interface CronManageResult {
   success?: boolean | null
   error?: string | null

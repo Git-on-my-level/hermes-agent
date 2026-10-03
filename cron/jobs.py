@@ -2073,6 +2073,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if (
+            "paused_reason" in updates
+            and updates.get("paused_reason")
+            and effective_job_state(updated) != "paused"
+        ):
+            raise ValueError(
+                "paused_reason can only be set on a paused job. "
+                f'Pause it with `hermes cron pause {job.get("id", job_id)} --reason "..."`.'
+            )
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2480,8 +2489,10 @@ def mark_job_run(
     instead of re-firing into it on every tick (cron/quota_hold.py, #89376).
 
     ``transient``: this failure is in the self-healing class (provider unreachable, idle timeout,
-    script timeout). It advances ``transient_failure_streak`` instead of clearing it. When the run
-    retires the job (repeat budget or one-shot), open incidents are resolved after the save.
+    script timeout). It advances ``transient_failure_streak`` instead of clearing it. When a
+    *successful* run retires the job (repeat budget or one-shot), open incidents are resolved
+    after the save. A failed final run leaves them open — that failure is still unresolved.
+    Removing the job, and the retention sweep that later drops the record, resolve them instead.
     """
     finished_reason: List[str] = []
     finished_id: List[str] = []
@@ -2499,7 +2510,9 @@ def mark_job_run(
         _record_run_outcome(
             job, success, error, delivery_error, status, now, transient=transient)
         _advance_after_run(job, now)
-        if job.get("state") == "completed" and not was_completed:
+        # A failed final run is an unresolved failure: leave its incident open so the
+        # alert that follows this save is not immediately undone, then redone.
+        if success and job.get("state") == "completed" and not was_completed:
             finished_reason.append(_completion_incident_reason(job))
             finished_id.append(job["id"])
         from cron import quota_hold
@@ -2852,7 +2865,10 @@ def _sweep_completed_oneshots(
     Removed ids go into *removed_ids* so save_jobs's shrink-merge guard allows the delete. Age is
     measured from ``last_run_at``; a record without a parseable one is kept (never guess into
     deletion). The removed record's output directory goes with it — record retention without
-    output GC is what accumulated months of orphaned ``cron/output/<id>/`` dirs (#37)."""
+    output GC is what accumulated months of orphaned ``cron/output/<id>/`` dirs (#37). Open
+    incidents for a pruned id are resolved with the same reason as ``remove_job`` (``job removed``)
+    so a failed final run, which deliberately leaves its incident open, does not become an orphan
+    when the record ages out."""
     retention_days = _completed_oneshot_retention_days()
     if retention_days <= 0:
         return False
@@ -2875,6 +2891,8 @@ def _sweep_completed_oneshots(
             if removed_ids is not None and rid:
                 removed_ids.add(str(rid))
             _rmtree_job_output_quietly(rid, context="completed-one-shot retention sweep")
+            if rid:
+                _resolve_job_incidents(str(rid), "job removed")
             logger.info(
                 "Job '%s': pruning completed one-shot record (finished %s, retention %.1f days)",
                 rj.get("name", rj.get("id", "?")), last_run, retention_days)

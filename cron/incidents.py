@@ -202,15 +202,27 @@ def set_incident_state(incident_id: str, state: str) -> bool:
     """Transition an incident's lifecycle state; return whether it changed. ``closed`` is terminal
     for that signature (re-open happens by a changed error minting a NEW incident). Unknown states
     are rejected (no-op, ``False``). ``alerted`` also stamps ``alerted_at`` — every time, so the
-    cooldown reminder (see ``cron.scheduler._upsert_incident_for_failure``) restarts its window."""
+    cooldown reminder (see ``cron.scheduler._upsert_incident_for_failure``) restarts its window.
+
+    A ``resolved`` row that already carries ``resolution_reason`` (job removed, retention sweep,
+    or a successful final run) does not walk back to ``alerted`` or ``detected`` here. A later
+    failure of the same signature reopens through ``upsert_incident``, which is the occurrence
+    that is allowed to.
+    """
     if state not in INCIDENT_STATES:
         return False
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT state FROM cron_incidents WHERE id=?", (incident_id,)
+            "SELECT state, resolution_reason FROM cron_incidents WHERE id=?", (incident_id,)
         ).fetchone()
         if row is None or row["state"] == "closed":
+            return False
+        if (
+            row["state"] == "resolved"
+            and str(row["resolution_reason"] or "").strip()
+            and state in {"alerted", "detected"}
+        ):
             return False
         if state == "alerted":
             conn.execute(

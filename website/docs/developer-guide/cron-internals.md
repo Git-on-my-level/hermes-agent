@@ -127,8 +127,12 @@ or clear it with `hermes cron edit <id> --workdir ""`.
 ### Incidents outliving a job
 
 Open incidents (`detected` / `alerted`) are resolved, with `resolution_reason`, when the job
-is removed or a run retires it (`completed` — repeat budget exhausted or a finished one-shot).
-Operator `closed` rows are left closed. Incidents whose job id is already gone are listed by
+is removed, when the retention sweep drops a completed record, or when a run retires it
+successfully (`completed` — repeat budget exhausted or a finished one-shot, and the final run
+succeeded). A failed final run leaves the incident open: it is still an unresolved failure.
+Operator `closed` rows are left closed. A resolved row that already has a `resolution_reason`
+is not moved back to `alerted` or `detected` by a late alert; a new occurrence of the same
+error reopens it through the incident upsert. Incidents whose job id is already gone are listed by
 `hermes cron incidents --prune-orphans` and resolved by the same command with `--apply`.
 Doctor reports them and does not write.
 

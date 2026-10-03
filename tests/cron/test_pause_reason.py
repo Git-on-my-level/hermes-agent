@@ -18,7 +18,7 @@ from cron.jobs import (
     save_jobs,
     update_job,
 )
-from hermes_cli.cron import cron_doctor, cron_pause
+from hermes_cli.cron import cron_doctor, cron_edit, cron_pause
 from tools.cronjob_tools import cronjob
 
 
@@ -118,6 +118,18 @@ def test_edit_can_attach_a_reason_to_an_existing_pause(tmp_cron_dir):
     assert updated["state"] == "paused"
     with pytest.raises(ValueError, match="non-empty reason"):
         update_job(job["id"], {"paused_reason": "  "})
+
+
+def test_edit_paused_reason_rejects_a_job_that_is_not_paused(tmp_cron_dir, capsys):
+    job = create_job(prompt="still running", schedule="every 1h", name="live")
+    assert cron_edit(argparse.Namespace(job_id=job["id"], paused_reason="not paused yet")) == 1
+    text = capsys.readouterr().out
+    assert "paused" in text.lower()
+    stored = get_job(job["id"])
+    assert stored["state"] != "paused"
+    assert not (stored.get("paused_reason") or "").strip()
+    with pytest.raises(ValueError, match="only be set on a paused job"):
+        update_job(job["id"], {"paused_reason": "not paused yet"})
 
 
 def test_cli_and_tool_reject_an_empty_pause_reason(tmp_cron_dir, capsys):
