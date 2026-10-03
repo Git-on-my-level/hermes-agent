@@ -183,7 +183,7 @@ def checkout_sha(project_root: Path) -> str:
     try:
         r = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
         )
         return normalize_pin(r.stdout)
     except (OSError, subprocess.TimeoutExpired):
@@ -194,7 +194,7 @@ def checkout_is_dirty(project_root: Path) -> bool:
     try:
         r = subprocess.run(
             ["git", "-C", str(project_root), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
         )
         return bool(r.stdout.strip()) if r.returncode == 0 else True
     except (OSError, subprocess.TimeoutExpired):
@@ -246,7 +246,7 @@ def channel_tip_sha(project_root: Path, remote: str = "", branch: str = "") -> s
     try:
         r = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", ref],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
         )
         return normalize_pin(r.stdout) if r.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
@@ -260,7 +260,7 @@ def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") ->
     try:
         subprocess.run(
             ["git", "-C", str(project_root), "fetch", "--prune", remote, branch],
-            capture_output=True, text=True, timeout=120, check=False,
+            capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.debug("channel-tip fetch failed: %s", e)
