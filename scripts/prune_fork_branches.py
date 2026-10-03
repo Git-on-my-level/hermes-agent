@@ -380,7 +380,7 @@ def apply_main(args, run) -> int:
             file=sys.stderr,
         )
         return 1
-    entries = parse_list(args.list_file.read_text(encoding="utf-8"))
+        entries = parse_list(args.list_file.read_text(encoding="utf-8-sig"))
     # Re-derive the guards now, not at plan time: a PR may have been opened,
     # a branch moved, since the list was published.
     open_heads = open_pr_heads(run, args.repo, args.upstream_repo)

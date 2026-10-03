@@ -128,7 +128,7 @@ def main() -> int:
         if not path.is_file():
             missing.append(f"MISSING FILE: {rel} ({label})")
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
         if needle not in text:
             missing.append(f"MISSING {label}: '{needle}' not found in {rel}")
     for rel in TEST_FILES:
