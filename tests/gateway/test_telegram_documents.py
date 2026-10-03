@@ -302,6 +302,90 @@ class TestMediaGroups:
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
 
+    @pytest.mark.asyncio
+    async def test_slow_album_sibling_stays_in_the_first_message(self, adapter):
+        """A sibling still downloading after the quiet window must not start a turn.
+
+        The window used to start when the first download finished. A slower second
+        photo then arrived as a busy follow-up ("Queued for the next turn") instead
+        of joining the first agent message.
+        """
+        adapter.MEDIA_GROUP_WAIT_SECONDS = 0.05
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow_download():
+            started.set()
+            await release.wait()
+            return bytearray(b"slow")
+
+        fast_file = _make_file_obj(b"fast")
+        slow_file = _make_file_obj(b"slow")
+        slow_file.download_as_bytearray = slow_download
+        msg1 = _make_message(
+            caption="both shots", photo=[_make_photo(fast_file)], media_group_id="album-1")
+        msg2 = _make_message(photo=[_make_photo(slow_file)], media_group_id="album-1")
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+            new=AsyncMock(side_effect=["/tmp/fast.jpg", "/tmp/slow.jpg"]),
+        ):
+            await adapter._handle_media_message(_make_update(msg1), MagicMock())
+            second = asyncio.create_task(
+                adapter._handle_media_message(_make_update(msg2), MagicMock()))
+            await started.wait()
+            await asyncio.sleep(0.12)
+            assert adapter.handle_message.await_count == 0
+            release.set()
+            await second
+            pending = [t for t in list(adapter._media_group_tasks.values()) if not t.done()]
+            if pending:
+                await asyncio.gather(*pending)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "both shots"
+        assert event.media_urls == ["/tmp/fast.jpg", "/tmp/slow.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_slow_photo_burst_sibling_stays_in_the_first_message(self, adapter):
+        """Same hold for photos that are not a Telegram album (no media_group_id)."""
+        adapter._media_batch_delay_seconds = 0.05
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow_download():
+            started.set()
+            await release.wait()
+            return bytearray(b"slow")
+
+        fast_file = _make_file_obj(b"fast")
+        slow_file = _make_file_obj(b"slow")
+        slow_file.download_as_bytearray = slow_download
+        msg1 = _make_message(caption="burst", photo=[_make_photo(fast_file)])
+        msg2 = _make_message(photo=[_make_photo(slow_file)])
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+            new=AsyncMock(side_effect=["/tmp/burst-fast.jpg", "/tmp/burst-slow.jpg"]),
+        ):
+            await adapter._handle_media_message(_make_update(msg1), MagicMock())
+            second = asyncio.create_task(
+                adapter._handle_media_message(_make_update(msg2), MagicMock()))
+            await started.wait()
+            await asyncio.sleep(0.12)
+            assert adapter.handle_message.await_count == 0
+            release.set()
+            await second
+            pending = [t for t in list(adapter._pending_photo_batch_tasks.values()) if not t.done()]
+            if pending:
+                await asyncio.gather(*pending)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_urls == ["/tmp/burst-fast.jpg", "/tmp/burst-slow.jpg"]
+        assert event.text == "burst"
+
 
 # ---------------------------------------------------------------------------
 # TestSendVoice — outbound audio delivery
