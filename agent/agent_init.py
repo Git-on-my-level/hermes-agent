@@ -1136,9 +1136,18 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
+    # xAI reserves tool_search on its Responses API. Skip the client-side
+    # bridge for that route only; other providers keep the assembled catalog.
+    # getattr: test stubs and partial agents may not have api_mode yet.
+    _provider = str(getattr(agent, "provider", "") or "")
+    _xai_responses = getattr(agent, "api_mode", None) == "codex_responses" and (
+        _provider in {"xai", "xai-oauth"}
+        or getattr(agent, "_base_url_hostname", "") == "api.x.ai"
+    )
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=_xai_responses,
     )
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools

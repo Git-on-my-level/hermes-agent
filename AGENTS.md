@@ -7,6 +7,8 @@ past that); see the **routing table** at the end and read the area file before e
 
 **Never give up on the right solution.**
 
+Fork-only maintenance rules, when this tree is the Git-on-my-level fork, live in `FORK.md`.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a messaging

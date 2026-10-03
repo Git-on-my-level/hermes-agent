@@ -343,3 +343,58 @@ def stale_channel_records(config: Optional[dict]) -> list[tuple[str, dict, str]]
         except Exception as exc:  # noqa: BLE001 — doctor sweep must not raise
             logger.debug("installs root unavailable: %s", exc)
     return stale
+
+
+# Git deploy target (updates.remote / updates.branch). Distinct from the release
+# channel records above: stock default is origin/main; a maintained fork sets
+# fork/prod in host config. CLI --remote/--branch override config.
+
+_DEFAULT_GIT_REMOTE = "origin"
+_DEFAULT_GIT_BRANCH = "main"
+
+
+def git_update_target(config: Any = None) -> tuple[str, str]:
+    """Return ``(remote, branch)`` from an already-loaded config dict."""
+    remote = _DEFAULT_GIT_REMOTE
+    branch = _DEFAULT_GIT_BRANCH
+    updates = (config or {}).get("updates") if isinstance(config, dict) else None
+    if isinstance(updates, dict):
+        raw_remote = str(updates.get("remote") or "").strip()
+        raw_branch = str(updates.get("branch") or "").strip()
+        if raw_remote:
+            remote = raw_remote
+        if raw_branch:
+            branch = raw_branch
+    return remote, branch
+
+
+def load_update_channel_defaults() -> tuple[str, str]:
+    """Return ``(remote, branch)`` from config, falling back to origin/main."""
+    try:
+        from hermes_cli.config import load_config
+
+        return git_update_target(load_config() or {})
+    except Exception:
+        return _DEFAULT_GIT_REMOTE, _DEFAULT_GIT_BRANCH
+
+
+def resolve_update_target(args: Any = None) -> tuple[str, str]:
+    """CLI overrides, then config, then origin/main."""
+    remote, branch = load_update_channel_defaults()
+    cli_remote = str(getattr(args, "remote", None) or "").strip()
+    cli_branch = str(getattr(args, "branch", None) or "").strip()
+    if cli_remote:
+        remote = cli_remote
+    if cli_branch:
+        branch = cli_branch
+    return remote, branch
+
+
+def resolve_update_branch(args: Any = None) -> str:
+    """Branch half of :func:`resolve_update_target`."""
+    return resolve_update_target(args)[1]
+
+
+def is_stock_upstream_probe(remote: str, branch: str) -> bool:
+    """True when a behind-count may still use the official origin/main shortcut."""
+    return remote == _DEFAULT_GIT_REMOTE and branch == _DEFAULT_GIT_BRANCH

@@ -2669,6 +2669,7 @@ class GatewayTurnMixin:
 
     def _build_stream_consumer_config(
         self, source: "SessionSource", scfg: Any, adapter: Any, *, on_missing_cursor: str,
+        commentary_mode: str = "separate", commentary_waiting_label: str = "",
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
@@ -2701,6 +2702,8 @@ class GatewayTurnMixin:
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            commentary_mode=commentary_mode,
+            commentary_waiting_label=commentary_waiting_label,
         )
         return _consumer_cfg, _pause_typing_before_finalize
 

@@ -780,6 +780,20 @@ def cron_edit(args):
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
+    model = getattr(args, "model", None)
+    model_provider = getattr(args, "model_provider", None)
+    target_no_agent = job.get("no_agent") and getattr(args, "no_agent", None) is not False
+    if target_no_agent and (model is not None or model_provider is not None):
+        print(
+            color(
+                "Cannot set --model or --provider on a no-agent job; "
+                "its script is the entire job and no model is invoked. "
+                "Use --agent in the same edit to enable model execution.",
+                Colors.RED,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     existing_skills = list(job.get("skills") or ([job["skill"]] if job.get("skill") else []))
     replacement_skills = _normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None))
     add_skills = _normalize_skills(None, getattr(args, "add_skills", None)) or []

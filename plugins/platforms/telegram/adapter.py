@@ -138,6 +138,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
 from agent.i18n import get_language, t
+from plugins.platforms.telegram.inbound_split import chunk_len as _inbound_chunk_len, is_near_split
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
@@ -1272,7 +1273,7 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int], media_label: str, reset_media: Optional[Any] = None) -> Any:
         """Retry stale private-topic media replies once without the topic anchor. Serialized per chat with
         ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
-        async with self._chat_send_lock(send_kwargs.get("chat_id")):
+        async with self._chat_send_lock(send_kwargs.get("chat_id"), metadata):
             try:
                 return await _await_with_thread_deadline(
                     send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
@@ -3740,7 +3741,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         # One chat at a time (held only around the API calls, never across the reconnect wait above), so
         # two concurrent split replies to one chat cannot interleave their chunks (#114396).
-        async with self._chat_send_lock(chat_id):
+        async with self._chat_send_lock(chat_id, metadata):
             return await self._send_text_locked(chat_id, content, reply_to, metadata)
 
     async def _send_text_locked(
@@ -3859,7 +3860,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         delivered = list(raw.get("delivered_message_ids") or ())
         prior = len(delivered)
-        async with self._chat_send_lock(chat_id):
+        async with self._chat_send_lock(chat_id, metadata):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
@@ -5593,11 +5594,23 @@ class TelegramAdapter(BasePlatformAdapter):
     # ``object.__new__()`` (no __init__).
 
     @contextlib.asynccontextmanager
-    async def _chat_send_lock(self, chat_id: Any):
-        """FIFO per-chat gate around outgoing API calls, reentrant within one asyncio task (media paths
-        nest: send_voice → send_document, and ``super().send_*`` fallbacks reach ``send()``; a plain
-        ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends for good)."""
+    async def _chat_send_lock(self, chat_id: Any, metadata: Optional[Dict[str, Any]] = None):
+        """FIFO per-conversation-stream gate around outgoing API calls, reentrant within one asyncio
+        task (media paths nest: send_voice → send_document, and ``super().send_*`` fallbacks reach
+        ``send()``; a plain ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends
+        for good).
+
+        Keyed by chat plus topic, not chat alone. A chat-only lock serializes a forum group's
+        independent topic streams behind each other. Topic ids partition those views, so same-stream
+        ordering stays intact while cross-topic sends run in parallel. Sends without topic metadata
+        AND Telegram's General topic (thread 1) share the bare chat FIFO, because both render in the
+        same view. General is omitted by ``_message_thread_id_for_send`` (sendMessage rejects
+        ``message_thread_id=1``), so the lock uses that same Bot-API-normalized thread id.
+        """
+        thread_id = self._message_thread_id_for_send(self._metadata_thread_id(metadata))
         key = str(normalize_telegram_chat_id(chat_id))
+        if thread_id:
+            key = f"{key}:{thread_id}"
         locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
         owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
         task = asyncio.current_task()
@@ -6592,9 +6605,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
-        # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
+        # A >4096 UTF-16 command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
-        if len(event.text or "") >= self._SPLIT_THRESHOLD:
+        if is_near_split(event.text):
             self._enqueue_text_event(event)
             return
         await self.handle_message(event)
@@ -6645,6 +6658,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="text-enqueue")
             return
         super()._enqueue_text_event(event)
+        # Base stores Python len(); Telegram splits on UTF-16.
+        pending = self._pending_text_batches.get(self._text_batch_key(event))
+        if pending is not None:
+            pending._last_chunk_len = _inbound_chunk_len(event.text)  # type: ignore[attr-defined]
         self._accept_update()
 
     async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:

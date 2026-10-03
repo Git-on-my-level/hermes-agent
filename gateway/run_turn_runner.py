@@ -901,20 +901,60 @@ class TurnRunner:
                 ctx.source.platform.value if ctx.source.platform else "unknown", event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            if str(event_type or "") == "compacted":
+                self._rearm_activity_after_compaction(ctx)
             return
         def present():
             fut = self._schedule(
                 _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
-            if fut is not None and ctx._cleanup_progress:
+            if fut is None:
+                if str(event_type or "") == "compacted":
+                    self._rearm_activity_after_compaction(ctx)
+                return
+            if ctx._cleanup_progress:
                 fut.add_done_callback(self._track_future_cleanup_id)
+            if str(event_type or "") == "compacted":
+                fut.add_done_callback(lambda _fut: self._rearm_activity_after_compaction(ctx))
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
                             diagnostic=is_warning_status(event_type, message))
 
+    def _rearm_activity_after_compaction(self, ctx) -> None:
+        """Resume typing after a mid-turn compaction boundary (Telegram clears it on status)."""
+        adapter = ctx._status_adapter
+        chat_id = ctx._status_chat_id
+        if not adapter or not chat_id or not ctx._run_still_current():
+            return
+        metadata = ctx._status_thread_metadata
+
+        async def _rearm_coro() -> None:
+            try:
+                resume = getattr(adapter, "resume_typing_for_chat", None)
+                if callable(resume):
+                    resume(chat_id)
+            except Exception:
+                pass
+            try:
+                cooldown = getattr(adapter, "_telegram_typing_cooldown_until", None)
+                if isinstance(cooldown, dict):
+                    cooldown.pop(str(chat_id), None)
+            except Exception:
+                pass
+            try:
+                send_typing = getattr(adapter, "send_typing", None)
+                if callable(send_typing):
+                    result = send_typing(chat_id, metadata=metadata)
+                    if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                        await result
+            except Exception:
+                logger.debug("post-compaction typing re-arm failed", exc_info=True)
+
+        self._schedule(_rearm_coro(), "post-compaction typing re-arm scheduling error")
+
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
-    def _setup_stream_consumer(self, platform_key):
+    def _setup_stream_consumer(self, platform_key, *, model=None, provider=None, reasoning_config=None):
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
@@ -932,9 +972,27 @@ class TurnRunner:
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:
+                from gateway.commentary_preview import telegram_preview_channel
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._delivery_adapter_for(ctx.source)
                 if adapter:
+                    preview = False
+                    if (
+                        ctx.source.platform == Platform.TELEGRAM
+                        and ctx.interim_assistant_messages_enabled
+                        and callable(ctx.resolve_display_setting)
+                    ):
+                        raw = ctx.resolve_display_setting(
+                            ctx.user_config, platform_key, "interim_assistant_message_mode", "separate",
+                        )
+                        preview = str(raw or "").strip().lower() == "preview"
+                    commentary_mode, waiting_label = telegram_preview_channel(
+                        platform=ctx.source.platform,
+                        preview=preview,
+                        provider=provider,
+                        model=model,
+                        reasoning_config=reasoning_config,
+                    )
                     supports_incremental_stream = (
                         getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
                         or bool(getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False))
@@ -946,6 +1004,8 @@ class TurnRunner:
                         # consumer records what reached non-editable platforms, so an interim
                         # callback carrying the final answer participates in final-send dedup.
                         on_missing_cursor="fallback" if want_interim_messages else "raise",
+                        commentary_mode=commentary_mode,
+                        commentary_waiting_label=waiting_label,
                     )
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
@@ -1935,7 +1995,12 @@ class TurnRunner:
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(
+            platform_key,
+            model=model,
+            provider=runtime_kwargs.get("provider"),
+            reasoning_config=reasoning_config,
+        )
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,

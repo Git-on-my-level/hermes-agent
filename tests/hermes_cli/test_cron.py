@@ -48,6 +48,33 @@ class TestCronCommandLifecycle:
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        "flag,value",
+        [("--model", "new-model"), ("--provider", "nous")],
+    )
+    def test_edit_refuses_inference_pins_for_no_agent_job(
+        self, tmp_cron_dir, capsys, flag, value
+    ):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="report.py",
+            no_agent=True,
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        rc = cron_command(parser.parse_args(["cron", "edit", job["id"], flag, value]))
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Cannot set --model or --provider on a no-agent job" in captured.err
+        assert "Updated job" not in captured.out
+        unchanged = get_job(job["id"])
+        assert unchanged.get("model") is None
+        assert unchanged.get("provider") is None
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

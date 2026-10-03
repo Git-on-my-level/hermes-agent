@@ -342,6 +342,32 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 
+def _check_configured_git_ref(result: dict, co: _Checkout, remote: str, branch: str) -> None:
+    """Behind-count for ``updates.remote`` / ``updates.branch``.
+
+    Passive and local (``rev-parse`` of the tracking ref, then ``rev-list``).
+    Does not use :func:`_branch_remote`'s official-SSH HTTPS shortcut, which
+    would measure a NousResearch ``origin`` against ``origin/main``.
+    """
+    result["branch"] = branch
+    ref = f"{remote}/{branch}"
+    target = _git_stdout(["rev-parse", ref], cwd=co.root, git=co.git)
+    if not _is_full_sha(target):
+        result.update(
+            error="fetch-failed",
+            message=f"Could not resolve {ref}. Passive check does not fall back to origin/main.",
+        )
+        return
+    if co.head == target or (not co.embedded and _git_ok(
+            ["merge-base", "--is-ancestor", target, co.head], cwd=co.root, git=co.git)):
+        behind = 0
+    else:
+        counted = _git_count(["rev-list", "--count", f"{co.head}..{target}"], cwd=co.root)
+        behind = counted if isinstance(counted, int) else UPDATE_AVAILABLE_NO_COUNT
+    result["commits"] = []
+    result.update(targetSha=target, behind=behind, updateAvailable=behind != 0)
+
+
 def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
                   heal: Optional[tuple[Path, dict]]) -> None:
     """Compare the checkout with ``selected_branch``'s remote tip, falling back to main if it was deleted."""
@@ -382,7 +408,8 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     """
     from hermes_cli.config import get_project_root, require_readable_config_before_write
     from hermes_cli.steward import read_install_stamp
-    from hermes_cli.update_channel import install_id, resolve_update_channel
+    from hermes_cli.update_channel import (
+        git_update_target, install_id, is_stock_upstream_probe, resolve_update_channel)
     from hermes_cli.release_channels import validate_name
 
     embedded = (os.environ.get("HERMES_REVISION") or None) if install_root is None else None
@@ -397,6 +424,8 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     if passive and (config.get("updates") or {}).get("check") is False:
         return {**result, "reason": "disabled"}
     channel = resolve_update_channel(config, root) if channel is None else validate_name(channel)
+    cfg_remote, cfg_branch = git_update_target(config)
+    stock_git_probe = is_stock_upstream_probe(cfg_remote, cfg_branch)
     co = _read_checkout(root, git, embedded)
     desktop_config = _read_json(branch_config_path) if branch_config_path else None
     configured_branch = _configured_branch(desktop_config)
@@ -407,7 +436,8 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     else:
         result["branch"] = selected_branch
     identity = {"root": str(root), "home": str(home), "head": co.head, "origin": co.origin, "branch": selected_branch,
-                "channel": channel, "embedded": embedded, "branchOverride": branch is not None, "channelProtocol": 1}
+                "channel": channel, "embedded": embedded, "branchOverride": branch is not None, "channelProtocol": 1,
+                "gitRemote": cfg_remote, "gitBranch": cfg_branch}
     cache_file = Path(cache_path) if cache_path is not None else home / "source-checks" / f"{install_id(root)}.json"
     now = time.time()
     cached = None if force else _cached_status(cache_file, identity, now)
@@ -422,7 +452,10 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
         if source_target is not None and not source_target.commit:
             # The record supplies a default, not permission to leave the user's branch.
             selected_branch = configured_branch or _checked_out_branch(co.current_branch, source_target.branch)
-    if "error" not in result and (source_target is None or source_target.branch is not None):
+    use_configured_git_ref = branch is None and channel == "main" and not stock_git_probe
+    if use_configured_git_ref and "error" not in result:
+        _check_configured_git_ref(result, co, cfg_remote, cfg_branch)
+    elif "error" not in result and (source_target is None or source_target.branch is not None):
         # Only a Desktop-configured branch the caller did not override is healed.
         heal = branch_config_path and not branch and configured_branch == selected_branch
         _check_branch(result, co, selected_branch,
