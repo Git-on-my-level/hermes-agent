@@ -140,9 +140,14 @@ def _emit_uncaught_oneshot_failure(message: str, exit_code: int) -> None:
     """One failure record when json mode died before ``run_oneshot`` wrote one."""
     from hermes_cli.oneshot_result import build_oneshot_result_record, write_oneshot_result_line
 
-    write_oneshot_result_line(sys.stdout, build_oneshot_result_record(
-        response=None, result={}, exit_code=exit_code, failure=message,
-    ))
+    # Called from except handlers ahead of the hard exit: a failed write
+    # (broken pipe) must not escape into interpreter teardown.
+    try:
+        write_oneshot_result_line(sys.stdout, build_oneshot_result_record(
+            response=None, result={}, exit_code=exit_code, failure=message,
+        ))
+    except Exception:
+        pass
 
 
 def _run_and_exit_oneshot(

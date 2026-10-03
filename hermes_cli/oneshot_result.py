@@ -46,12 +46,20 @@ def _text(value: object) -> str:
     return _clean(value)
 
 
+def _redact(text: str) -> str:
+    """Failure text can quote provider errors or tracebacks; agentctl stores
+    ``error`` and ``result`` verbatim, so secrets must not survive into them."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True, redact_url_credentials=True)
+
+
 def _failure_message(result: dict, failure: Optional[str], exit_code: int) -> str:
     if isinstance(failure, str) and failure.strip():
-        return _clean(failure.strip())
+        return _redact(_clean(failure.strip()))
     raw_error = result.get("error")
     if isinstance(raw_error, str) and raw_error.strip():
-        return _clean(raw_error.strip())
+        return _redact(_clean(raw_error.strip()))
     if exit_code == 130 or result.get("interrupted"):
         return "Interrupted"
     if exit_code == 1:
@@ -101,7 +109,7 @@ def build_oneshot_result_record(
         # agentctl stores ``result`` as the answer. A failure that only sets
         # ``error`` leaves content empty, so the visible answer (or the error
         # itself) always rides in ``result``.
-        record["result"] = text if text.strip() else err
+        record["result"] = _redact(text) if text.strip() else err
     for key in ("session_id", "model", "provider"):
         value = _text(payload.get(key)).strip()
         if value:

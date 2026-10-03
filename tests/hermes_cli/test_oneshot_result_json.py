@@ -245,3 +245,15 @@ def test_interrupted_json_run_writes_a_failure_record_before_propagating(tmp_pat
     assert record["status"] == "failed"
     assert record["error"] == "Interrupted"
     assert record["result"] == "Interrupted"
+
+
+def test_failure_record_redacts_secrets():
+    from hermes_cli.oneshot_result import build_oneshot_result_record
+
+    token = "sk-" + "a" * 48
+    record = build_oneshot_result_record(
+        response=None, result={}, exit_code=1, failure=f"provider rejected key {token}"
+    )
+    assert token not in record["error"]
+    assert token not in record["result"]
+    assert record["status"] == "failed"
