@@ -6615,20 +6615,35 @@ class TelegramAdapter(BasePlatformAdapter):
         owner = tasks.get(key)
         return owner is None or owner is current_task
 
-    def _media_collect_token(self, msg, event: MessageEvent) -> str:
-        """Album items share a media_group_id; everything else shares the photo-burst key."""
+    def _media_collect_token(self, msg, event: MessageEvent) -> Optional[str]:
+        """Album items share a media_group_id; photo bursts share a batch key.
+
+        Voice, video, and documents dispatch immediately, so they must not take a token.
+        Computing a photo-burst key calls ``_event_session_key``, which partial test
+        adapters and pre-download size gates do not satisfy.
+        """
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             return f"album:{media_group_id}"
+        if not getattr(msg, "photo", None):
+            return None
         return f"burst:{self._photo_batch_key(event, msg)}"
 
+    def _ensure_media_collect_maps(self) -> None:
+        if not hasattr(self, "_media_collect_inflight"):
+            self._media_collect_inflight = {}
+        if not hasattr(self, "_media_collect_idle"):
+            self._media_collect_idle = {}
+
     def _begin_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
         inflight = self._media_collect_inflight.get(token, 0) + 1
         self._media_collect_inflight[token] = inflight
         if inflight == 1:
             self._media_collect_idle[token] = asyncio.Event()
 
     def _end_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
         remaining = self._media_collect_inflight.get(token, 0) - 1
         if remaining > 0:
             self._media_collect_inflight[token] = remaining
@@ -6898,11 +6913,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # first item is enqueued (after its download); a slower sibling must still join that
         # first message instead of hitting the busy queue.
         collect_token = self._media_collect_token(msg, event)
-        self._begin_media_collect(collect_token)
+        if collect_token:
+            self._begin_media_collect(collect_token)
         try:
             return await self._cache_and_route_media(msg, event)
         finally:
-            self._end_media_collect(collect_token)
+            if collect_token:
+                self._end_media_collect(collect_token)
 
     async def _cache_and_route_media(self, msg, event: MessageEvent) -> None:
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
