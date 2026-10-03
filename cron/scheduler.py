@@ -407,6 +407,31 @@ def _upsert_incident_for_failure(
         return False, None
 
 
+def _upsert_workdir_missing_incident(
+    job: dict, error: str, *, output_file: Optional[Any] = None
+) -> tuple[bool, Optional[str]]:
+    """One standing incident (id suffix ``workdir_missing``) for a deleted workdir.
+
+    Withhold once the incident is ``alerted`` or ``closed`` — not the 6h reminder cooldown. A
+    deleted directory does not heal on its own; a later successful run re-opens it if it returns.
+    """
+    try:
+        from cron.incidents import get_incident, upsert_incident
+
+        incident_id, _is_new = upsert_incident(
+            job["id"], str(error or ""), job_name=job.get("name"),
+            failure_type="workdir_missing", signature="workdir_missing",
+            output_file=output_file)
+        incident = get_incident(incident_id)
+        state = incident.get("state") if incident else None
+        return state in {"alerted", "closed"}, incident_id
+    except Exception as exc:
+        logger.debug(
+            "Incident store unavailable for job %s (delivery unaffected): %s",
+            job["id"], exc)
+        return False, None
+
+
 def _resolve_incidents_for_recovered_job(job: dict) -> None:
     """Best-effort: a successful run marks the job's open incidents ``resolved`` (never touches an
     operator ``closed`` ack). Store errors log at debug; delivery is unaffected."""
@@ -1470,14 +1495,34 @@ def _job_doc_header(job_name: str, job_id: str, now_iso: str, mode: str) -> str:
 
 
 def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
-    """Configured job workdir, or None when unset / no longer a directory (logged)."""
+    """Configured job workdir, or None when unset / no longer a directory (logged).
+
+    Dispatch refuses a missing workdir before this runs (``_prepare_job_prompt``). This fallback
+    only covers a directory that disappears between that check and the script start.
+    """
     workdir = (job.get("workdir") or "").strip() or None
     if workdir and not Path(workdir).is_dir():
         logger.warning(
-            "Job '%s': configured workdir %r no longer exists — running without it",
+            "Job '%s': configured workdir %r vanished after the dispatch check — running without it",
             job_id, workdir)
         return None
     return workdir
+
+
+def _missing_workdir_result(job: dict, job_id: str, job_name: str):
+    """Skip the occurrence when a configured workdir is not a directory. None when it may run."""
+    workdir = (job.get("workdir") or "").strip()
+    if not workdir:
+        return None
+    path = Path(workdir).expanduser()
+    if path.is_dir():
+        return None
+    logger.warning(
+        "Job '%s': configured workdir %s does not exist — skipping this occurrence",
+        job_id, path)
+    error = f"workdir_missing: configured workdir {path} does not exist"
+    doc = f"# Cron Job: {job_name}\n\n**Job ID:** {job_id}\n\nError: {error}\n"
+    return False, doc, "", error
 
 
 def _run_no_agent_job(
@@ -2205,6 +2250,11 @@ def _prepare_job_prompt(
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    # A deleted workdir must not start the script or the agent. The slot is still recorded by the
+    # caller's mark_job_run / finish_execution (a skip is an accounted occurrence, not a drop).
+    if (missing := _missing_workdir_result(job, job_id, job_name)) is not None:
+        return missing, None
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2847,6 +2897,22 @@ def _classify_delivery_outcome(
     return "suppressed"
 
 
+def _transient_delivery_withheld(job: dict, error: str) -> bool:
+    """Blank the notice for a transient failure still under the per-job/config streak threshold.
+
+    The incident stays ``detected`` (this path does not mark it alerted). Threshold 1 never
+    withholds. Unreachable-retry suppression is a separate gate in ``_save_compose_deliver``.
+    """
+    from cron.scheduler_failure_copy import transient_notice_withheld
+
+    if not transient_notice_withheld(job, error):
+        return False
+    logger.info(
+        "Job '%s': withholding transient failure notice until the streak threshold",
+        job.get("id"))
+    return True
+
+
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
     agent_declared: bool = False,
@@ -2872,11 +2938,24 @@ def _compose_run_delivery(
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
+        # A missing workdir is a standing condition: one notice, then silence until it is fixed.
         # Best-effort: a ledger failure never breaks delivery.
-        incident_acked, failure_incident_id = _upsert_incident_for_failure(
-            job, error or "", output_file=output_file
-        )
+        err_text = error or ""
+        workdir_missing = str(err_text).startswith("workdir_missing")
+        if workdir_missing:
+            incident_acked, failure_incident_id = _upsert_workdir_missing_incident(
+                job, err_text, output_file=output_file)
+        else:
+            incident_acked, failure_incident_id = _upsert_incident_for_failure(
+                job, err_text, output_file=output_file
+            )
         if incident_acked:
+            deliver_content = ""
+        elif workdir_missing:
+            from cron.scheduler_failure_copy import workdir_missing_notice
+            deliver_content = workdir_missing_notice(
+                job.get("name") or job["id"], job["id"], str(err_text))
+        elif _transient_delivery_withheld(job, err_text):
             deliver_content = ""
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
@@ -3084,6 +3163,11 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    if not d.success:
+        # Classify before popping ``_model_unreachable`` — that flag is part of the transient set.
+        from cron.scheduler_failure_copy import is_transient_cron_failure
+        if is_transient_cron_failure(job, d.error or ""):
+            mark_kwargs["transient"] = True
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
