@@ -372,6 +372,7 @@ from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.converge import build_converge_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
 from hermes_cli.subcommands.gui import build_gui_parser
@@ -2492,6 +2493,11 @@ from hermes_cli.update_receipt import update_receipt_scope
 @update_receipt_scope()
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
+    if getattr(args, "converge", False):
+        from hermes_cli.update_converge import cmd_converge_tick
+
+        cmd_converge_tick(args)
+        return
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
@@ -2560,6 +2566,11 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def cmd_converge(args):
+    from hermes_cli.update_converge import cmd_converge as _cmd_converge
+
+    _cmd_converge(args)
+
 
 def _coalesce_session_name_args(argv: list) -> list:
     """Join unquoted multi-word session names after -c/--continue and -r/--resume.
@@ -2570,7 +2581,7 @@ def _coalesce_session_name_args(argv: list) -> list:
     _SUBCOMMANDS = {
         "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
         "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
-        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve",
+        "sessions", "insights", "update", "converge", "uninstall", "profile", "dashboard", "serve",
         "desktop", "gui", "honcho", "claw", "plugins", "security", "acp", "webhook", "peer",
         "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
     }
@@ -2903,7 +2914,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update", "converge",
         "usage", "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -3541,6 +3552,7 @@ def _build_cli_parser():
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
     build_vault_parser(subparsers)
     build_update_parser(subparsers, cmd_update=cmd_update)
+    build_converge_parser(subparsers, cmd_converge=cmd_converge)
     build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
     build_acp_parser(subparsers, cmd_acp=cmd_acp)
     build_profile_parser(subparsers, cmd_profile=cmd_profile)

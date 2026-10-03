@@ -107,6 +107,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--converge", action="store_true", default=False,
+        help="Idle/after-turn tick when updates.converge is true. Applies updates.pin if set, "
+            "else the configured update channel tip. Skips when busy (until converge_busy_sla) "
+            "or dirty. Silent on no-op. Intended for the ai.hermes.converge LaunchAgent.",
+    )
+    update_parser.add_argument(
+        "--sha", default=None, metavar="SHA",
+        help="Install this commit instead of the channel tip. The SHA must be an ancestor "
+            "of the configured updates.remote/updates.branch (or --remote/--branch).",
+    )
+    update_parser.add_argument(
         "--no-gateway-restart", action="store_true", default=False,
         help="Update code and dependencies but defer the fleet restart. Use for updates "
              "running inside a gateway cgroup, then restart gateways separately.",

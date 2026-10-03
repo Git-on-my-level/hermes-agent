@@ -107,6 +107,36 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "def reset_ui_delivery_state_after_compaction",
         "compaction re-opens mid-turn commentary delivery",
     ),
+    (
+        "hermes_cli/update_converge.py",
+        "def cmd_converge_tick",
+        "idle converge tick",
+    ),
+    (
+        "hermes_cli/config_defaults.py",
+        '"skip_gateway_restart"',
+        "updates.skip_gateway_restart converge default",
+    ),
+    (
+        "gateway/run_notifications.py",
+        "Planned-restart online notice skipped: quiet drain restart",
+        "quiet drain skips the gateway-online broadcast",
+    ),
+    (
+        "hermes_cli/gateway_launchd.py",
+        "<key>HardResourceLimits</key>",
+        "launchd nofile hard ceiling",
+    ),
+    (
+        "hermes_cli/gateway_launchd.py",
+        "def _launchctl_domain_supervising_process",
+        "domain-scoped launchd supervision probe",
+    ),
+    (
+        "plugins/platforms/telegram/adapter.py",
+        "def _media_collect_token",
+        "telegram album sibling hold",
+    ),
 ]
 
 TEST_FILES = [
@@ -118,6 +148,7 @@ TEST_FILES = [
     "tests/agent/test_xai_tool_search_registration.py",
     "tests/agent/test_reset_ui_delivery_after_compaction.py",
     "tests/gateway/test_rearm_typing_after_compaction.py",
+    "tests/hermes_cli/test_update_converge.py",
 ]
 
 

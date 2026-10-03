@@ -2167,12 +2167,16 @@ class GatewayShutdownMixin:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                from gateway.drain_control import drain_notification_suppressed
                 atomic_json_write(
                     _planned_restart_notification_path(),
                     {
                         "requested_at": time.time(),
                         "via_service": bool(self._restart_via_service),
                         "detached": bool(self._restart_detached),
+                        # A quiet drain stays quiet across the restart: the booting gateway
+                        # skips the "Gateway online" broadcast when this is set.
+                        "quiet": drain_notification_suppressed(),
                     },
                     indent=None,
                 )

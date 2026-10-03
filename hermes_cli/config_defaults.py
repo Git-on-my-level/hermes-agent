@@ -2390,6 +2390,13 @@ DEFAULT_CONFIG = {
         # in host config so the count is not the official origin/main shortcut.
         "remote": "origin",
         "branch": "main",
+        # Idle converge onto the update channel tip, or updates.pin if set. Off by default.
+        "converge": False,
+        "pin": "",
+        "pin_file": "",
+        "converge_interval": 1800,
+        "converge_busy_sla": 21600,
+        "skip_gateway_restart": False,
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,

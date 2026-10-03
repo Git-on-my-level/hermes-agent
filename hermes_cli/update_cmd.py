@@ -1430,6 +1430,37 @@ def _apply_pulled_update(
     _complete_source_update(completion_request)
 
 
+def _reset_to_update_pin(git_cmd, pin: str, remote: str, branch: str):
+    """Reset HEAD to ``pin`` if it is an ancestor of ``remote/branch``.
+
+    Returns the pre-reset SHA when HEAD moved, else None (already there).
+    Exits 1 when the pin is missing or off-channel.
+    """
+    from hermes_cli.update_converge import normalize_pin
+
+    pin = normalize_pin(pin)
+    if not pin:
+        print("✗ --sha is not a git commit id")
+        sys.exit(1)
+    resolved = _git_run(git_cmd, ["rev-parse", "--verify", f"{pin}^{{commit}}"])
+    if resolved.returncode != 0:
+        print(f"✗ Pin {pin} is not a commit on this checkout (fetch {remote}/{branch} first)")
+        sys.exit(1)
+    sha = resolved.stdout.strip()
+    tip = f"{remote}/{branch}"
+    if _git_run(git_cmd, ["merge-base", "--is-ancestor", sha, tip]).returncode != 0:
+        print(f"✗ Pin {sha[:12]} is not an ancestor of {tip}")
+        sys.exit(1)
+    pre = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    if pre == sha:
+        return None
+    print(f"→ Pinning checkout to {sha[:12]} (channel {tip})")
+    if _git_run(git_cmd, ["reset", "--hard", sha]).returncode != 0:
+        print(f"✗ git reset --hard {sha[:12]} failed")
+        sys.exit(1)
+    return pre
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Apply the update; the command boundary owns errors, receipts and stdio."""
     # Marks this frame as the CURRENT updater for
@@ -1587,6 +1618,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
             target_ref=target_ref, _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
+
+        pin = str(getattr(args, "sha", None) or "").strip()
+        if pin:
+            from hermes_cli.update_channel import resolve_update_target
+
+            pin_remote, pin_branch = resolve_update_target(args)
+            pin_fetch = _git_run(git_cmd, ["fetch", pin_remote, pin_branch], network=True)
+            if pin_fetch.returncode != 0:
+                _print_fetch_failure(pin_fetch.stderr)
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                sys.exit(1)
+            moved_from = _reset_to_update_pin(git_cmd, pin, pin_remote, pin_branch)
+            if moved_from is None:
+                commit_count = 0
+            else:
+                completion_request["expected_sha"] = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                _apply_pulled_update(
+                    git_cmd, pin_branch, moved_from, _plan,
+                    _windows_gateway_resume=_windows_gateway_resume,
+                    completion_request=completion_request)
+                return
 
         if commit_count == 0:
             _finish_already_up_to_date(
