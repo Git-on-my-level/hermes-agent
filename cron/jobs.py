@@ -1644,12 +1644,67 @@ def _complete_job_record(job: Dict[str, Any]) -> None:
 def _activate_job_record(job: Dict[str, Any]) -> None:
     """Clear pause markers in place so *job* is runnable again."""
     job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
+    job.pop("paused_review_after", None)
+
+
+PAUSE_REASON_REQUIRED = (
+    "Pausing a cron job requires a non-empty reason. "
+    "Use `hermes cron pause <id> --reason \"...\"`, "
+    "or cronjob action=pause with reason=."
+)
+
+
+def _normalize_review_after(value: Any) -> Optional[str]:
+    """ISO date (YYYY-MM-DD) for a pause review, or None when unset. Full timestamps keep the date."""
+    if value is None or value is False:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    day = text[:10]
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(
+            f"review-after must be a date (YYYY-MM-DD), got {value!r}."
+        ) from exc
+    return day
+
+
+def _normalize_pause_reason_update(value: Any) -> Optional[str]:
+    """Pause-reason update: None clears (resume); a blank string is refused."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("paused_reason must be a string.")
+    text = value.strip()
+    if not text:
+        raise ValueError(PAUSE_REASON_REQUIRED)
+    return text
+
+
+def _normalize_transient_notify_after(value: Any) -> Optional[int]:
+    """Per-job override of ``cron.transient_notify_after``. None/'' clears it; integers < 1 are refused."""
+    if value is None or value is False:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "transient_notify_after must be an integer >= 1."
+        ) from exc
+    if count < 1:
+        raise ValueError("transient_notify_after must be an integer >= 1.")
+    return count
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Workdir -> absolute path, or None when empty. ``~`` expands; relative paths are rejected
-    (cron runs detached from any cwd); must be an existing dir now but is deliberately NOT
-    re-checked at run time (scheduler falls back with a warning). ValueError when invalid."""
+    (cron runs detached from any cwd); must be an existing directory at create/update time.
+    Dispatch re-checks and skips the occurrence (recorded, one notice) if it is later removed.
+    ValueError when invalid."""
     if workdir is None:
         return None
     raw = str(workdir).strip()
@@ -1764,6 +1819,9 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "paused_reason": _normalize_pause_reason_update,
+    "paused_review_after": _normalize_review_after,
+    "transient_notify_after": _normalize_transient_notify_after,
 }
 
 
@@ -2119,6 +2177,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if (
+            "paused_reason" in updates
+            and updates.get("paused_reason")
+            and effective_job_state(updated) != "paused"
+        ):
+            raise ValueError(
+                "paused_reason can only be set on a paused job. "
+                f'Pause it with `hermes cron pause {job.get("id", job_id)} --reason "..."`.'
+            )
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2149,16 +2216,50 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return _with_job(job_id, apply)
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+def _resolve_job_incidents(job_id: str, reason: str) -> None:
+    """Best-effort: open incidents for a removed or finished job become ``resolved``.
+
+    Store errors must not fail the removal or the run that completed the job.
+    """
+    try:
+        from cron.incidents import resolve_open_incidents
+
+        resolve_open_incidents(job_id, reason)
+    except Exception:
+        logger.debug("Could not resolve incidents for job %s", job_id, exc_info=True)
+
+
+def _completion_incident_reason(job: Dict[str, Any]) -> str:
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0)
+    kind = (job.get("schedule") or {}).get("kind")
+    if kind != "once" and times is not None and times > 0 and completed >= times:
+        return "repeat budget exhausted"
+    return "job completed"
+
+
+def pause_job(
+    job_id: str, reason: Optional[str] = None, review_after: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    ``reason`` is required and stored on ``paused_reason`` (existing paused jobs with an empty
+    reason keep working; new pauses do not). ``review_after`` is an optional YYYY-MM-DD date
+    ``hermes cron doctor`` surfaces once it has passed.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(PAUSE_REASON_REQUIRED)
+    text = reason.strip()
     return update_job(job["id"], {
         "enabled": False,
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
-        "paused_reason": reason,
+        "paused_reason": text,
+        "paused_review_after": _normalize_review_after(review_after),
     })
 
 
@@ -2198,6 +2299,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
+        "paused_review_after": None,
         "next_run_at": next_run_at,
     })
 
@@ -2220,6 +2322,7 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
+        "paused_review_after": None,
         "next_run_at": manual_run_at,
         # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
         "manual_run_at": manual_run_at,
@@ -2323,6 +2426,7 @@ def remove_job(job_id: str) -> bool:
             clear_notepad(canonical_id)
         except Exception:
             logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+        _resolve_job_incidents(canonical_id, "job removed")
         # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
         _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
         with _fire_fence_locks_guard:
@@ -2377,7 +2481,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
-    status: Optional[str], now: str,
+    status: Optional[str], now: str, *, transient: bool = False,
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
@@ -2394,9 +2498,11 @@ def _record_run_outcome(
         job.pop("preflight_alerted", None)
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
+        job["transient_failure_streak"] = 0
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count
-        # (scheduler._failure_streak_nudge).
+        # (scheduler._failure_streak_nudge). A non-transient failure breaks the transient
+        # streak so a later blip starts counting from one again.
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
         # Sticky last-failure stamp (#118354): the next success resets last_status and
         # failure_streak, which erases the only job-level trace that a run ever failed —
@@ -2404,6 +2510,10 @@ def _record_run_outcome(
         # survives success (latest failure wins); the recency window is the consumer's
         # call. Delivery failures keep their own sticky last_delivery_error.
         job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
+        if transient:
+            job["transient_failure_streak"] = int(job.get("transient_failure_streak") or 0) + 1
+        else:
+            job["transient_failure_streak"] = 0
     job["last_delivery_error"] = delivery_error
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
@@ -2475,6 +2585,7 @@ def mark_job_run(
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    transient: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2496,7 +2607,16 @@ def mark_job_run(
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
     (cron/quota_hold.py, #89376).
+
+    ``transient``: this failure is in the self-healing class (provider unreachable, idle timeout,
+    script timeout). It advances ``transient_failure_streak`` instead of clearing it. When a
+    *successful* run retires the job (repeat budget or one-shot), open incidents are resolved
+    after the save. A failed final run leaves them open — that failure is still unresolved.
+    Removing the job, and the retention sweep that later drops the record, resolve them instead.
     """
+    finished_reason: List[str] = []
+    finished_id: List[str] = []
+
     def apply(jobs, _i, job):
         if expected_fire_owner is not None:
             claim = job.get("fire_claim")
@@ -2506,8 +2626,15 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
-        _record_run_outcome(job, success, error, delivery_error, status, now)
+        was_completed = job.get("state") == "completed"
+        _record_run_outcome(
+            job, success, error, delivery_error, status, now, transient=transient)
         _advance_after_run(job, now, ladder_rung=ladder_rung)
+        # A failed final run is an unresolved failure: leave its incident open so the
+        # alert that follows this save is not immediately undone, then redone.
+        if success and job.get("state") == "completed" and not was_completed:
+            finished_reason.append(_completion_incident_reason(job))
+            finished_id.append(job["id"])
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
@@ -2530,7 +2657,10 @@ def mark_job_run(
             return False
         return found
 
-    return _under_fire_fence(job_id, locked)
+    recorded = _under_fire_fence(job_id, locked)
+    if recorded and finished_reason:
+        _resolve_job_incidents(finished_id[0] if finished_id else job_id, finished_reason[0])
+    return recorded
 
 
 def _write_oneshot_diagnostic(job: Dict[str, Any], text: str, what: str) -> bool:
@@ -2854,7 +2984,9 @@ def _sweep_completed_oneshots(
     """Prune completed one-shot records past retention (in place; True when anything was removed).
     Removed ids go into *removed_ids* so save_jobs's shrink-merge guard allows the delete. Age is
     measured from ``last_run_at``; a record without a parseable one is kept (never guess into
-    deletion)."""
+    deletion). Open incidents for a pruned id are resolved with the same reason as
+    ``remove_job`` (``job removed``) so a failed final run, which deliberately leaves its
+    incident open, does not become an orphan when the record ages out."""
     retention_days = _completed_oneshot_retention_days()
     if retention_days <= 0:
         return False
@@ -2876,6 +3008,8 @@ def _sweep_completed_oneshots(
             rid = rj.get("id")
             if removed_ids is not None and rid:
                 removed_ids.add(str(rid))
+            if rid:
+                _resolve_job_incidents(str(rid), "job removed")
             logger.info(
                 "Job '%s': pruning completed one-shot record (finished %s, retention %.1f days)",
                 rj.get("name", rj.get("id", "?")), last_run, retention_days)

@@ -114,6 +114,28 @@ tick()
   6. Release scheduler lock
 ```
 
+### Missing workdir
+
+If a job has a configured `workdir` and that path is not a directory at dispatch, the
+scheduler does not start the script or the agent. The occurrence is still accounted for:
+`mark_job_run` records `last_status=error` with `last_error` prefixed `workdir_missing:`,
+advances `next_run_at`, and clears `pending_slot`; the executions ledger gets a failed row;
+one incident with signature `workdir_missing` is opened and notified once (later ticks stay
+quiet until a successful run resolves it, or the operator closes it). Restore the directory
+or clear it with `hermes cron edit <id> --workdir ""`.
+
+### Incidents outliving a job
+
+Open incidents (`detected` / `alerted`) are resolved, with `resolution_reason`, when the job
+is removed, when the retention sweep drops a completed record, or when a run retires it
+successfully (`completed` — repeat budget exhausted or a finished one-shot, and the final run
+succeeded). A failed final run leaves the incident open: it is still an unresolved failure.
+Operator `closed` rows are left closed. A resolved row that already has a `resolution_reason`
+is not moved back to `alerted` or `detected` by a late alert; a new occurrence of the same
+error reopens it through the incident upsert. Incidents whose job id is already gone are listed by
+`hermes cron incidents --prune-orphans` and resolved by the same command with `--apply`.
+Doctor reports them and does not write.
+
 ### Missed-occurrence contract (restart gaps)
 
 Recurring jobs are **at-most-once per occurrence, and every occurrence is

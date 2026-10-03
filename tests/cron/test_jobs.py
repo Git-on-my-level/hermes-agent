@@ -675,7 +675,7 @@ class TestPauseResumeJob:
         now = datetime(2026, 9, 16, 17, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
         ahead = create_job(prompt="daily", schedule="30 1 * * *", deliver="local")
-        pause_job(ahead["id"])
+        pause_job(ahead["id"], reason="test")
         canary = create_job(prompt="canary", schedule="0 9 * * *", deliver="local", paused=True)
         assert get_job(canary["id"])["next_run_at"] is None
 

@@ -1813,6 +1813,9 @@ export { Codicon } from '@/components/ui/codicon'
  *  literal hex drifts off-theme the moment the palette moves. */
 export { ColorSwatches } from '@/components/ui/color-swatches'
 export { ConfirmDialog } from '@/components/ui/confirm-dialog'
+/** Text collected through the app confirm modal. Electron has no
+ *  `window.prompt`, so a pause reason goes through this. */
+export { promptText } from '@/store/confirm'
 export {
   ContextMenu,
   ContextMenuCheckboxItem,

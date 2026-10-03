@@ -587,6 +587,7 @@ export const arCommandCenter = {
     pause: 'إيقاف مؤقت',
     resumeTitle: 'استئناف المهمة',
     pauseTitle: 'إيقاف المهمة مؤقتا',
+    pauseReasonPrompt: 'لماذا تم إيقاف هذه المهمة مؤقتًا؟',
     triggerNow: 'تشغيل الآن',
     edit: 'تحرير',
     deleteTitle: 'حذف المهمة',

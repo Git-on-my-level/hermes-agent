@@ -2509,6 +2509,7 @@ export const ru = defineLocale({
     pause: 'Приостановить cron',
     resumeTitle: 'Продолжить',
     pauseTitle: 'Приостановить',
+    pauseReasonPrompt: 'Почему эта задача на паузе?',
     triggerNow: 'Запустить сейчас',
     edit: 'Изменить cron',
     deleteTitle: 'Удалить cron-задачу?',

@@ -329,6 +329,7 @@ export const en: Translations = {
     /** Banner when the ticker heartbeat is stale; {when} is a relative time such as "7h ago". */
     schedulerLastTicked: "Scheduler last ticked {when} — jobs that came due since then have not fired",
     pause: "Pause",
+    pauseReasonPrompt: "Why is this job paused?",
     resume: "Resume",
     triggerNow: "Trigger now",
     delivery: {

@@ -327,6 +327,10 @@ class CronJobCreate(BaseModel):
 class CronJobUpdate(BaseModel):
     updates: dict
 
+class CronJobPause(BaseModel):
+    reason: str
+    review_after: Optional[str] = None
+
 class AutomationBlueprintInstantiate(BaseModel):
     blueprint: str  # blueprint key, e.g. "morning-brief"
     values: Dict[str, Any] = {}  # filled slot values from the form

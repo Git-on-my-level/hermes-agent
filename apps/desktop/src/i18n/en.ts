@@ -3395,6 +3395,7 @@ export const en: Translations = {
     pause: 'Pause cron',
     resumeTitle: 'Resume',
     pauseTitle: 'Pause',
+    pauseReasonPrompt: 'Why is this job paused?',
     triggerNow: 'Trigger now',
     edit: 'Edit cron',
     deleteTitle: 'Delete cron job?',

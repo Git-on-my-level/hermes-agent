@@ -14,6 +14,7 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
+import { askCronPauseReason } from '../../cron/pause-reason'
 import { updateCronJobs } from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
@@ -268,8 +269,15 @@ function CronJobSidebarRow({
   // overlay uses) — the sidebar and overlay render from that one atom, so the
   // row updates in place.
   const togglePause = async () => {
+    let pauseReason: string | undefined
+    if (!isPaused) {
+      pauseReason = (await askCronPauseReason({ confirmLabel: c.pauseTitle, prompt: c.pauseReasonPrompt })) ?? undefined
+      if (!pauseReason) {
+        return
+      }
+    }
     try {
-      const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id)
+      const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id, pauseReason)
       updateCronJobs(rows => rows.map(row => (row.id === job.id ? updated : row)))
       notify({ kind: 'success', title: isPaused ? c.resumed : c.paused, message: label })
     } catch (err) {

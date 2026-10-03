@@ -1389,6 +1389,18 @@ def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
         "missing_servers": sorted(missing_servers), "reset": bool(session), "unknown": unknown})
 
 
+def _cron_manage_reply(rid, payload: dict) -> dict:
+    """A cronjob() body with ``success: false`` is an RPC error.
+
+    Wrapping that JSON in a successful result made pause look done to clients
+    that only checked the RPC status (a reasonless pause returned an error
+    string and the UI treated the job as paused).
+    """
+    if payload.get("success") is False:
+        return _err(rid, 4020, str(payload.get("error") or "cron action failed"))
+    return _ok(rid, payload)
+
+
 # ─── Cron / learning / skills ────────────────────────────────────────────────
 @_scoped_rpc("cron.manage", 5023)
 def _(rid, params: dict) -> dict:
@@ -1403,7 +1415,7 @@ def _(rid, params: dict) -> dict:
         # keep the safe [bot:<name>] filter.
         if profile := _str_arg(params, "profile"):
             result["scoped"] = profile
-        return _ok(rid, result)
+        return _cron_manage_reply(rid, result)
     if action == "add":
         # Optional repeat / continuity / deliver ('bot-chat[:name]'): None keeps each cronjob() default.
         raw = cronjob(
@@ -1411,9 +1423,15 @@ def _(rid, params: dict) -> dict:
             repeat=int(params["repeat"]) if str(params.get("repeat", "")).strip().isdigit() else None,
             continuity=is_truthy_value(params.get("continuity")) if params.get("continuity") is not None else None,
             deliver=_str_arg(params, "deliver") or None)
-        return _ok(rid, json.loads(raw))
-    if action in {"remove", "pause", "resume"}:
-        return _ok(rid, json.loads(cronjob(action=action, job_id=jid)))
+        return _cron_manage_reply(rid, json.loads(raw))
+    if action == "pause":
+        raw = cronjob(
+            action="pause", job_id=jid,
+            reason=_str_arg(params, "reason") or None,
+            review_after=_str_arg(params, "review_after") or None)
+        return _cron_manage_reply(rid, json.loads(raw))
+    if action in {"remove", "resume"}:
+        return _cron_manage_reply(rid, json.loads(cronjob(action=action, job_id=jid)))
     return _err(rid, 4016, f"unknown cron action: {action}")
 
 

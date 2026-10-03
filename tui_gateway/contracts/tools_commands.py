@@ -431,6 +431,9 @@ class CronManageParams(Params):
     continuity: bool | str | None = None
     deliver: str | None = None
     profile: str | None = None
+    # pause only. A missing/blank reason is a tool error, returned as an RPC error.
+    reason: str | None = None
+    review_after: str | None = None
 
 
 class CronJobRow(_Open):
@@ -480,7 +483,8 @@ class CronRemovedJob(Result):
 class CronManageResult(_Open):
     """Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` → ``jobs``/``count``
     (+ ``scoped`` when profile-scoped); ``add`` → the created job's summary + ``job``; ``remove`` →
-    ``removed_job``; ``pause``/``resume`` → ``job``. A tool-level failure lands in ``error``."""
+    ``removed_job``; ``pause``/``resume`` → ``job``. A tool-level failure (``success`` false,
+    including a pause with no reason) is an RPC error, not a successful result with ``error``."""
 
     success: bool | None = None
     error: str | None = None

@@ -3170,6 +3170,7 @@ export const zh = defineLocale({
     pause: '暂停定时任务',
     resumeTitle: '恢复',
     pauseTitle: '暂停',
+    pauseReasonPrompt: '为什么暂停这个任务？',
     triggerNow: '立即触发',
     edit: '编辑定时任务',
     deleteTitle: '删除定时任务？',

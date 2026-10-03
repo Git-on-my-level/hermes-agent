@@ -508,6 +508,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": effective_job_state(job),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "paused_review_after": job.get("paused_review_after"),
     }
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):

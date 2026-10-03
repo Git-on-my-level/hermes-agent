@@ -2825,6 +2825,7 @@ export interface Translations {
     pause: string
     resumeTitle: string
     pauseTitle: string
+    pauseReasonPrompt: string
     triggerNow: string
     edit: string
     deleteTitle: string

@@ -340,6 +340,8 @@ export interface Translations {
     overdueSince?: string;
     schedulerLastTicked?: string;
     pause: string;
+    /** Optional — English fallback until translated. */
+    pauseReasonPrompt?: string;
     resume: string;
     triggerNow: string;
     delivery: {

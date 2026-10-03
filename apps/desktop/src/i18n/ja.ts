@@ -2315,6 +2315,7 @@ export const ja = defineLocale({
     pause: '一時停止',
     resumeTitle: '再開',
     pauseTitle: '一時停止',
+    pauseReasonPrompt: 'このジョブを一時停止する理由は？',
     triggerNow: '今すぐ実行',
     edit: 'Cron を編集',
     deleteTitle: 'Cron ジョブを削除しますか？',

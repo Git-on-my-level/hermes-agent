@@ -789,7 +789,12 @@ export default function CronPage() {
           "success",
         );
       } else {
-        await api.pauseCronJob(job.id, profile);
+        const reason = window.prompt(t.cron.pauseReasonPrompt ?? "Why is this job paused?")?.trim();
+        if (!reason) {
+          showToast(t.cron.pauseReasonPrompt ?? "Why is this job paused?", "error");
+          return;
+        }
+        await api.pauseCronJob(job.id, profile, reason);
         showToast(
           `${t.cron.pause}: "${truncateText(getJobTitle(job), 30)}"`,
           "success",

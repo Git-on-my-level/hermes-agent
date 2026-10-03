@@ -512,6 +512,7 @@ export const zhHantCommandCenter = {
     pause: '暫停',
     resumeTitle: '繼續',
     pauseTitle: '暫停',
+    pauseReasonPrompt: '為什麼暫停這個任務？',
     triggerNow: '立即觸發',
     edit: '編輯排程工作',
     deleteTitle: '刪除排程工作？',
