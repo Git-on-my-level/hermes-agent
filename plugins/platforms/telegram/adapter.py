@@ -588,6 +588,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        # Downloads still in flight for an album/burst. The quiet-window flush must not
+        # dispatch until these hit zero — the window starts when the first download
+        # finishes, and a slower sibling would otherwise become a queued follow-up.
+        self._media_collect_inflight: Dict[str, int] = {}
+        self._media_collect_idle: Dict[str, asyncio.Event] = {}
         # Aggregate client-side splits of long messages into one MessageEvent; bounds are conservative
         # for Telegram's ~1 edit/s flood envelope.
         self._text_batch_delay_seconds = self._env_float_clamped(
@@ -3377,6 +3382,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._media_group_tasks, self._media_group_events, self._pending_photo_batch_tasks,
             self._pending_photo_batches, self._pending_text_batch_tasks, self._pending_text_batches):
             d.clear()
+        # Partial test adapters build via object.__new__ and never run __init__.
+        idle_map = getattr(self, "_media_collect_idle", None)
+        if idle_map:
+            for idle in idle_map.values():
+                idle.set()
+            idle_map.clear()
+        inflight = getattr(self, "_media_collect_inflight", None)
+        if inflight is not None:
+            inflight.clear()
         self._clear_task_attrs_except(
             current_task, "_polling_error_task", "_polling_progress_verifier_task", "_held_inbound_redispatch_task")
 
@@ -6557,17 +6571,25 @@ class TelegramAdapter(BasePlatformAdapter):
             pending._last_chunk_len = _inbound_chunk_len(event.text)  # type: ignore[attr-defined]
         self._accept_update()
 
-    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
+    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None, collect_token: Optional[str] = None) -> None:
         """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
-        the pop but before durable dispatch re-holds the event (never lose it)."""
+        the pop but before durable dispatch re-holds the event (never lose it).
+
+        ``collect_token`` holds the pop while a sibling attachment for that album/burst is still
+        downloading. The quiet window starts when the first item is enqueued, which is after its
+        download; without the hold a slower sibling misses the window and is queued as the next turn.
+        """
         current_task = asyncio.current_task()
         event = None
         try:
             await asyncio.sleep(delay)
             # Superseded flush (a newer chunk re-armed the timer while our sleep was already done):
             # CancelledError only lands at the next await, so check synchronously before the pop.
-            owner = tasks.get(key)
-            if owner is not None and owner is not current_task:
+            if not self._flush_still_owner(tasks, key, current_task):
+                return
+            if collect_token and not await self._wait_media_collect_idle(collect_token, tasks, key, current_task):
+                return
+            if not self._flush_still_owner(tasks, key, current_task):
                 return
             event = pending.pop(key, None)
             if not event:
@@ -6587,6 +6609,62 @@ class TelegramAdapter(BasePlatformAdapter):
         finally:
             if tasks.get(key) is current_task:
                 tasks.pop(key, None)
+
+    @staticmethod
+    def _flush_still_owner(tasks: dict, key: str, current_task) -> bool:
+        owner = tasks.get(key)
+        return owner is None or owner is current_task
+
+    def _media_collect_token(self, msg, event: MessageEvent) -> Optional[str]:
+        """Album items share a media_group_id; photo bursts share a batch key.
+
+        Voice, video, and documents dispatch immediately, so they must not take a token.
+        Computing a photo-burst key calls ``_event_session_key``, which partial test
+        adapters and pre-download size gates do not satisfy.
+        """
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id:
+            return f"album:{media_group_id}"
+        if not getattr(msg, "photo", None):
+            return None
+        return f"burst:{self._photo_batch_key(event, msg)}"
+
+    def _ensure_media_collect_maps(self) -> None:
+        if not hasattr(self, "_media_collect_inflight"):
+            self._media_collect_inflight = {}
+        if not hasattr(self, "_media_collect_idle"):
+            self._media_collect_idle = {}
+
+    def _begin_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
+        inflight = self._media_collect_inflight.get(token, 0) + 1
+        self._media_collect_inflight[token] = inflight
+        if inflight == 1:
+            self._media_collect_idle[token] = asyncio.Event()
+
+    def _end_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
+        remaining = self._media_collect_inflight.get(token, 0) - 1
+        if remaining > 0:
+            self._media_collect_inflight[token] = remaining
+            return
+        self._media_collect_inflight.pop(token, None)
+        idle = self._media_collect_idle.pop(token, None)
+        if idle is not None:
+            idle.set()
+
+    async def _wait_media_collect_idle(self, token: str, tasks: dict, key: str, current_task) -> bool:
+        """Block until sibling downloads for ``token`` finish. False if a newer flush took the slot."""
+        inflight = getattr(self, "_media_collect_inflight", None)
+        idle_map = getattr(self, "_media_collect_idle", None)
+        while inflight is not None and inflight.get(token, 0) > 0:
+            if not self._flush_still_owner(tasks, key, current_task):
+                return False
+            idle = idle_map.get(token) if idle_map is not None else None
+            if idle is None:
+                return self._flush_still_owner(tasks, key, current_task)
+            await idle.wait()
+        return self._flush_still_owner(tasks, key, current_task)
 
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """Adaptive delay: near-split-point last chunk → long delay (continuation almost certain);
@@ -6622,7 +6700,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a buffered photo burst/album as a single MessageEvent."""
         await self._flush_buffered(
             self._pending_photo_batches, self._pending_photo_batch_tasks, batch_key, self._media_batch_delay_seconds, "photo",
-            lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)))
+            lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)),
+            collect_token=f"burst:{batch_key}")
 
     def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
         """Merge ``event`` into ``pending[key]`` (media + caption) or seed it."""
@@ -6830,6 +6909,19 @@ class TelegramAdapter(BasePlatformAdapter):
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
+        # Hold the album/burst open for the whole download. The quiet window starts when the
+        # first item is enqueued (after its download); a slower sibling must still join that
+        # first message instead of hitting the busy queue.
+        collect_token = self._media_collect_token(msg, event)
+        if collect_token:
+            self._begin_media_collect(collect_token)
+        try:
+            return await self._cache_and_route_media(msg, event)
+        finally:
+            if collect_token:
+                self._end_media_collect(collect_token)
+
+    async def _cache_and_route_media(self, msg, event: MessageEvent) -> None:
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
@@ -6882,7 +6974,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _flush_media_group_event(self, media_group_id: str) -> None:
         await self._flush_buffered(
-            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group")
+            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group",
+            collect_token=f"album:{media_group_id}")
 
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """Describe a sticker via vision, cached by file_unique_id; animated/video stickers get an emoji placeholder."""
