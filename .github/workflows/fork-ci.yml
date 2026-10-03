@@ -12,7 +12,11 @@ name: Fork CI
 on:
   pull_request:
   push:
-    branches: [main, prod]
+    # sync/* is listed so a conflicted sync PR (prod cannot merge-commit
+    # origin/main) still runs Fork CI on the branch head. pull_request
+    # workflows need a merge ref, which GitHub does not build while the
+    # PR is dirty.
+    branches: [main, prod, sync/upstream-2026-10-04]
 
 permissions:
   contents: read
