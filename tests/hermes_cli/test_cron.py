@@ -328,7 +328,7 @@ class TestCronListStatusRendering:
     def test_default_list_includes_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
         job = create_job(prompt="Paused digest", schedule="every 1h")
-        pause_job(job["id"])
+        pause_job(job["id"], reason="test")
 
         cron_command(Namespace(cron_command="list", all=False))
 

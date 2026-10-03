@@ -306,7 +306,9 @@ class TestUnifiedCronjobTool:
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
 
-        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        refused = json.loads(cronjob(action="pause", job_id=job_id))
+        assert refused["success"] is False
+        paused = json.loads(cronjob(action="pause", job_id=job_id, reason="maintenance"))
         assert paused["success"] is True
         assert paused["job"]["state"] == "paused"
 

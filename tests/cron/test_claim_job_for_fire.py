@@ -55,7 +55,7 @@ def test_claim_paused_job_returns_false(temp_home):
     from cron.jobs import create_job, claim_job_for_fire, pause_job
 
     job = create_job(prompt="x", schedule="every 5m", name="p")
-    pause_job(job["id"])
+    pause_job(job["id"], reason="test")
     assert claim_job_for_fire(job["id"]) is False
 
 
@@ -65,7 +65,7 @@ def test_forced_claim_atomically_resumes_paused_job(temp_home):
     from cron.jobs import create_job, claim_job_for_fire, get_job, pause_job
 
     job = create_job(prompt="x", schedule="every 5m", name="manual")
-    pause_job(job["id"])
+    pause_job(job["id"], reason="test")
 
     assert claim_job_for_fire(job["id"], force=True) is True
     claimed = get_job(job["id"])
@@ -337,7 +337,7 @@ def test_manual_claim_still_refuses_a_paused_job(temp_home):
     from cron.jobs import create_job, claim_job_for_fire, get_job, pause_job
 
     job = create_job(prompt="x", schedule="every 5m", name="mp")
-    pause_job(job["id"])
+    pause_job(job["id"], reason="test")
 
     assert claim_job_for_fire(job["id"], manual=True) is False
     assert get_job(job["id"]).get("paused_at") is not None

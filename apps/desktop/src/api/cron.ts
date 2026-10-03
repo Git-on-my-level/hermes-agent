@@ -82,12 +82,13 @@ export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<C
   })
 }
 
-export function pauseCronJob(jobId: string): Promise<CronJob> {
+export function pauseCronJob(jobId: string, reason?: string): Promise<CronJob> {
   return hermesApi<CronJob>({
     ...profileScoped(),
     ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
-    method: 'POST'
+    method: 'POST',
+    ...(reason ? { body: { reason } } : {})
   })
 }
 

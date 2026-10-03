@@ -257,8 +257,15 @@ function CronJobSidebarRow({
   // overlay uses) — the sidebar and overlay render from that one atom, so the
   // row updates in place.
   const togglePause = async () => {
+    let pauseReason: string | undefined
+    if (!isPaused) {
+      pauseReason = window.prompt(c.pauseReasonPrompt)?.trim()
+      if (!pauseReason) {
+        return
+      }
+    }
     try {
-      const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id)
+      const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id, pauseReason)
       updateCronJobs(rows => rows.map(row => (row.id === job.id ? updated : row)))
       notify({ kind: 'success', title: isPaused ? c.resumed : c.paused, message: label })
     } catch (err) {
