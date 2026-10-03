@@ -19,7 +19,7 @@ from hermes_cli.config import cfg_get
 from hermes_cli.web_server_cron import (
     _create_cron_job_sync, _cron_optional_text, _cron_string_list, _mutate_cron_for_profile, _normalize_dashboard_cron_script, _raise_if_cron_registration_error, _run_cron_dashboard_io, _validate_dashboard_cron_context_from, _validate_dashboard_cron_effective_job,
 )
-from hermes_cli.web_models import AutomationBlueprintInstantiate, CronJobCreate, CronJobUpdate
+from hermes_cli.web_models import AutomationBlueprintInstantiate, CronJobCreate, CronJobPause, CronJobUpdate
 from hermes_cli.web_routers._common import log as _log
 
 router = APIRouter()
@@ -183,8 +183,20 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
     return _found(job)
 
 
-def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
-    return _found(_mutate_cron_for_profile(_job_profile(job_id, profile), "pause_job", job_id))
+def _pause_cron_job_sync(
+    job_id: str, reason: str, profile: Optional[str] = None, review_after: Optional[str] = None,
+):
+    text = reason.strip() if isinstance(reason, str) else ""
+    if not text:
+        raise HTTPException(status_code=400, detail="Pausing a cron job requires a non-empty reason.")
+    kwargs = {"reason": text}
+    if review_after:
+        kwargs["review_after"] = review_after
+    try:
+        return _found(_mutate_cron_for_profile(
+            _job_profile(job_id, profile), "pause_job", job_id, **kwargs))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
@@ -280,8 +292,9 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
 
 
 @router.post("/api/cron/jobs/{job_id}/pause")
-async def pause_cron_job(job_id: str, profile: Optional[str] = None):
-    return await _run_cron_dashboard_io(_pause_cron_job_sync, job_id, profile)
+async def pause_cron_job(job_id: str, body: CronJobPause, profile: Optional[str] = None):
+    return await _run_cron_dashboard_io(
+        _pause_cron_job_sync, job_id, body.reason, profile, body.review_after)
 
 
 @router.post("/api/cron/jobs/{job_id}/resume")

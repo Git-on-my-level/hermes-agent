@@ -154,10 +154,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution.")
+    cron_edit.add_argument("--paused-reason", dest="paused_reason",
+        help="Set the reason on an already-paused job (non-empty). "
+             "Refused when the job is not paused.")
+    cron_edit.add_argument("--paused-review-after", dest="paused_review_after",
+        help="YYYY-MM-DD date after which doctor flags this pause. Empty string clears it.")
+    cron_edit.add_argument("--transient-notify-after", dest="transient_notify_after",
+        help="Consecutive transient failures before a notice (integer >= 1). "
+             "Empty string clears the per-job override and follows cron.transient_notify_after.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
+    cron_pause.add_argument("--reason", required=True,
+        help="Why this job is paused (required, non-empty).")
+    cron_pause.add_argument("--review-after", dest="review_after",
+        help="YYYY-MM-DD date; doctor flags the pause once this day has arrived.")
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
@@ -189,6 +201,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "incident_action", nargs="?", default="list", choices=["list", "ack"],
         help="Action (default: list)")
     cron_incidents.add_argument("incident_id", nargs="?", help="Incident ID to acknowledge (ack)")
+    _flag(cron_incidents, "--prune-orphans", dest="prune_orphans",
+        help="List open incidents whose job no longer exists (add --apply to resolve them)")
+    _flag(cron_incidents, "--apply",
+        help="With --prune-orphans, resolve the listed orphan incidents")
 
     # notepad: per-job durable KV, injected into the job prompt each run.
     cron_notepad = cron_subparsers.add_parser(

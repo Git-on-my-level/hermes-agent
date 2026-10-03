@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { askCronPauseReason } from './pause-reason'
 import {
   Dialog,
   DialogContent,
@@ -464,13 +465,20 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
   }
 
   async function handlePauseResume(job: CronJob) {
+    const isPaused = jobState(job) === 'paused'
+    let pauseReason: string | undefined
+    if (!isPaused) {
+      pauseReason = (await askCronPauseReason({ confirmLabel: c.pauseTitle, prompt: c.pauseReasonPrompt })) ?? undefined
+      if (!pauseReason) {
+        return
+      }
+    }
+
     const busyToken = beginJobBusy(job.id)
 
     try {
-      const isPaused = jobState(job) === 'paused'
-
       const { refreshError, stale } = await mutateAndRefreshCronJobs(profile, () =>
-        isPaused ? resumeCronJob(job.id) : pauseCronJob(job.id)
+        isPaused ? resumeCronJob(job.id) : pauseCronJob(job.id, pauseReason)
       )
 
       if (stale) {

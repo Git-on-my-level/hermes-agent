@@ -326,11 +326,37 @@ _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "res
                           "closed": Colors.DIM}
 
 
+def _prune_orphan_incidents(*, apply: bool) -> int:
+    """Plan (default) or apply resolution of open incidents whose job id is gone."""
+    from cron.incidents import list_open_orphan_incidents, resolve_orphan_incidents
+    from cron.jobs import list_jobs
+
+    known = {str(job.get("id")) for job in list_jobs(include_disabled=True)}
+    orphans = list_open_orphan_incidents(known)
+    if not orphans:
+        print(color("No orphaned open incidents.", Colors.DIM))
+        return 0
+    for inc in orphans:
+        print(f"  {color(inc['id'], Colors.YELLOW)}  job {inc.get('job_id')}  {inc.get('state')}")
+    if not apply:
+        print(color(
+            f"  {len(orphans)} orphan(s). Re-run with --apply to resolve them "
+            "(reason: job no longer exists).",
+            Colors.DIM))
+        return 0
+    changed = resolve_orphan_incidents(known, "job no longer exists")
+    print(color(f"Resolved {changed} orphaned incident(s).", Colors.GREEN))
+    return 0
+
+
 def cron_incidents(args) -> int:
     """List (``[--state <s>]``) or ``ack <id>`` durable cron failure incidents.
 
     Acking closes an incident so its failure ping stays silent until the error signature changes.
+    ``--prune-orphans`` lists open incidents whose job is gone; ``--apply`` resolves them.
     """
+    if getattr(args, "prune_orphans", False):
+        return _prune_orphan_incidents(apply=bool(getattr(args, "apply", False)))
     from cron.incidents import ack_incident, list_incidents
     action = getattr(args, "incident_action", "list")
     if action == "ack":
@@ -640,9 +666,59 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     if script and (script_issue := _script_health_issue(script)):
         issues.append(script_issue)
     workdir = str(job.get("workdir") or "").strip()
-    if workdir and not Path(workdir).expanduser().exists():
-        issues.append(f"workdir not found: {workdir}")
+    # Same predicate as dispatch (``_missing_workdir_result``): a file, a broken
+    # symlink, or a missing path is not a directory, so the run will be skipped.
+    if workdir and not Path(workdir).expanduser().is_dir():
+        issues.append(
+            f"workdir is not a directory: {workdir} — the scheduler records the slot and skips the run "
+            "(incident workdir_missing) instead of starting the agent")
     return issues
+
+
+def _cron_doctor_pause_audit_findings() -> List[str]:
+    """Paused jobs with no reason, and pauses whose review date has arrived.
+
+    Doctor stays read-only. Existing pauses with an empty reason keep not firing; this only
+    tells the operator how to record intent.
+    """
+    from cron.jobs import effective_job_state, list_jobs
+    from hermes_time import now as hermes_now
+
+    today = hermes_now().date().isoformat()
+    findings: List[str] = []
+    for job in list_jobs(include_disabled=True):
+        if effective_job_state(job) != "paused":
+            continue
+        job_id = job.get("id")
+        label = job.get("name") or job_id
+        reason = str(job.get("paused_reason") or "").strip()
+        if not reason:
+            findings.append(
+                f"paused job '{label}' ({job_id}) has no paused_reason — intent is unknown. "
+                f'Add one with: hermes cron edit {job_id} --paused-reason "..."')
+        review = str(job.get("paused_review_after") or "").strip()
+        if review and review <= today:
+            why = f" (reason: {reason})" if reason else ""
+            findings.append(
+                f"paused job '{label}' ({job_id}) review date {review} has passed{why}. "
+                f"Resume with `hermes cron resume {job_id}` or set a new date with "
+                f"`hermes cron edit {job_id} --paused-review-after YYYY-MM-DD`.")
+    return findings
+
+
+def _cron_doctor_orphan_incident_line() -> Optional[str]:
+    """Read-only count of open incidents whose job is gone. Does not create the ledger."""
+    from cron.incidents import list_open_orphan_incidents
+    from cron.jobs import list_jobs
+
+    known = {str(job.get("id")) for job in list_jobs(include_disabled=True)}
+    orphans = list_open_orphan_incidents(known)
+    if not orphans:
+        return None
+    return (
+        f"{len(orphans)} open incident(s) whose job no longer exists. "
+        "Review with `hermes cron incidents --prune-orphans`, then "
+        "`hermes cron incidents --prune-orphans --apply` to resolve them.")
 
 
 def cron_doctor(args=None) -> int:
@@ -656,13 +732,21 @@ def cron_doctor(args=None) -> int:
     history_lines = _cron_doctor_history_findings(jobs)
     orphan_dirs = _cron_doctor_orphan_output_dirs(jobs)
     dependency_findings = _cron_doctor_pause_propagation_findings(jobs)
-    if not findings and not history_lines and not orphan_dirs and not dependency_findings:
+    pause_audit = _cron_doctor_pause_audit_findings()
+    orphan_incident_line = _cron_doctor_orphan_incident_line()
+    if not any((
+        findings, history_lines, orphan_dirs, dependency_findings,
+        pause_audit, orphan_incident_line,
+    )):
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
         print(color(note, Colors.DIM))
         return 0
     issue_count = sum(len(issues) for _, issues in findings)
-    if issue_count or history_lines or orphan_dirs or dependency_findings:
+    if any((
+        issue_count, history_lines, orphan_dirs, dependency_findings,
+        pause_audit, orphan_incident_line,
+    )):
         print(color("Cron doctor found issues:", Colors.YELLOW))
         print()
     for job, issues in findings:
@@ -696,6 +780,13 @@ def cron_doctor(args=None) -> int:
                 print(color(f"  Could not prune {job_id} (see log).", Colors.YELLOW))
         else:
             print(color("  Run `hermes cron doctor --prune` to remove them.", Colors.DIM))
+    if pause_audit:
+        print()
+        for line in pause_audit:
+            print(f"  {color('⚠', Colors.YELLOW)} {line}")
+    if orphan_incident_line:
+        print()
+        print(f"  {color('⚠', Colors.YELLOW)} {orphan_incident_line}")
     print()
     print(color("Review the findings above, then run `hermes cron doctor` again.", Colors.DIM))
     return 1
@@ -990,10 +1081,16 @@ def cron_edit(args):
     elif add_skills or remove_skills:
         final_skills = [skill for skill in existing_skills if skill not in remove_skills]
         final_skills += [skill for skill in add_skills if skill not in final_skills]
+    pause_fields = {
+        key: getattr(args, key, None)
+        for key in ("paused_reason", "paused_review_after", "transient_notify_after")
+        if getattr(args, key, None) is not None
+    }
     result = _cron_api(action="update", job_id=args.job_id,
                        schedule=getattr(args, "schedule", None),
                        prompt=getattr(args, "prompt", None), skills=final_skills,
-                       no_agent=getattr(args, "no_agent", None), **_job_api_kwargs(args))
+                       no_agent=getattr(args, "no_agent", None),
+                       **pause_fields, **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -1010,6 +1107,30 @@ def cron_edit(args):
     print(f"  Skills: {', '.join(updated['skills'])}" if updated.get("skills") else
           "  Skills: none")
     _print_job_details(updated)
+    return 0
+
+
+def cron_pause(args) -> int:
+    """Pause a job. ``--reason`` is required and must be non-empty."""
+    reason = getattr(args, "reason", None)
+    if not isinstance(reason, str) or not reason.strip():
+        print(color(
+            'Pausing requires a non-empty --reason. '
+            'Example: hermes cron pause <id> --reason "..."',
+            Colors.RED))
+        return 1
+    result = _cron_api(
+        action="pause", job_id=args.job_id, reason=reason.strip(),
+        review_after=getattr(args, "review_after", None))
+    if not result.get("success"):
+        print(color(f"Failed to pause job: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    job = result.get("job") or {}
+    print(color(f"Paused job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN))
+    if job.get("paused_reason"):
+        print(f"  Reason: {job['paused_reason']}")
+    if job.get("paused_review_after"):
+        print(f"  Review after: {job['paused_review_after']}")
     return 0
 
 
@@ -1139,7 +1260,7 @@ _CRON_SUBCOMMANDS = {
     "notepad": lambda a: cron_notepad(a),
     "create": lambda a: cron_create(a),
     "edit": lambda a: cron_edit(a),
-    "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
+    "pause": lambda a: cron_pause(a),
     "resume": lambda a: cron_resume(a),
     "run": lambda a: _job_action("run", a.job_id, "Triggered"),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),

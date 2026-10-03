@@ -1849,6 +1849,10 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # Consecutive transient failures (provider unreachable, script timeout, idle timeout,
+        # empty cron output) before a notice. 1 alerts on the first failure — today's behavior.
+        # A job's transient_notify_after overrides this. The incident is still recorded immediately.
+        "transient_notify_after": 1,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per

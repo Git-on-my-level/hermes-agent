@@ -132,6 +132,77 @@ def inactivity_notice(job_name: str, job_id: str) -> str:
     )
 
 
+_IDLE_TIMEOUT_RE = re.compile(r"idle for \d+s\s*\(limit \d+s\)")
+
+
+def workdir_missing_notice(job_name: str, job_id: str, error: str) -> str:
+    """One notice when a configured workdir is gone. Later ticks stay quiet until it is restored."""
+    detail = str(error or "").strip()
+    if detail.lower().startswith("workdir_missing:"):
+        detail = detail.split(":", 1)[1].strip()
+    return (
+        f"⚠️ Cron '{job_name}' did not run: {detail}. The occurrence was recorded and the agent "
+        f"was not started. Restore the directory, or clear it with `hermes cron edit {job_id} "
+        f"--workdir \"\"`. This notice is sent once until the job runs successfully."
+    )
+
+
+def is_transient_cron_failure(job: dict, error: Optional[str]) -> bool:
+    """Self-healing failures: a single blip should not page when a streak threshold is set.
+
+    Provider-unreachable (the scheduler's ``_model_unreachable`` flag), a script timeout, the
+    inactivity watchdog, and an empty cron response. Other errors are standing failures.
+    """
+    if job.get("_model_unreachable"):
+        return True
+    text = (error or "").strip().lower()
+    # The script runner returns "Script timed out after ..."; an exception path prefixes the type.
+    if text.startswith("script timed out") or ": script timed out" in text:
+        return True
+    if _IDLE_TIMEOUT_RE.search(text):
+        return True
+    if "cron_incomplete_no_output" in text or "produced empty response" in text:
+        return True
+    return False
+
+
+def transient_notify_after(job: dict) -> int:
+    """How many consecutive transient failures before a notice. Job field, else config, else 1.
+
+    Values below 1 are treated as 1 so a mis-set override cannot silence failures entirely.
+    """
+    raw = job.get("transient_notify_after")
+    if raw not in (None, ""):
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            count = 1
+        return count if count >= 1 else 1
+    from cron.jobs import _cron_config_number
+
+    count = _cron_config_number("transient_notify_after", 1, int)
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        return 1
+    return count if count >= 1 else 1
+
+
+def transient_notice_withheld(job: dict, error: Optional[str]) -> bool:
+    """True when this transient failure is still under the notify threshold.
+
+    The stored streak is the count *before* this run; delivery is decided before ``mark_job_run``
+    increments it. Threshold 1 (the default) never withholds, so today's paging is unchanged.
+    """
+    if not is_transient_cron_failure(job, error):
+        return False
+    threshold = transient_notify_after(job)
+    if threshold <= 1:
+        return False
+    streak = int(job.get("transient_failure_streak") or 0)
+    return streak + 1 < threshold
+
+
 def blocked_config_notice(job_name: str, reason: str) -> str:
     """One-time notice when the pre-run configuration check refused to start the job."""
     reason = reason.rstrip()

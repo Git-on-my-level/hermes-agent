@@ -26,6 +26,21 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+  A configured `workdir` that is not a directory at dispatch is one of those recorded skips
+  (`last_error` prefix `workdir_missing:`, one `workdir_missing` incident) — the agent and
+  script do not start.
+- New pauses require a non-empty `paused_reason` (`hermes cron pause --reason`, the cronjob
+  tool, and both pause APIs). Jobs already paused with an empty reason stay paused; doctor
+  names `hermes cron edit <id> --paused-reason`. Optional `paused_review_after` (YYYY-MM-DD)
+  is flagged by doctor once that day has arrived.
+- Removing a job, the retention sweep that drops a completed record, or a run that
+  retires the job **successfully**, resolves its open incidents (`resolution_reason` set;
+  operator `closed` rows stay closed). A failed final run leaves its incident open — that
+  failure is still unresolved. Pre-existing orphans are `hermes cron incidents
+  --prune-orphans` (plan) / `--apply`.
+- `cron.transient_notify_after` (default 1) and a per-job override withhold the *notice* for
+  transient failures until N consecutive ones. The incident is still recorded as `detected`
+  immediately. 1 preserves today's paging.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**

@@ -11380,6 +11380,30 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "review_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Review After"
           }
         },
         "title": "CronManageParams",
@@ -11387,7 +11411,7 @@
       },
       "CronManageResult": {
         "additionalProperties": true,
-        "description": "Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` \u2192 ``jobs``/``count``\n(+ ``scoped`` when profile-scoped); ``add`` \u2192 the created job's summary + ``job``; ``remove`` \u2192\n``removed_job``; ``pause``/``resume`` \u2192 ``job``. A tool-level failure lands in ``error``.",
+        "description": "Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` \u2192 ``jobs``/``count``\n(+ ``scoped`` when profile-scoped); ``add`` \u2192 the created job's summary + ``job``; ``remove`` \u2192\n``removed_job``; ``pause``/``resume`` \u2192 ``job``. A tool-level failure (``success`` false,\nincluding a pause with no reason) is an RPC error, not a successful result with ``error``.",
         "properties": {
           "success": {
             "anyOf": [

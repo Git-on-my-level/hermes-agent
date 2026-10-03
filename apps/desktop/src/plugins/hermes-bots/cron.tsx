@@ -21,6 +21,7 @@ import {
   Input,
   nextRunOverdueMs,
   PanelEmpty,
+  promptText,
   queryClient,
   relativeTime,
   RowButton,
@@ -75,6 +76,13 @@ function showsHandle(name: string, meta: BotMeta | null | undefined, bot?: Roste
 const BOT_TAG_RE = /^\[bot:([a-z0-9][a-z0-9_-]*)\]\s*/i
 const SAFE_ROUTINE_MARKER = '[bot-mode:routine:v2] '
 const LEGACY_DELEGATED_ROUTINE_PREFIX = 'You are running the scheduled routine "'
+
+/** Persisted on the job when the loader retires a pre-hardening routine.
+ *  Those prompts were built by interpolation, so a title or instruction
+ *  containing `$(…)` executed on the scheduler. The v2 marker composes the
+ *  same delegation with quoting; this pause is what stops the old shape. */
+export const LEGACY_DELEGATED_PAUSE_REASON =
+  'Auto-paused: legacy delegated routine superseded by the v2 bot-mode routine (pre-hardening prompt interpolated a shell command).'
 
 /** A routine's owner: a roster row, a bare profile name, or nothing resolved yet. */
 type RoutineOwner = RosterRow | string | null | undefined
@@ -137,18 +145,29 @@ export async function loadRoutines(owner: RoutineOwner): Promise<RoutineListResu
   // A pause failing must not fail the LIST — the pane would report "could
   // not load cronjobs" over data that loaded fine, and the 20s poll would
   // re-attempt the failing pause inside a failing query forever. Each pause
-  // swallows its own error; the overlay only claims jobs the gateway
+  // reports its own error; the overlay only claims jobs the gateway
   // actually paused, and the next poll retries the rest.
   const pauses = await Promise.all(
-    activeLegacyJobs.map(job =>
-      requestForBot(bot, 'cron.manage', {
-        action: 'pause',
-        name: job.job_id,
-        ...scope
-      })
-        .then(() => true)
-        .catch(() => false)
-    )
+    activeLegacyJobs.map(async job => {
+      try {
+        const result = await requestForBot<{ error?: string; success?: boolean }>(bot, 'cron.manage', {
+          action: 'pause',
+          name: job.job_id,
+          reason: LEGACY_DELEGATED_PAUSE_REASON,
+          ...scope
+        })
+
+        if (result?.success === false) {
+          host.notifyError(new Error(result.error || 'pause failed'), translateNow('cron.failedUpdate'))
+          return false
+        }
+
+        return true
+      } catch (err) {
+        host.notifyError(err, translateNow('cron.failedUpdate'))
+        return false
+      }
+    })
   )
 
   if (!activeLegacyJobs.length) {
@@ -505,6 +524,22 @@ export function RoutineRow({ job, onOpen, owner }: RoutineRowProps) {
       return
     }
 
+    let reason: string | undefined
+
+    if (action === 'pause') {
+      const entered = await promptText({
+        confirmLabel: c.pauseTitle,
+        placeholder: c.pauseReasonPrompt,
+        title: c.pauseReasonPrompt
+      })
+
+      if (!entered) {
+        return
+      }
+
+      reason = entered
+    }
+
     setBusy(true)
 
     if (action === 'pause' || action === 'resume') {
@@ -512,15 +547,25 @@ export function RoutineRow({ job, onOpen, owner }: RoutineRowProps) {
     }
 
     try {
-      await requestForBot(owner, 'cron.manage', {
+      const result = await requestForBot<{ error?: string; success?: boolean }>(owner, 'cron.manage', {
         action,
         name: job.job_id,
+        ...(reason
+          ? {
+              reason
+            }
+          : {}),
         ...(profile
           ? {
               profile
             }
           : {})
       })
+
+      if (result?.success === false) {
+        throw new Error(result.error || c.failedUpdate)
+      }
+
       await invalidateRoutineOwner(owner)
     } catch (err) {
       setPendingActive(null)

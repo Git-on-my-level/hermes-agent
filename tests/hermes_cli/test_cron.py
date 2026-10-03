@@ -328,7 +328,7 @@ class TestCronListStatusRendering:
     def test_default_list_includes_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
         job = create_job(prompt="Paused digest", schedule="every 1h")
-        pause_job(job["id"])
+        pause_job(job["id"], reason="test")
 
         cron_command(Namespace(cron_command="list", all=False))
 
@@ -738,3 +738,23 @@ class TestSlashCronRunSkipped:
         out = capsys.readouterr().out
         assert "Job is paused/disabled; resume it before running." in out
         assert "Triggered" not in out and "next scheduler tick" not in out
+
+
+def test_doctor_workdir_check_uses_is_dir(tmp_cron_dir, capsys):
+    """A file at the configured path is not a directory, same as dispatch."""
+    real = tmp_cron_dir / "proj"
+    real.mkdir()
+    bogus = tmp_cron_dir / "notes.txt"
+    bogus.write_text("not a directory")
+    create_job(prompt="in a dir", schedule="every 1h", name="good", workdir=str(real))
+    bad = create_job(prompt="points at a file", schedule="every 1h", name="bad", workdir=str(real))
+    rows = load_jobs()
+    for row in rows:
+        if row["id"] == bad["id"]:
+            row["workdir"] = str(bogus)
+    save_jobs(rows)
+
+    assert cron_cli.cron_doctor(argparse.Namespace(prune=False)) == 1
+    out = capsys.readouterr().out
+    assert f"workdir is not a directory: {bogus}" in out
+    assert str(real) not in out
