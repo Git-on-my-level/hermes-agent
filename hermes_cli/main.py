@@ -136,6 +136,20 @@ def _cleanup_oneshot_runtime() -> None:
             pass
 
 
+def _emit_uncaught_oneshot_failure(message: str, exit_code: int) -> None:
+    """One failure record when json mode died before ``run_oneshot`` wrote one."""
+    from hermes_cli.oneshot_result import build_oneshot_result_record, write_oneshot_result_line
+
+    # Called from except handlers ahead of the hard exit: a failed write
+    # (broken pipe) must not escape into interpreter teardown.
+    try:
+        write_oneshot_result_line(sys.stdout, build_oneshot_result_record(
+            response=None, result={}, exit_code=exit_code, failure=message,
+        ))
+    except Exception:
+        pass
+
+
 def _run_and_exit_oneshot(
     prompt: str,
     *,
@@ -146,7 +160,9 @@ def _run_and_exit_oneshot(
     usage_file: object = None,
     resume: object = None,
     reasoning: object = None,
+    output_format: object = None,
 ) -> None:
+    json_mode = output_format == "json"
     try:
         from hermes_cli.oneshot import run_oneshot
 
@@ -159,16 +175,22 @@ def _run_and_exit_oneshot(
             usage_file=usage_file,
             resume=resume,
             reasoning=reasoning,
+            output_format=output_format if isinstance(output_format, str) else None,
         )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         rc = 130
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            _emit_uncaught_oneshot_failure("Interrupted", 130)
     except SystemExit as exc:
         if exc.code is not None and not isinstance(exc.code, int):
             print(exc.code, file=sys.stderr)
             rc = 1
         else:
             rc = exc.code
-    except BaseException:
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            detail = exc.code if isinstance(exc.code, str) and exc.code.strip() else "hermes -z exited"
+            _emit_uncaught_oneshot_failure(detail, rc if isinstance(rc, int) and rc != 0 else 1)
+    except BaseException as exc:
         # ``run_oneshot`` already maps agent failures to an int rc; anything
         # still escaping means it malfunctioned. Print it but never fall
         # through to interpreter teardown (the SIGABRT path this routine fixes).
@@ -178,6 +200,8 @@ def _run_and_exit_oneshot(
         except Exception:
             pass
         rc = 1
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            _emit_uncaught_oneshot_failure(str(exc) or "hermes -z failed", 1)
     try:
         _cleanup_oneshot_runtime()
     finally:
@@ -3108,6 +3132,7 @@ def _run_oneshot_from_args(args) -> None:
         usage_file=getattr(args, "usage_file", None),
         resume=getattr(args, "resume", None),
         reasoning=getattr(args, "reasoning", None),
+        output_format=getattr(args, "oneshot_output_format", None),
     )
 
 

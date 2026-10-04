@@ -213,7 +213,7 @@ the initiating process.
 
 ### `hermes -z <prompt>` — scripted one-shot
 
-For programmatic callers (shell scripts, CI, cron, parent processes piping in a prompt), `hermes -z` is the purest one-shot entry point: **single prompt in, final response text out, nothing else on stdout or stderr.** No banner, no spinner, no tool previews, no `Session:` line — just the agent's final reply as plain text.
+For programmatic callers (shell scripts, CI, cron, parent processes piping in a prompt), `hermes -z` is the purest one-shot entry point: **single prompt in, final response text out, nothing else on stdout.** No banner, no spinner, no tool previews, no `Session:` line — just the agent's final reply as plain text. `--output-format json` swaps that text for one agentctl terminal record; the default stays plain text.
 
 ```bash
 hermes -z "What's the capital of France?"
@@ -230,11 +230,36 @@ Per-run overrides (no mutation to `~/.hermes/config.yaml`):
 | `-m` / `--model <model>` | `HERMES_INFERENCE_MODEL` | Override the model for this run |
 | `--provider <provider>` | _(none)_ | Override the provider for this run |
 | `--usage-file <path>` | _(none)_ | Write a JSON usage report after the run (see below) |
+| `--output-format text\|json` | _(none)_ | `text` (default) prints the answer. `json` prints one agentctl terminal record (see below) |
 
 ```bash
 hermes -z "…" --provider openrouter --model openai/gpt-5.5
 # or:
 HERMES_INFERENCE_MODEL=anthropic/claude-sonnet-4.6 hermes -z "…"
+```
+
+#### `--output-format json` — one terminal record for agentctl
+
+`hermes -z` defaults to plain text, which agentctl's generic-process adapter cannot store (exit 0 with no structured terminal record is `result_extraction_failed`). `--output-format json` prints exactly one JSON object on stdout and keeps banners, errors, and tracebacks off stdout (stderr, or suppressed while the agent runs). Exit codes are unchanged: `0` success, nonzero failure. A failed, partial, or interrupted run still prints a `status: "failed"` record rather than only a traceback.
+
+`-z` takes the next token as the prompt, so the flag goes before `-z` or after the prompt (same rule as `--usage-file`):
+
+```bash
+hermes --output-format json -z "reply with exactly the word OK"
+hermes -z "reply with exactly the word OK" --output-format json
+```
+
+The record matches agentctl's generic-process parser (`type` `result`, string `result` = the answer, `status` `success` or `failed`):
+
+```json
+{"type":"result","status":"success","success":true,"is_error":false,"result":"OK","model":"…","session_id":"…","usage":{"input_tokens":1,"output_tokens":1}}
+```
+
+`model`, `provider`, `session_id`, and `usage` are omitted when the turn did not report them. A failure record sets `status` to `failed`, `is_error` to `true`, `error` to the reason, and `result` to the answer text when there is one (otherwise the error text, so the answer is never an empty terminal record).
+
+```bash
+agentctl run --label hermes-oneshot -- hermes --output-format json -z "reply with exactly the word OK"
+agentctl result <execution-id> --content
 ```
 
 Same agent, same tools, same skills — just strips every interactive / cosmetic layer. If you need tool output in the transcript too, use `hermes chat --oneshot -q` instead; `-z` is explicitly for "I only want the final answer".
