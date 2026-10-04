@@ -84,14 +84,17 @@ def load_converge_settings(cfg: Optional[dict[str, Any]] = None) -> ConvergeSett
         sla = _DEFAULT_BUSY_SLA if raw_sla in (None, "") else float(raw_sla)
     except (TypeError, ValueError):
         sla = _DEFAULT_BUSY_SLA
+    from hermes_cli.update_channel import git_update_target
+
+    remote, branch = git_update_target(cfg)
     return ConvergeSettings(
         enabled=bool(updates.get("converge")),
         pin=pin,
         interval=max(60, interval),
         busy_sla=max(0.0, sla),
         skip_gateway_restart=bool(updates.get("skip_gateway_restart")),
-        remote=str(updates.get("remote") or "").strip(),
-        branch=str(updates.get("branch") or "").strip(),
+        remote=remote,
+        branch=branch,
     )
 
 
@@ -203,10 +206,11 @@ def checkout_is_dirty(project_root: Path) -> bool:
 
 def live_code_sha() -> str:
     try:
-        from gateway.status import get_running_pid, read_runtime_status
+        from gateway.status import get_running_pid, read_runtime_status, runtime_status_pid_is_live
 
         rec = read_runtime_status() or {}
-        if get_running_pid() is None:
+        pid = get_running_pid()
+        if pid is None or rec.get("pid") != pid or not runtime_status_pid_is_live(rec):
             return ""
         return normalize_pin(rec.get("code_sha"))
     except Exception:
@@ -257,9 +261,11 @@ def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") ->
     """Refresh the tracking ref used by channel-tip. Failures are skip-safe."""
     if not remote or not branch:
         return
+    from hermes_cli.update_cmd_check import tracking_refspec
+
     try:
         subprocess.run(
-            ["git", "-C", str(project_root), "fetch", "--prune", remote, branch],
+            ["git", "-C", str(project_root), "fetch", "--prune", remote, tracking_refspec(remote, branch)],
             capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -307,6 +313,9 @@ def cmd_converge_tick(args: Any) -> None:
         return
     args.converge = False
     args.yes = True
+    args.remote = settings.remote or "origin"
+    args.branch = settings.branch or "main"
+    args.channel = None
     if decision.pin:
         args.sha = decision.pin
     elif decision.action == "update":
@@ -588,7 +597,13 @@ def cmd_converge(args: Any) -> None:
         settings = load_converge_settings()
         from hermes_cli.main import PROJECT_ROOT
 
+        checkout = checkout_sha(PROJECT_ROOT)
+        live = live_code_sha()
+        target = settings.pin or channel_tip_sha(PROJECT_ROOT, settings.remote, settings.branch)
+        matches = prefixes_match(checkout, target) and prefixes_match(live, target)
         d = decide_from_live(PROJECT_ROOT, settings)
+        print(f"checkout_sha={checkout or 'unknown'} live_sha={live or 'unknown'} target_sha={target or 'unknown'}")
+        print(f"match={'YES' if matches else 'NO'}")
         print(f"enabled={settings.enabled} pin={settings.pin or '-'} skip_restart={settings.skip_gateway_restart}")
         print(f"action={d.action} reason={d.reason}")
         if sys.platform == "darwin":
@@ -596,5 +611,7 @@ def cmd_converge(args: Any) -> None:
         elif sys.platform.startswith("linux"):
             timer = _systemd_user_dir() / "hermes-converge.timer"
             print(f"timer={timer} exists={timer.exists()}")
+        if getattr(args, "assert_current", False) and not matches:
+            sys.exit(1)
         return
     cmd_converge_tick(args)

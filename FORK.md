@@ -179,3 +179,38 @@ surface is zero against `ci.yaml`.
 ```bash
 test -f FORK.md && rg -F 'FORK.md' AGENTS.md && git diff --check
 ```
+
+## Recheck prod immediately before landing a sync
+
+Record `git rev-parse fork/prod` at sync start. Immediately before the final
+push/review handoff, from the clean sync worktree run:
+
+```bash
+python3 scripts/check_sync_prod_tip.py --baseline <recorded-prod-sha>
+python3 scripts/check_fork_features.py
+```
+
+The check fetches `fork/prod` again. One new linear commit is cherry-picked
+onto the sync branch when clean; an already represented patch is a no-op.
+A conflict is aborted without changing the sync tip. Multiple commits or a
+rebased prod tip stop for review of the new delta, not another full re-port.
+After absorption, rerun focused tests and record the new prod SHA. Repeat the
+check immediately before the coordinator lands the PR if prod moved again.
+The script never pushes; it does not eliminate the final fetch-to-merge race,
+so the coordinator must recheck at merge time too. Never force-push prod.
+
+## Assert the running release
+
+`hermes converge status` prints `checkout_sha`, `live_sha`, `target_sha`, and
+`match` independently of the scheduler's action/reason (a busy skip or a
+restart opt-out does not prove the runtime is current). For release verification:
+
+```bash
+hermes converge status --assert-current
+```
+
+This read-only assertion exits non-zero if either SHA is unknown or does not
+match the pin/configured tracking tip. It does not fetch or recycle gateways;
+refresh the configured tracking ref before checking an unpinned release.
+An explicit `hermes update --channel stable` selects the release feed for that
+run; git `--remote`/`--branch` selectors and `--sha` select the git target.

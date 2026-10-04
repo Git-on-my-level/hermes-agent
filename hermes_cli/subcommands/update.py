@@ -49,6 +49,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "stay parked in git stash instead of being restored onto the "
             "updated code. Used by the desktop updater so local source edits "
             "never silently ride along across updates.")
+    update_parser.add_argument("--remote", default=None, metavar="NAME",
+                               help="Git remote to update from (overrides updates.remote).")
     update_parser.add_argument(
         "--branch", default=None, metavar="NAME",
         help="Update against this branch instead of the default (main). "
