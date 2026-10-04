@@ -19,5 +19,7 @@ def build_converge_parser(subparsers, *, cmd_converge: Callable) -> None:
     ins = sub.add_parser("install", help="Install the macOS LaunchAgent timer")
     ins.add_argument("--force", action="store_true", help="Write the plist even if updates.converge is false")
     sub.add_parser("uninstall", help="Remove the converge LaunchAgent")
-    sub.add_parser("status", help="Show pin, skip reason, and agent path")
+    status = sub.add_parser("status", help="Show checkout/live SHA, pin, skip reason, and agent path")
+    status.add_argument("--assert-current", action="store_true",
+                        help="Exit non-zero unless checkout and live gateway both match the target")
     p.set_defaults(func=cmd_converge)

@@ -17,6 +17,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # (relative path, required substring, human label)
 KEEP_LIST: list[tuple[str, str, str]] = [
+    ("hermes_cli/update_git_target.py", "def configured_git_target", "presence-sensitive git deploy target"),
+    ("hermes_cli/update_cmd.py", "configured_git_target(args)", "updater selects configured git target"),
+    ("hermes_cli/subcommands/converge.py", "--assert-current", "checkout/live release assertion"),
+    ("scripts/check_sync_prod_tip.py", "check_prod_tip", "pre-land prod drift check"),
     (
         "gateway/stream_consumer_preview.py",
         "StreamCommentaryPreviewMixin",
@@ -140,6 +144,9 @@ KEEP_LIST: list[tuple[str, str, str]] = [
 ]
 
 TEST_FILES = [
+    "tests/hermes_cli/test_update_configured_git_target.py",
+    "tests/hermes_cli/test_converge_release_status.py",
+    "tests/hermes_cli/test_sync_prod_tip.py",
     "tests/gateway/test_stream_consumer_commentary_preview.py",
     "tests/gateway/test_telegram_topic_scoped_send_lock.py",
     "tests/scripts/test_prune_fork_branches.py",

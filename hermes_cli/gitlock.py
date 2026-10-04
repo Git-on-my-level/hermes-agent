@@ -527,7 +527,7 @@ def heal_shallow_history(repo_root: Path, branch: str, **run_kwargs) -> bool:
     return _shallow_file_path(repo_root) is not None and fetch_full_commit_graph(repo_root, branch, **run_kwargs)
 
 
-def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs) -> bool:
+def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, remote: str = "origin", **run_kwargs) -> bool:
     """Refresh release tags and fill shallow history before publishing identity.
 
     A full commit graph does not imply current tags, especially after a --no-tags
@@ -556,7 +556,7 @@ def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs)
         subprocess.run(
             ["git", "fetch", "--quiet", *(["--unshallow"] if shallow else []),
              *([f"--filter={fetch_filter}"] if fetch_filter else []),
-             "--no-tags", "origin", "refs/tags/v*:refs/tags/v*", *extra_refspecs],
+             "--no-tags", remote, "refs/tags/v*:refs/tags/v*", *extra_refspecs],
             cwd=str(repo_root), check=True, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=900, **run_kwargs,
         )

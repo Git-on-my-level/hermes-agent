@@ -110,14 +110,14 @@ def _fetch(git_cmd: list[str], root: Path, depth_args: list[str], remote: str, b
         **_uc()._no_prompt_git_kwargs())
 
 
-def fetch_compare_branch(git_cmd: list[str], root: Path, branch: str, depth_args: list[str]):
+def fetch_compare_branch(git_cmd: list[str], root: Path, branch: str, depth_args: list[str], *, remote: str | None = None):
     """Fetch only ``branch`` and return ``(fetch_result, compare_ref)``.
 
     A bare ``git fetch <remote>`` pulls every ref, and this repo has thousands of auto-generated
     branches. ``main`` prefers upstream as the canonical reference; other branches go straight
     to origin, because a fork's branch usually has no upstream counterpart.
     """
-    if branch == "main":
+    if remote is None and branch == "main":
         # A local probe (~6 ms) spares non-fork installs a failed network fetch (~0.3-1 s).
         if _git(git_cmd, root, ["remote", "get-url", "upstream"]).returncode == 0:
             fetch_result = _fetch(git_cmd, root, depth_args, "upstream", branch)
@@ -125,10 +125,11 @@ def fetch_compare_branch(git_cmd: list[str], root: Path, branch: str, depth_args
                 return fetch_result, f"upstream/{branch}"
     from hermes_cli.gitlock import fetch_with_partial_clone_recovery
     # Marking the unmarked packs clears the git 2.53+ partial-clone pack-objects crash (#124272).
-    print("→ Fetching from origin...")
+    remote = remote or "origin"
+    print(f"→ Fetching from {remote}...")
     return fetch_with_partial_clone_recovery(
         lambda gc, a: _git(gc, root, a, **_uc()._no_prompt_git_kwargs()),
-        git_cmd, ["fetch", *depth_args, "origin", tracking_refspec("origin", branch)], root), f"origin/{branch}"
+        git_cmd, ["fetch", *depth_args, remote, tracking_refspec(remote, branch)], root), f"{remote}/{branch}"
 
 
 def repair_shallow_grafts(root: Path) -> None:
