@@ -1567,7 +1567,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             completion_request["branch"] = branch
             target_ref = f"origin/{branch}"
 
-    if use_zip_update and git_target:
+    requires_git = bool(git_target and (git_target != ("origin", "main") or getattr(args, "sha", None)))
+    if use_zip_update and requires_git:
         print("✗ A configured git target requires git; refusing an upstream ZIP fallback.")
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         sys.exit(1)
@@ -1688,7 +1689,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd, branch, movement_baseline, _plan,
             _windows_gateway_resume=_windows_gateway_resume, completion_request=completion_request)
     except subprocess.CalledProcessError as e:
-        if git_target:
+        if requires_git:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             raise
         try:

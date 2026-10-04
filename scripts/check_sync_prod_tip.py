@@ -10,7 +10,8 @@ import sys
 
 
 def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace").stdout.strip()
 
 
 def check_prod_tip(baseline):
