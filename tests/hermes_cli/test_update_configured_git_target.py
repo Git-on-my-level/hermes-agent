@@ -108,3 +108,15 @@ def test_command_never_detours_to_upstream(update_tree, tmp_path, monkeypatch, m
         assert not any("origin/main" in str(c) for c in commands)
         assert not any("checkout" in c and "main" in c for c in commands)
         assert not any("fetch" in c and "origin" in c for c in commands)
+
+
+def test_divergence_recovery_keeps_its_stock_default_ref(update_tree):
+    t = update_tree
+    git(t.clone, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git(t.clone, "checkout", "-q", "main")
+    git(t.clone, "commit", "--allow-empty", "-qm", "local divergence")
+    before = git(t.clone, "rev-parse", "HEAD")
+    update_cmd._reconcile_diverged_checkout(["git"], "main", before)
+    assert git(t.clone, "rev-parse", "HEAD") == t.newer
+    backups = git(t.clone, "for-each-ref", "--format=%(objectname)", "refs/hermes-update-backups/")
+    assert before in backups.splitlines()
