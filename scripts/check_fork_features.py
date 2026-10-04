@@ -146,7 +146,7 @@ KEEP_LIST: list[tuple[str, str, str]] = [
 TEST_FILES = [
     "tests/hermes_cli/test_update_configured_git_target.py",
     "tests/hermes_cli/test_converge_release_status.py",
-    "tests/hermes_cli/test_sync_prod_tip.py",
+    "tests/scripts/test_sync_prod_tip.py",
     "tests/gateway/test_stream_consumer_commentary_preview.py",
     "tests/gateway/test_telegram_topic_scoped_send_lock.py",
     "tests/scripts/test_prune_fork_branches.py",
