@@ -148,8 +148,15 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
         getattr(error, "status_code", None) == 429
         and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
         and "glm-5" in (model or "").lower()
-        and not any(marker in text for marker in ("quotaresetdelay", "resets in", "resets_in_seconds"))
-        and any(marker in text for marker in ("1302", "1305", "rate limit", "temporarily overloaded"))
+        and not any(
+            rx.search(text)
+            # Singular+plural both valid: the shared parser accepts "reset in" too.
+            for rx in (_QUOTA_RESET_DELAY_RE, _RESETS_IN_RE, _RESETS_IN_SECONDS_FIELD_RE)
+        )
+        and any(
+            marker in text
+            for marker in ("1302", "1305", "rate limit", "rate_limit", "too many requests", "throttl", "temporarily overloaded")
+        )
     )
 
 

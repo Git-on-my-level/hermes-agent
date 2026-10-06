@@ -151,7 +151,7 @@ def test_zai_rate_limit_family_preserves_adaptive_and_quota_boundaries():
         (endpoint, "other-model", 429, "1302"),
         (endpoint, "glm-5.3-flash", 500, "1302"),
     ]
-    for marker in ("Resets in 4hr 5min.", "quotaResetDelay: 300s", "resets_in_seconds: 300"):
+    for marker in ("Resets in 4hr 5min.", "Reset in 4 hours.", "quotaResetDelay: 300s", "resets_in_seconds: 300"):
         excluded.append((endpoint, "glm-5.3-flash", 429, f"1302 Rate limit reached for requests. {marker}"))
     for base_url, model, status_code, message in excluded:
         error = SimpleNamespace(status_code=status_code, body={"error": {"message": message}})
@@ -159,6 +159,14 @@ def test_zai_rate_limit_family_preserves_adaptive_and_quota_boundaries():
         assert adaptive_rate_limit_backoff(
             4, base_url=base_url, model=model, error=error, default_wait=2.0,
         ) == (2.0, None)
+
+    # Classifier-recognized rate-limit wordings without a numeric body code.
+    for message in ("Too many requests", "Request throttled", "rate_limit exceeded"):
+        error = SimpleNamespace(status_code=429, body={"error": {"message": message}})
+        assert retry_utils.is_zai_coding_overload_error(base_url=endpoint, model="glm-5.3-flash", error=error)
+        assert adaptive_rate_limit_backoff(
+            4, base_url=endpoint, model="glm-5.3-flash", error=error, default_wait=2.0,
+        )[1] == "zai_coding_overload_long"
 
 
 def test_zai_rate_limit_window_covers_ten_minutes():
