@@ -127,6 +127,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "quiet drain skips the gateway-online broadcast",
     ),
     (
+        "gateway/run_shutdown.py",
+        "Home-channel shutdown broadcast suppressed: external supervisor recycle",
+        "launchd recycle skips the home-channel shutdown broadcast",
+    ),
+    (
+        "gateway/drain_control.py",
+        "def external_supervisor_shutdown_is_quiet",
+        "external supervisor shutdown quiet probe",
+    ),
+    (
         "hermes_cli/gateway_launchd.py",
         "<key>HardResourceLimits</key>",
         "launchd nofile hard ceiling",

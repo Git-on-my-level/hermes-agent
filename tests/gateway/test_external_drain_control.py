@@ -69,6 +69,15 @@ class TestSuppressNotification:
         assert dc.drain_notification_suppressed() is True
 
 
+def test_external_supervisor_shutdown_is_quiet_only_when_env_set(monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
+    assert dc.external_supervisor_shutdown_is_quiet() is False
+    monkeypatch.setenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "1")
+    assert dc.external_supervisor_shutdown_is_quiet() is True
+    monkeypatch.setenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "no")
+    assert dc.external_supervisor_shutdown_is_quiet() is False
+
+
 # ---------------------------------------------------------------------------
 # Instantiation-epoch staleness (NS-570: orphaned marker on durable volume)
 # ---------------------------------------------------------------------------
