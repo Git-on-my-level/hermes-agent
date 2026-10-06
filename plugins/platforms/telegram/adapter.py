@@ -3943,7 +3943,25 @@ class TelegramAdapter(BasePlatformAdapter):
         silently nor fail (the consumer would re-send a duplicate): edit with the first chunk, send the rest as
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            # Dead adapter after a supervisor rebuild: edit the live replacement
+            # instead of success=False (silent commentary scatter). send() already
+            # delegates; an in-flight consumer still holds the old instance whose
+            # _bot stays None, and a silent False here makes every later commentary
+            # item a fresh send.
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+                return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+            live = self._replacement_telegram_adapter()
+            if not self._bot and live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if not self._bot:
+                return SendResult(success=False, error="Not connected", retryable=True)
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
         # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
         # control. A final edit is never gated (the completed answer is always delivered). Sends wait for
