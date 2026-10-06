@@ -447,3 +447,76 @@ async def test_preview_edit_not_modified_is_a_successful_noop():
     assert adapter.send.await_count == 1
     assert consumer.commentary_preview_message_ids == ("preview-1",)
     assert consumer.already_sent is False
+
+
+@pytest.mark.asyncio
+async def test_two_commentary_items_with_real_send_result_are_one_edit_not_two_sends():
+    """Successful edits of a real Telegram SendResult stay one bubble.
+
+    message_id plus raw_response.message_ids of the same id must not look like
+    two bubbles. Two commentary items are one send and one edit, not two sends.
+    """
+    from gateway.platforms.base import SendResult
+
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        return_value=SendResult(
+            success=True,
+            message_id="100",
+            raw_response={"message_ids": ["100"], "requested_thread_id": "728"},
+        )
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SendResult(success=True, message_id="100")
+    )
+    consumer = _consumer(adapter)
+
+    consumer.on_commentary("Checking the repo.")
+    consumer.on_commentary("Running targeted tests.")
+    consumer.finish()
+    await consumer.run()
+
+    assert adapter.send.await_count == 1
+    assert adapter.edit_message.await_count == 1
+    assert adapter.edit_message.await_args.kwargs["message_id"] == "100"
+    assert adapter.edit_message.await_args.kwargs["content"] == (
+        "Checking the repo.\n\nRunning targeted tests."
+    )
+
+
+@pytest.mark.asyncio
+async def test_persistent_edit_failure_does_not_send_one_bubble_per_item():
+    """Every edit returning success=False must not scatter.
+
+    One fallback send is allowed. Later items retry the edit and must not
+    mint another Telegram message (m5: silent success=False after adapter rebuild).
+    """
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(
+        side_effect=[
+            SimpleNamespace(success=True, message_id="preview-1"),
+            SimpleNamespace(success=True, message_id="preview-2"),
+            SimpleNamespace(success=True, message_id="preview-3"),
+            SimpleNamespace(success=True, message_id="preview-4"),
+        ]
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=False, error="Not connected")
+    )
+    consumer = _consumer(adapter)
+
+    consumer.on_commentary("First.")
+    consumer.on_commentary("Second.")
+    consumer.on_commentary("Third.")
+    consumer.on_commentary("Fourth.")
+    consumer.finish()
+    await consumer.run()
+
+    assert [call.kwargs["content"] for call in adapter.send.await_args_list] == [
+        "First.",
+        "First.\n\nSecond.",
+    ]
+    assert adapter.send.await_count == 2
+    assert consumer._commentary_preview_message_id == "preview-2"

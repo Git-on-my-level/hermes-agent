@@ -85,7 +85,8 @@ python3 scripts/check_fork_features.py
 ```
 
 It asserts each keep-list file/symbol is still present (commentary preview
-mixin, resolver, plumb-throughs, contract tests). Exit 0 = intact; exit 1
+mixin, interim_assistant_message_mode registration, resolver, plumb-throughs,
+contract tests). Exit 0 = intact; exit 1
 prints one line per missing item — re-port it before pushing.
 
 ## Branch retention

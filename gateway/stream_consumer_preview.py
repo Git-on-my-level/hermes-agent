@@ -230,6 +230,7 @@ class StreamCommentaryPreviewMixin:
                         self._commentary_preview_message_id = None
                         self._commentary_preview_edit_supported = False
                     self._commentary_preview_last_text = text
+                    self._commentary_edit_fail_streak = 0
                     if is_placeholder:
                         self._commentary_preview_is_placeholder = True
                         self._commentary_placeholder_sent = True
@@ -248,6 +249,7 @@ class StreamCommentaryPreviewMixin:
                 # (one new bubble per commentary item).
                 if "not modified" in str(e).lower():
                     self._commentary_preview_last_text = text
+                    self._commentary_edit_fail_streak = 0
                     if is_placeholder:
                         self._commentary_preview_is_placeholder = True
                         self._commentary_placeholder_sent = True
@@ -260,9 +262,20 @@ class StreamCommentaryPreviewMixin:
                     return True
                 logger.debug("Commentary preview edit failed: %s", e)
 
-            # Preserve the old bubble as a breadcrumb and degrade this
-            # update to a fresh send.  A successful fresh send becomes the
-            # next editable preview; all created IDs remain cleanup-eligible.
+            # One fallback send is a breadcrumb. A second failure must not mint
+            # another bubble: re-enabling edits after a fresh send still scatters
+            # when every edit returns success=False (silent on a rebuilt adapter).
+            streak = int(getattr(self, "_commentary_edit_fail_streak", 0)) + 1
+            self._commentary_edit_fail_streak = streak
+            if streak > 1 and self._commentary_preview_message_id:
+                logger.debug(
+                    "Commentary preview edit still failing; not sending another bubble"
+                )
+                if not is_placeholder and entries is not None:
+                    self._commentary_preview_entries = list(entries)
+                    self._commentary_preview_is_placeholder = False
+                return False
+            # First failure only: one fresh send becomes the next edit target.
             self._commentary_preview_edit_supported = False
             self._commentary_preview_message_id = None
 

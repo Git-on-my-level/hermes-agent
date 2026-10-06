@@ -141,6 +141,26 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "def _media_collect_token",
         "telegram album sibling hold",
     ),
+    (
+        "gateway/display_config.py",
+        '"interim_assistant_message_mode": "separate"',
+        "interim_assistant_message_mode default registration",
+    ),
+    (
+        "gateway/display_config.py",
+        '_norm_choice(("separate", "preview"))',
+        "interim_assistant_message_mode normaliser",
+    ),
+    (
+        "plugins/platforms/telegram/adapter.py",
+        "silent commentary scatter",
+        "telegram edit_message delegates to the replacement adapter",
+    ),
+    (
+        "gateway/stream_consumer_preview.py",
+        "Commentary preview edit still failing; not sending another bubble",
+        "persistent commentary edit failure does not mint a bubble per item",
+    ),
 ]
 
 TEST_FILES = [
@@ -148,6 +168,8 @@ TEST_FILES = [
     "tests/hermes_cli/test_converge_release_status.py",
     "tests/scripts/test_sync_prod_tip.py",
     "tests/gateway/test_stream_consumer_commentary_preview.py",
+    "tests/gateway/test_interim_assistant_message_mode.py",
+    "tests/gateway/test_telegram_edit_replacement.py",
     "tests/gateway/test_telegram_topic_scoped_send_lock.py",
     "tests/scripts/test_prune_fork_branches.py",
     "tests/gateway/test_telegram_inbound_split.py",
