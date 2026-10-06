@@ -125,6 +125,46 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == list(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
 
 
+def test_zai_rate_limit_family_preserves_adaptive_and_quota_boundaries():
+    endpoint = "https://api.z.ai/api/coding/paas/v4"
+    for model in ("glm-5.2", "glm-5.3-flash", "GLM-5.4"):
+        for payload in (
+            {"code": "1302"},
+            {"code": "1305"},
+            {"message": "Rate limit reached for requests"},
+            {"message": "Temporarily overloaded"},
+            {"message": "Rate limit reached for requests. Retry after 10 s"},
+        ):
+            error = SimpleNamespace(status_code=429, body={"error": payload})
+            assert retry_utils.is_zai_coding_overload_error(base_url=endpoint, model=model, error=error)
+            for attempt in range(1, retry_utils.zai_coding_overload_retry_ceiling() + 2):
+                wait, policy = adaptive_rate_limit_backoff(
+                    attempt, base_url=endpoint, model=model, error=error, default_wait=2.0,
+                )
+                if attempt <= 3:
+                    assert (wait, policy) == (2.0, "zai_coding_overload_short")
+                else:
+                    assert policy == "zai_coding_overload_long"
+
+    excluded = [
+        ("https://api.openai.com/v1", "glm-5.3-flash", 429, "1302"),
+        (endpoint, "other-model", 429, "1302"),
+        (endpoint, "glm-5.3-flash", 500, "1302"),
+    ]
+    for marker in ("Resets in 4hr 5min.", "quotaResetDelay: 300s", "resets_in_seconds: 300"):
+        excluded.append((endpoint, "glm-5.3-flash", 429, f"1302 Rate limit reached for requests. {marker}"))
+    for base_url, model, status_code, message in excluded:
+        error = SimpleNamespace(status_code=status_code, body={"error": {"message": message}})
+        assert not retry_utils.is_zai_coding_overload_error(base_url=base_url, model=model, error=error)
+        assert adaptive_rate_limit_backoff(
+            4, base_url=base_url, model=model, error=error, default_wait=2.0,
+        ) == (2.0, None)
+
+
+def test_zai_rate_limit_window_covers_ten_minutes():
+    assert (2 + 4 + 8) + 1.2 * sum(retry_utils._ZAI_CODING_OVERLOAD_LONG_BACKOFF) >= 600
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
