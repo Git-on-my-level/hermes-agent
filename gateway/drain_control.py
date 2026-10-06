@@ -16,6 +16,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -171,6 +172,20 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     """
     body = _active_drain_body(home)
     return bool(body and body.get("suppress_notification"))
+
+
+_EXTERNAL_SUPERVISOR_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def external_supervisor_shutdown_is_quiet() -> bool:
+    """True when this process is a launchd/supervisor child.
+
+    macOS ``kickstart -k`` has no ExecStop, so SIGTERM looks unplanned and the
+    home-channel shutdown broadcast fires. Linux units mark the stop first.
+    In-chat /restart does not set this env and is not this path.
+    """
+    raw = os.environ.get("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "")
+    return str(raw).strip().lower() in _EXTERNAL_SUPERVISOR_TRUTHY
 
 
 def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:

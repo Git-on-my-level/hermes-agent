@@ -1094,6 +1094,12 @@ class GatewayShutdownMixin:
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
+            from gateway.drain_control import external_supervisor_shutdown_is_quiet
+            if external_supervisor_shutdown_is_quiet() and not self._restart_requested:
+                logger.info(
+                    "Home-channel shutdown broadcast suppressed: external supervisor recycle"
+                )
+                return
         # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
         # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
         # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
