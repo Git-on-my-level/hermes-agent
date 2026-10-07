@@ -698,7 +698,25 @@ class CLILoopsMixin:
         via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
         mgr = self._get_goal_manager()
-        if mgr is None or not mgr.is_active():
+        if mgr is None:
+            return
+        # goals.auto_infer (CLI): a goal-less turn whose reply commits to work seeds an inferred goal.
+        if not mgr.has_goal():
+            try:
+                from hermes_cli.goals import auto_infer_enabled, maybe_infer_goal
+                if auto_infer_enabled():
+                    reply = self._last_assistant_response_text()
+                    last_user = ""
+                    for msg in reversed(self.conversation_history or []):
+                        if msg.get("role") == "user":
+                            last_user = msg.get("content", "")
+                            break
+                    notice = maybe_infer_goal(mgr, last_user, reply)
+                    if notice:
+                        _cprint(f"{_DIM}{notice}{_RST}")
+            except Exception:
+                pass
+        if not mgr.is_active():
             return
 
         # Slash commands don't count as "real user messages": they're dispatched via

@@ -272,8 +272,21 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
+    @staticmethod
+    def _turn_is_user_authored(event: Any) -> bool:
+        """True for a real inbound user message; False for heartbeat ticks, goal/loop continuations
+        and internal synthetic events (those must never seed an inferred goal)."""
+        if event is None:
+            return False
+        if getattr(event, "_heartbeat_session_id", None) or getattr(event, "internal", False):
+            return False
+        text = str(getattr(event, "text", "") or "")
+        if text.startswith("[Continuing toward your standing goal]") or text.startswith("[Heartbeat"):
+            return False
+        return True
+
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -283,7 +296,23 @@ class GatewayGoalsMixin:
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
-        if mgr is None or not mgr.is_active():
+        if mgr is None:
+            return
+
+        # goals.auto_infer: a goal-less session whose reply commits to work gets an inferred goal
+        # (Muse/Dots pattern). Skipped for heartbeat / continuation / internal turns so the loop
+        # never feeds itself. Runs before the judge so this very reply gets judged against it.
+        if not mgr.has_goal() and self._turn_is_user_authored(event):
+            with suppress(Exception):
+                from hermes_cli.goals import auto_infer_enabled, maybe_infer_goal
+                if auto_infer_enabled():
+                    last_user = getattr(event, "text", None) or ""
+                    notice = await self._run_in_executor_with_context(
+                        lambda: maybe_infer_goal(mgr, last_user, final_response or ""),
+                    )
+                    if notice and source is not None:
+                        await self._defer_goal_status_notice_after_delivery(source, notice)
+        if not mgr.is_active():
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -338,7 +367,10 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                if label == "goal continuation":
+                    await hook(session_entry=session_entry, source=source, final_response=final_text, event=event)
+                else:
+                    await hook(session_entry=session_entry, source=source, final_response=final_text)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

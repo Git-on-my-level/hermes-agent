@@ -1403,6 +1403,8 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
+        # Infer a goal from the agent's commitment after a real user turn (opt-in).
+        "auto_infer": False,
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
