@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_time import safe_strftime
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,9 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Completion contract:\n"
     "{contract_block}\n\n"
-    "Continue working toward the outcome above. Take the next concrete step. "
+    "Do not repeat a status update or a promise to act later. Use an available "
+    "tool to take one concrete step before replying. If that step was already "
+    "done, verify its current result instead of promising it again. "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
@@ -98,8 +101,11 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
-    "Continue working toward the goal AND all additional criteria. Take "
-    "the next concrete step. If you believe the goal and every "
+    "Do not repeat a status update or a promise to act later. Use an available "
+    "tool to take one concrete step before replying. If that step was already "
+    "done, verify its current result instead of promising it again. "
+    "Continue working toward the goal AND all additional criteria. If you believe the goal and "
+    "every "
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
@@ -309,7 +315,7 @@ def _goals_setting(key: str, default):
 
 
 def auto_infer_enabled() -> bool:
-    return bool(_goals_setting("auto_infer", False))
+    return is_truthy_value(_goals_setting("auto_infer", False), default=False)
 
 
 def infer_goal_from_turn(
@@ -564,7 +570,7 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
-    # "user" (typed /goal) or "auto" (inferred from the agent's own commitment, goals.auto_infer).
+    # "user" (/goal), "auto" (inferred commitment), or "auto_start" (gateway prompt).
     source: str = "user"
 
     def to_json(self) -> str:
@@ -1357,7 +1363,8 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
+            source: str = "user") -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1365,6 +1372,7 @@ class GoalManager:
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
+            source=source,
         )
         return self._save()
 

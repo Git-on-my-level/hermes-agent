@@ -89,7 +89,7 @@ async def test_auto_start_ignores_commands_and_internal_continuations(tmp_path, 
 async def test_auto_start_and_inference_share_one_goal_loop(tmp_path, monkeypatch, mode):
     """Real config + SQLite + post-turn dispatch: one judge and at most one continuation."""
     (tmp_path / "config.yaml").write_text(
-        f"goals:\n  auto_start: {'true' if mode == 'auto_start' else 'false'}\n"
+        f"goals:\n  auto_start: {'false' if mode == 'inferred' else 'true'}\n"
         "  auto_infer: true\n  max_turns: 3\n", encoding="utf-8"
     )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -124,7 +124,9 @@ async def test_auto_start_and_inference_share_one_goal_loop(tmp_path, monkeypatc
             source=event.source, is_internal=False, event=event,
         )
         state = goals.GoalManager("sid-auto-start-goal").state
-        assert state.source == ("auto" if mode == "inferred" else "user")
+        assert state.source == {
+            "auto_start": "auto_start", "inferred": "auto", "explicit": "user", "paused": "user",
+        }[mode]
         assert infer.call_count == (1 if mode == "inferred" else 0)
         assert judge.call_count == (0 if mode == "paused" else 1)
         assert len(enqueued) == (0 if mode == "paused" else 1)

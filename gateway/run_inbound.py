@@ -739,6 +739,8 @@ class GatewayInboundMixin:
             return _result
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
+        if not self._draining:
+            await self._auto_start_goal_for_inbound_event(event)
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
             return None
 
