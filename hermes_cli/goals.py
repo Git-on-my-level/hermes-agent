@@ -257,6 +257,107 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 )
 
 
+# ── Goal inference (goals.auto_infer) ────────────────────────────────
+#
+# Muse/Dots-style: an agent that *commits* to multi-turn work ("I'll cut the release once CI is
+# green", "next I'll verify the payment end to end") gets a standing goal without anyone typing
+# /goal. A side judge reads the latest user message + the agent's reply and answers whether a
+# nameable, checkable end state was promised. Chit-chat, one-shot answers and questions back to
+# the user are NOT goals. The inferred goal is tagged ``source="auto"`` so ``/goal clear`` and the
+# status line can tell it apart from a user-declared one.
+
+INFER_GOAL_SYSTEM_PROMPT = (
+    "You read the latest exchange between a user and an autonomous assistant and decide whether "
+    "the assistant has COMMITTED to multi-step work whose end state can be named and checked.\n\n"
+    "Answer goal=true ONLY when ALL hold:\n"
+    "- The assistant promised to do something that takes more than this one reply "
+    "(e.g. 'I will ship X once Y passes', 'next I'll verify Z', 'I'm cutting the release').\n"
+    "- The end state is concrete: a file, PR, release, message, test result, deployed service.\n"
+    "- The assistant is not merely asking the user a question, explaining, or declining.\n\n"
+    "Answer goal=false for greetings, explanations, answers, status reports with no further "
+    "promise, and anything already explicitly completed in the reply.\n\n"
+    "Reply ONLY with one JSON object on one line:\n"
+    '{"goal": true|false, "objective": "<one sentence, imperative, what must be true when done>", '
+    '"reason": "<short>"}'
+)
+
+# Minimum length for an inferred objective; shorter strings are judge noise.
+_INFER_MIN_OBJECTIVE_CHARS = 12
+
+
+def _goals_setting(key: str, default):
+    """Resolve ``goals.<key>`` from config.yaml; ``default`` on any error."""
+    try:
+        from hermes_cli.config import load_config
+
+        return (load_config().get("goals") or {}).get(key, default)
+    except Exception:
+        return default
+
+
+def auto_infer_enabled() -> bool:
+    return bool(_goals_setting("auto_infer", False))
+
+
+def infer_goal_from_turn(
+    last_user_message: Any, last_response: str, *, timeout: Optional[float] = None,
+) -> Optional[str]:
+    """Return an objective sentence when the agent's reply commits to multi-turn work, else None.
+
+    A side ``goal_judge`` auxiliary call — never a conversation turn, never a tool exposed to the
+    model, so prompt caching and the toolset are untouched. Fails open to None on any error."""
+    user_text = last_user_message
+    if isinstance(user_text, list):
+        user_text = " ".join(str(b.get("text", "")) for b in user_text if isinstance(b, dict))
+    user_text = str(user_text or "").strip()
+    response = str(last_response or "").strip()
+    if not response:
+        return None
+    if timeout is None:
+        timeout = _goal_judge_timeout()
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception as exc:
+        logger.debug("goal infer: auxiliary client import failed: %s", exc)
+        return None
+    prompt = (
+        f"User message:\n{_truncate(user_text, 3000)}\n\n"
+        f"Assistant reply:\n{_truncate(response, 6000)}"
+    )
+    try:
+        raw = _call_goal_judge_llm(call_llm, INFER_GOAL_SYSTEM_PROMPT, prompt, timeout)
+    except Exception as exc:
+        logger.info("goal infer: API call failed (%s)", exc)
+        return None
+    data = _extract_json_object(raw)
+    if not isinstance(data, dict) or not data.get("goal"):
+        return None
+    objective = str(data.get("objective") or "").strip()
+    if len(objective) < _INFER_MIN_OBJECTIVE_CHARS:
+        return None
+    return objective
+
+
+def maybe_infer_goal(mgr: "GoalManager", last_user_message: Any, last_response: str) -> Optional[str]:
+    """Post-turn hook shared by CLI and gateway: when ``goals.auto_infer`` is on and the session has
+    no goal, ask the judge whether the reply commits to work; install it as an inferred goal with a
+    drafted contract. Returns the user-facing notice (or None when nothing was set).
+
+    Must run BEFORE ``evaluate_after_turn`` on the same turn so the freshly inferred goal's first
+    judge pass happens on the reply that created it. Synchronous: callers off-load to an executor."""
+    if mgr is None or mgr.has_goal() or not auto_infer_enabled():
+        return None
+    objective = infer_goal_from_turn(last_user_message, last_response)
+    if not objective:
+        return None
+    contract = draft_contract(objective)
+    state = mgr.set_inferred(objective, contract=contract)
+    if state is None:
+        return None
+    logger.info("goal infer: set inferred goal for %s: %s", mgr.session_id, _truncate(objective, 120))
+    return f"⊙ Goal inferred from my reply: {objective}\n(/goal clear to drop it, /goal status to inspect)"
+
+
 # ── Completion contract ───────────────────────────────────────────────
 
 # The five contract fields, in display order (after OpenAI Codex's "strong goal" guidance: what
@@ -450,6 +551,8 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # "user" (typed /goal) or "auto" (inferred from the agent's own commitment, goals.auto_infer).
+    source: str = "user"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -472,6 +575,7 @@ class GoalState:
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
+            source=str(data.get("source") or "user"),
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
@@ -1121,7 +1225,8 @@ class GoalManager:
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
-        meta = f"{turns}{sub}{con}{gat}"
+        src = ", inferred" if s.source == "auto" else ""
+        meta = f"{turns}{sub}{con}{gat}{src}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
@@ -1173,6 +1278,15 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
+        return self._save()
+
+    def set_inferred(self, objective: str, *, contract: Optional[GoalContract] = None) -> Optional[GoalState]:
+        """Install an auto-inferred goal (``source="auto"``). Never overwrites an existing active or
+        paused goal — a user-declared goal always wins; returns None in that case."""
+        if self.has_goal():
+            return None
+        state = self.set(objective, contract=contract)
+        state.source = "auto"
         return self._save()
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
