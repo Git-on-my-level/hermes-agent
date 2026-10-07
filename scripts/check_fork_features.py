@@ -17,6 +17,56 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # (relative path, required substring, human label)
 KEEP_LIST: list[tuple[str, str, str]] = [
+    (
+        "hermes_cli/goals.py",
+        "def maybe_infer_goal",
+        "NousResearch/hermes-agent#134448 commitment-based goal inference",
+    ),
+    (
+        "hermes_cli/config_defaults.py",
+        '"auto_infer": False',
+        "NousResearch/hermes-agent#134448 inference stays opt-in",
+    ),
+    (
+        "gateway/run_goals.py",
+        "lambda: maybe_infer_goal(mgr, last_user, final_response",
+        "NousResearch/hermes-agent#134448 gateway inference hook",
+    ),
+    (
+        "hermes_cli/cli_loops_mixin.py",
+        "notice = maybe_infer_goal(mgr, last_user, reply)",
+        "NousResearch/hermes-agent#134448 CLI inference hook",
+    ),
+    (
+        "gateway/run_inbound.py",
+        "await self._auto_start_goal_for_inbound_event(event)",
+        "NousResearch/hermes-agent#114921 inbound automatic goal hook",
+    ),
+    (
+        "gateway/run_goals.py",
+        "or not self._turn_is_user_authored(event)",
+        "NousResearch/hermes-agent#114921 automatic goals exclude synthetic events",
+    ),
+    (
+        "hermes_cli/config_defaults.py",
+        '"auto_start": False',
+        "NousResearch/hermes-agent#114921 automatic gateway goals stay opt-in",
+    ),
+    (
+        "hermes_cli/goals.py",
+        "tool to take one concrete step before replying.",
+        "NousResearch/hermes-agent#129380 actionable standing-goal continuation",
+    ),
+    (
+        "hermes_cli/goals.py",
+        "def gather_tool_activity",
+        "NousResearch/hermes-agent#117222 host-observed tool evidence extraction",
+    ),
+    (
+        "hermes_cli/goals.py",
+        "tool_activity=gather_tool_activity(self.session_id)",
+        "NousResearch/hermes-agent#117222 tool evidence reaches the goal judge",
+    ),
     ("hermes_cli/update_git_target.py", "def configured_git_target", "presence-sensitive git deploy target"),
     ("hermes_cli/update_cmd.py", "configured_git_target(args)", "updater selects configured git target"),
     ("hermes_cli/subcommands/converge.py", "--assert-current", "checkout/live release assertion"),
@@ -174,6 +224,10 @@ KEEP_LIST: list[tuple[str, str, str]] = [
 ]
 
 TEST_FILES = [
+    "tests/hermes_cli/test_goal_auto_infer.py",
+    "tests/gateway/test_auto_start_goal.py",
+    "tests/hermes_cli/test_goals.py",
+    "tests/hermes_cli/test_goal_gates.py",
     "tests/hermes_cli/test_update_configured_git_target.py",
     "tests/hermes_cli/test_converge_release_status.py",
     "tests/scripts/test_sync_prod_tip.py",

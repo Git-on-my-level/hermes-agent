@@ -73,6 +73,11 @@ Re-port a fork commit only if all hold:
 2. The delta is a new file or a transport/platform-local hook.
 3. A focused test fails if the behavior regresses.
 
+Prefer porting a small **open upstream PR** over a fork-original change when
+it avoids the weekly-rewritten files and carries its tests. Record the upstream
+PR number in the commit and keep-list; drop the port once upstream merges an
+equivalent.
+
 Drop or move to `~/.hermes` when upstream landed an equivalent (GLM-5.3
 catalog, mcp 2.x HTTP, patient Z.AI 429s, curated-before-fuzzy).
 
@@ -88,6 +93,15 @@ It asserts each keep-list file/symbol is still present (commentary preview
 mixin, interim_assistant_message_mode registration, resolver, plumb-throughs,
 contract tests). Exit 0 = intact; exit 1
 prints one line per missing item — re-port it before pushing.
+
+Open upstream goal ports (both automatic modes remain off by default):
+
+| Upstream PR | Carried behavior | Contract tests |
+| --- | --- | --- |
+| NousResearch/hermes-agent#134448 | Infer a goal from the agent's commitment (`goals.auto_infer`) | `tests/hermes_cli/test_goal_auto_infer.py` |
+| NousResearch/hermes-agent#114921 | Opt in to gateway goals (`goals.auto_start`); skip synthetic events and prevent double-arming with inference | `tests/gateway/test_auto_start_goal.py` |
+| NousResearch/hermes-agent#129380 | Continuations take a concrete action before replying | `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_gates.py` |
+| NousResearch/hermes-agent#117222 | Feed host-observed tool activity to the goal judge | `tests/hermes_cli/test_goals.py` |
 
 ## Branch retention
 
