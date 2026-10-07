@@ -62,14 +62,15 @@ class GatewayGoalsMixin:
             return False
 
     async def _auto_start_goal_for_inbound_event(self, event: "MessageEvent") -> None:
-        """Replace the session goal for an ordinary external user message.
+        """Start or correct an automatic goal; preserve explicit and paused goals.
 
-        This deliberately runs after command dispatch and FIFO rescue. Commands
-        retain their own semantics and continuation/heartbeat events must never
-        reset the goal they are advancing.
+        Idle turns run this after command dispatch and FIFO rescue; busy turns
+        reuse it before steering or queueing. Synthetic events never reset the
+        goal they are advancing.
         """
         if (
             not self._auto_start_goals_enabled()
+            or getattr(event, "_auto_start_goal_applied", False)
             or not self._turn_is_user_authored(event)
             or event.get_command()
         ):
@@ -80,8 +81,14 @@ class GatewayGoalsMixin:
         mgr, _session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return
+        state = mgr.state
+        if mgr.has_goal() and (state.source == "user" or state.status == "paused"):
+            return
         try:
-            await self._run_in_executor_with_context(lambda: mgr.set(goal))
+            await self._run_in_executor_with_context(lambda: mgr.set(goal, source="auto_start"))
+            self._clear_goal_continuations(event, "auto-start")
+            # A queued busy follow-up later traverses the cold path with the same event.
+            event._auto_start_goal_applied = True
         except Exception as exc:
             # Failing to persist an optional goal must not reject the user's turn.
             logger.debug("automatic goal start failed: %s", exc)
@@ -319,10 +326,11 @@ class GatewayGoalsMixin:
         and internal synthetic events (those must never seed an inferred goal)."""
         if event is None:
             return False
-        if getattr(event, "_heartbeat_session_id", None) or getattr(event, "internal", False):
+        if (getattr(event, "_heartbeat_session_id", None) or getattr(event, "internal", False)
+                or getattr(event, "_goal_kickoff", False)):
             return False
         text = str(getattr(event, "text", "") or "")
-        if text.startswith("[Continuing toward your standing goal]") or text.startswith("[Heartbeat"):
+        if text.startswith("[Continuing toward your standing goal") or text.startswith("[Heartbeat"):
             return False
         return True
 
@@ -378,14 +386,17 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        if source is None:
             return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
+        # Background notifications can finish with an older continuation still queued. Replace
+        # only goal continuations, or remove them when the judge parks/pauses the objective.
         try:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                self._clear_goal_pending_continuations(_quick_key, adapter)
+                if decision.get("should_continue") and prompt:
+                    self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 

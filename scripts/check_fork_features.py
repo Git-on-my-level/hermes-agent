@@ -18,6 +18,46 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # (relative path, required substring, human label)
 KEEP_LIST: list[tuple[str, str, str]] = [
     (
+        "tests/gateway/test_auto_start_goal.py",
+        "def test_auto_start_and_inference_share_one_goal_loop(",
+        "NousResearch/hermes-agent#114921 enabled explicit/paused precedence regression",
+    ),
+    (
+        "tests/gateway/test_goal_autodrive_regressions.py",
+        "def test_goal_busy_correction_replaces_automatic_objective(",
+        "NousResearch/hermes-agent#114921 busy correction regression",
+    ),
+    (
+        "tests/gateway/test_goal_autodrive_regressions.py",
+        "def test_goal_auto_start_replacement_clears_old_continuations(",
+        "NousResearch/hermes-agent#114921 obsolete continuation cleanup regression",
+    ),
+    (
+        "tests/gateway/test_goal_autodrive_regressions.py",
+        "def test_goal_kickoff_is_synthetic_and_preserves_contract(",
+        "NousResearch/hermes-agent#114921 command kickoff provenance regression",
+    ),
+    (
+        "tests/gateway/test_goal_autodrive_regressions.py",
+        "def test_goal_gate_continuation_preserves_budget_and_pause_dequeues_it(",
+        "NousResearch/hermes-agent#114921 quality-gate continuation regression",
+    ),
+    (
+        "tests/gateway/test_goal_autodrive_regressions.py",
+        "def test_goal_enabled_lifecycle_preserves_state_and_single_continuation(",
+        "NousResearch/hermes-agent#134448 enabled notification/correction/blocked lifecycle regression",
+    ),
+    (
+        "tests/hermes_cli/test_goal_continuation_actions.py",
+        "def test_goal_continuation_requires_action_with_all_criteria(",
+        "NousResearch/hermes-agent#129380 contract/subgoal action regression",
+    ),
+    (
+        "tests/hermes_cli/test_goal_continuation_actions.py",
+        "def test_auto_infer_false_string_does_not_call_judge(",
+        "NousResearch/hermes-agent#134448 false-string opt-in regression",
+    ),
+    (
         "hermes_cli/goals.py",
         "def maybe_infer_goal",
         "NousResearch/hermes-agent#134448 commitment-based goal inference",
@@ -224,6 +264,8 @@ KEEP_LIST: list[tuple[str, str, str]] = [
 ]
 
 TEST_FILES = [
+    "tests/gateway/test_goal_autodrive_regressions.py",
+    "tests/hermes_cli/test_goal_continuation_actions.py",
     "tests/hermes_cli/test_goal_auto_infer.py",
     "tests/gateway/test_auto_start_goal.py",
     "tests/hermes_cli/test_goals.py",
