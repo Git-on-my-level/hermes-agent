@@ -336,9 +336,11 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
+        quiet_internal: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+        ``quiet_internal``: the turn was internal and replied only with the silence marker."""
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -362,6 +364,11 @@ class GatewayGoalsMixin:
                     if notice and source is not None:
                         await self._defer_goal_status_notice_after_delivery(source, notice)
         if not mgr.is_active():
+            return
+        # A silent internal turn while the wait still holds reported "nothing changed": judging the
+        # bare marker reads as not-waiting, so it would clear a live barrier, spend a turn, post a
+        # status line and enqueue a continuation. A lifted barrier (the process exited) still judges.
+        if quiet_internal and await self._run_in_executor_with_context(mgr.wait_barrier_live):
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -415,12 +422,14 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip() and not self._silent_internal_turn(is_internal, final_text):
+        if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
                 if label == "goal continuation":
-                    await hook(session_entry=session_entry, source=source, final_response=final_text, event=event)
+                    quiet = self._silent_internal_turn(is_internal, final_text)
+                    await hook(session_entry=session_entry, source=source, final_response=final_text, event=event,
+                               **({"quiet_internal": True} if quiet else {}))
                 else:
                     await hook(session_entry=session_entry, source=source, final_response=final_text)
             except Exception as exc:
@@ -429,9 +438,7 @@ class GatewayGoalsMixin:
     @staticmethod
     def _silent_internal_turn(is_internal: bool, final_text: str) -> bool:
         """An internal turn (process notice, plugin injection) whose reply is exactly the silence
-        marker reported "nothing changed": it must not drive /goal. Judging it reads the bare
-        marker as not-waiting, so the judge clears a valid wait barrier, spends a turn, posts a
-        status line, and enqueues a continuation for a turn that deliberately said nothing."""
+        marker; the goal hook then skips judging while the goal's wait barrier still holds."""
         if not is_internal:
             return False
         from gateway.response_filters import is_intentional_silence_response
