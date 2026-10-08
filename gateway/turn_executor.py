@@ -16,11 +16,16 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
     Not ``tools.daemon_pool.DaemonThreadPoolExecutor(sys.maxsize)``: that keeps idle workers alive
     until shutdown, whereas here each thread exits when its turn ends.
 
-    ``submit`` only enqueues. A dispatcher thread calls ``Thread.start``, so a caller on the event
-    loop does not hold ``_lock`` across OS thread startup. The worker is registered in ``_threads``
-    before ``start`` returns, including when ``start`` itself runs the worker to completion.
-    ``shutdown(wait=True)`` drains accepted work. ``shutdown(wait=False)`` does not wait on a
-    ``Thread.start`` that has not returned.
+    ``submit`` only enqueues. A dispatcher thread calls ``Thread.start`` outside this lock, so a
+    caller on the event loop does not stall on OS thread startup. A dequeued future is a pending
+    start until its worker is inside ``_run``: it is not in ``_threads`` until then, and ``join()``
+    is never asked to join that unstarted thread. ``cancel_futures`` cancels queued
+    futures and pending starts together, so a body that has not begun does not run after shutdown.
+    On entry the worker adds itself to ``_threads`` and drops that entry before releasing the lock
+    if the future was cancelled. After the lock is released, ``_threads`` holds only workers whose
+    bodies will run.
+    ``shutdown(wait=True)`` drains accepted work that is still going to run. ``shutdown(wait=False)``
+    does not wait for a ``Thread.start`` that has not returned.
     """
 
     def __init__(self, thread_name_prefix: str = ""):
@@ -31,6 +36,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
         self._cv = threading.Condition(self._lock)
         self._n = 0
         self._queue: deque = deque()
+        self._pending: set = set()
         self._inflight = 0
         self._dispatcher: threading.Thread | None = None
 
@@ -67,19 +73,32 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
                 fut, fn, args, kwargs, n = self._queue.popleft()
                 self._inflight += 1
                 thread = self._make_worker(fut, fn, args, kwargs, n)
+                # Same critical section as the pop: shutdown must see this future as a pending
+                # start, not as neither queued nor running.
+                self._pending.add(fut)
             self._start_registered(thread, fut)
 
     def _make_worker(self, fut, fn, args, kwargs, n: int) -> threading.Thread:
         def _run():
-            # Register on the worker, which is running, so ``_threads`` only holds joinable
-            # threads. Adding after ``Thread.start`` returns loses the race where start joins
-            # the worker first; adding before start hands ``_stop_pool`` a thread join() rejects.
+            # This thread is running, so it is joinable. Shutdown captured ``_pending`` under
+            # this lock and cancels those futures before it returns; ``set_running_or_notify_cancel``
+            # is what makes the two sides exclusive. A cancel that wins leaves the body unrun and
+            # removes this thread before the lock is released. Adding the thread object before
+            # ``start`` would make ``join()`` raise; adding it after ``start`` returns loses the
+            # race where start joins the worker first.
             current = threading.current_thread()
             with self._cv:
+                self._pending.discard(fut)
+                # In ``_threads`` before the future can become running, so a shutdown that loses
+                # the cancel race still snapshots a joinable worker. A cancel that wins takes the
+                # thread back out before this lock is released.
                 self._threads.add(current)
+                run_body = fut.set_running_or_notify_cancel()
+                if not run_body:
+                    self._threads.discard(current)
                 self._cv.notify_all()
             try:
-                if not fut.set_running_or_notify_cancel():
+                if not run_body:
                     return
                 try:
                     fut.set_result(fn(*args, **kwargs))
@@ -100,26 +119,40 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             thread.start()
         except BaseException as exc:  # noqa: BLE001 - thread-limit and shutdown races are results
             with self._cv:
+                self._pending.discard(fut)
                 self._threads.discard(thread)
                 self._inflight -= 1
                 self._cv.notify_all()
-            try:
-                fut.set_exception(exc)
-            except concurrent.futures.InvalidStateError:
-                pass
+            if not fut.cancelled():
+                try:
+                    fut.set_exception(exc)
+                except concurrent.futures.InvalidStateError:
+                    pass
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
         with self._cv:
             self._shutdown = True
+            queued: list = []
+            pending: list = []
             if cancel_futures:
                 while self._queue:
                     fut, _fn, _args, _kwargs, _n = self._queue.popleft()
-                    fut.cancel()
+                    queued.append(fut)
+                pending = list(self._pending)
             self._cv.notify_all()
-            if not wait:
-                # Do not wait for a Thread.start that has not returned. A start that never
-                # enters the worker is absent from ``_threads``; joining it would raise.
-                return
+        # ``Future.cancel`` runs done callbacks. Keep that outside ``_cv`` so a callback can take
+        # the executor lock. Cancel still happens before ``wait=False`` returns and before the
+        # ``wait=True`` drain, and it is the same set captured under the lock.
+        if cancel_futures:
+            for fut in queued:
+                fut.cancel()
+            for fut in pending:
+                fut.cancel()
+        if not wait:
+            # Do not wait for a Thread.start that has not entered the worker. That thread is not
+            # joinable and is not in ``_threads``. With cancel_futures, its body is cancelled.
+            return
+        with self._cv:
             while self._queue or self._inflight:
                 self._cv.wait()
             threads = [thread for thread in self._threads if thread.is_alive()]

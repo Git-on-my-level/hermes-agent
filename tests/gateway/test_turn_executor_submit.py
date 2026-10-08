@@ -155,6 +155,41 @@ def test_thread_start_exception_fails_the_future(monkeypatch):
     assert executor._inflight == 0
 
 
+def test_cancel_futures_drops_a_start_that_has_not_returned(monkeypatch):
+    """A dequeued future blocked inside Thread.start is not queued and not in ``_threads``.
+
+    ``cancel_futures`` must still drop it. Releasing the start gate afterwards must not run the body.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    ran = threading.Event()
+    real_start = _UnboundedThreadExecutor._start_registered
+
+    def gated(self, thread, fut):
+        entered.set()
+        assert release.wait(2), "start gate was never released"
+        return real_start(self, thread, fut)
+
+    monkeypatch.setattr(_UnboundedThreadExecutor, "_start_registered", gated)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    try:
+        future = executor.submit(lambda: ran.set())
+        assert entered.wait(1), "dispatcher never reached the gated start"
+        began = time.monotonic()
+        executor.shutdown(wait=False, cancel_futures=True)
+        assert time.monotonic() - began < 0.2, "shutdown(wait=False) blocked on Thread.start"
+        assert future.cancelled()
+        assert len(executor._threads) == 0
+    finally:
+        release.set()
+    deadline = time.monotonic() + 2
+    while executor._inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert executor._inflight == 0
+    assert not ran.is_set()
+    assert future.cancelled()
+
+
 def test_cancel_futures_drops_work_still_queued(monkeypatch):
     gate = threading.Event()
     entered = threading.Event()
