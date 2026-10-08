@@ -94,6 +94,43 @@ def _target(goal: dict) -> str:
     return "nothing (goal active, no wait barrier)"
 
 
+def _lease_key(con: sqlite3.Connection, sid: str) -> str:
+    """Mirror of SessionDB._session_turn_lease_key: walk compression parents to the conversation root."""
+    current, seen = sid, {sid}
+    while True:
+        row = con.execute("select parent_session_id from sessions where id=?", (current,)).fetchone()
+        parent = row[0] if row else None
+        if not parent or parent in seen:
+            return current
+        prow = con.execute("select end_reason from sessions where id=?", (parent,)).fetchone()
+        if not prow or prow[0] != "compression":
+            return current
+        seen.add(parent)
+        current = parent
+
+
+def _turn_running(con: sqlite3.Connection, sid: str, now: float) -> bool:
+    """A live turn lease: the session is mid-turn, so an injection would only queue behind it
+    (and a long turn persists its rows at the end, so the transcript alone looks idle)."""
+    try:
+        row = con.execute("select 1 from session_turn_leases where conversation_id=? and expires_at>?",
+                          (_lease_key(con, sid), now)).fetchone()
+    except sqlite3.OperationalError:  # older schema without leases
+        return False
+    return row is not None
+
+
+def _last_activity(con: sqlite3.Connection, sid: str, now: float) -> float:
+    """Freshest of the newest message and the session's activity heartbeat (~60 s while running)."""
+    last = con.execute("select max(timestamp) from messages where session_id=?", (sid,)).fetchone()[0] or 0.0
+    try:
+        beat = con.execute("select last_activity_at from sessions where id=?", (sid,)).fetchone()
+        beat = float(beat[0]) if beat and beat[0] else 0.0
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        beat = 0.0
+    return max(float(last), beat if beat <= now + 60 else 0.0)  # ignore garbage future stamps
+
+
 def _is_synthetic_sql() -> str:
     return " or ".join("instr(substr(coalesce(content,''),1,200), ?) > 0" for _ in SYNTHETIC_PREFIXES)
 
@@ -114,11 +151,11 @@ def candidates(db_path: Path, interval_s: float, escalate_after: int, now: float
             row = con.execute("select session_key, ended_at from sessions where id=?", (sid,)).fetchone()
             if not row or not row[0] or row[1] is not None or not str(row[0]).startswith("agent:"):
                 continue
-            last = con.execute("select max(timestamp) from messages where session_id=?", (sid,)).fetchone()[0]
+            last = _last_activity(con, sid, now)
             if not last:
                 continue
-            idle = now - float(last)
-            if idle < interval_s:
+            idle = now - last
+            if idle < interval_s or _turn_running(con, sid, now):
                 continue
             real = con.execute(
                 f"select coalesce(max(id), 0) from messages where session_id=? and role='user' "
@@ -156,8 +193,10 @@ def _tick(ctx, home: Path) -> None:
     interval_s = cfg["interval_minutes"] * 60
     now = time.time()
     for sid, key, k, idle, goal in candidates(home / "state.db", interval_s, cfg["escalate_after"], now):
-        # Covers an injection not yet visible in the session; once its row lands the session is no
-        # longer idle. A dispatch the gateway dropped never lands and is retried after RETRY_SECONDS.
+        # Covers an injection not yet visible in the session; once its turn starts the session holds a
+        # lease and then has fresh rows. One that never starts (the gateway dropped the dispatch) is
+        # retried after RETRY_SECONDS; candidates() skips sessions mid-turn, so a heartbeat is never
+        # queued behind a running turn in the first place.
         if now - _recent.get((str(home), sid), 0) < RETRY_SECONDS:
             continue
         ok = False

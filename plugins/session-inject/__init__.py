@@ -84,18 +84,43 @@ def recover_stale_inflight(spool: Path, now: float | None = None) -> int:
     return n
 
 
-def _observed(db_path: Path, session_key: str, content: str, since: float) -> bool:
+def _snippet(content: str) -> str:
+    """The part of the text the gateway persists verbatim: it strips leading timestamp prefixes
+    (and stores their time as the row time) and may prepend a sender label."""
+    text = content
+    try:
+        from gateway.message_timestamps import strip_leading_message_timestamps
+        text = strip_leading_message_timestamps(content)[0]
+    except Exception:
+        pass
+    return text.strip()[:200]
+
+
+def _max_message_id(db_path: Path) -> int:
+    if not db_path.exists():
+        return 0
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    try:
+        return int(con.execute("select coalesce(max(id), 0) from messages").fetchone()[0])
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+
+
+def _observed(db_path: Path, session_key: str, content: str, after_id: int) -> bool:
     """True once the injected text is persisted as a user turn in that session (any session id
-    the key has had, so compression rotation is covered)."""
-    snippet = content.strip()[:200]
+    the key has had, so compression rotation is covered). Bounded by row id, not timestamp: the
+    gateway may stamp a row with a time embedded in the text."""
+    snippet = _snippet(content)
     if not snippet or not db_path.exists():
         return False
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
     try:
         row = con.execute(
             "select 1 from messages m join sessions s on s.id = m.session_id "
-            "where s.session_key = ? and m.role = 'user' and m.timestamp >= ? "
-            "and instr(m.content, ?) > 0 limit 1", (session_key, since - 5, snippet)).fetchone()
+            "where s.session_key = ? and m.role = 'user' and m.id > ? "
+            "and instr(m.content, ?) > 0 limit 1", (session_key, after_id, snippet)).fetchone()
         return row is not None
     finally:
         con.close()
@@ -110,7 +135,7 @@ def confirm_sent(spool: Path, db_path: Path, now: float | None = None) -> None:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             sent_at = float(record["sent_at"])
-            if _observed(db_path, record["session_key"], record["content"], sent_at):
+            if _observed(db_path, record["session_key"], record["content"], int(record.get("after_id", 0))):
                 record["confirmed_at"] = now
                 _move(path, spool, "done", record)
                 logger.info("session-inject: confirmed %s -> %s", path.name, record["session_key"])
@@ -122,8 +147,9 @@ def confirm_sent(spool: Path, db_path: Path, now: float | None = None) -> None:
             logger.warning("session-inject: confirm failed for %s", path.name, exc_info=True)
 
 
-def drain_once(ctx, spool: Path | None = None) -> None:
+def drain_once(ctx, spool: Path | None = None, db_path: Path | None = None) -> None:
     spool = spool or spool_dir()
+    db_path = db_path or spool.parent.parent / "state.db"
     for queued in sorted(spool.glob("*.json")):
         path = queued.with_suffix(".inflight")
         try:
@@ -138,13 +164,14 @@ def drain_once(ctx, spool: Path | None = None) -> None:
             _move(path, spool, "failed", {"file": path.name, "error": str(exc)})
             continue
         ok = False
+        after_id = _max_message_id(db_path)  # before dispatch, so the persisted row's id is larger
         try:
             ok = bool(ctx.inject_message(content, role="user", session_key=key))
         except Exception:
             logger.warning("session-inject: inject failed for %s", key, exc_info=True)
         record["attempts"] = int(record.get("attempts", 0)) + 1
         if ok:
-            record["sent_at"] = time.time()
+            record["sent_at"], record["after_id"] = time.time(), after_id
             logger.info("session-inject: dispatched %s -> %s", queued.name, key)
             _move(path, spool, "sent", record)
         elif record["attempts"] >= MAX_ATTEMPTS:
@@ -166,7 +193,7 @@ def _loop(ctx, token_key: str, token, home: Path) -> None:
                 return
             if _in_gateway_process() and spool.is_dir():
                 recover_stale_inflight(spool)
-                drain_once(ctx, spool)
+                drain_once(ctx, spool, home / "state.db")
                 confirm_sent(spool, home / "state.db")
         except Exception:
             logger.warning("session-inject: drain loop error", exc_info=True)

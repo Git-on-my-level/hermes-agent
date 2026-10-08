@@ -29,7 +29,10 @@ def db(tmp_path):
     con = sqlite3.connect(path)
     con.executescript("""
         create table state_meta (key text primary key, value text);
-        create table sessions (id text primary key, session_key text, ended_at real);
+        create table sessions (id text primary key, session_key text, ended_at real,
+                               parent_session_id text, end_reason text, last_activity_at real);
+        create table session_turn_leases (conversation_id text primary key, holder text,
+                                          acquired_at real, expires_at real);
         create table messages (id integer primary key autoincrement, session_id text, role text,
                                content text, timestamp real);
     """)
@@ -40,7 +43,7 @@ def db(tmp_path):
 def _goal(con, sid, status="active", key="agent:main:telegram:dm:1", ended=None, **wait):
     goal = {"goal": f"ship {sid}", "status": status, **wait}
     con.execute("insert into state_meta values (?, ?)", (f"goal:{sid}", json.dumps(goal)))
-    con.execute("insert into sessions values (?, ?, ?)", (sid, key, ended))
+    con.execute("insert into sessions (id, session_key, ended_at) values (?, ?, ?)", (sid, key, ended))
     con.commit()
 
 
@@ -95,6 +98,26 @@ def test_goal_continuations_do_not_reset_the_count(db):
     _msg(con, "s", "user", "[Continuing toward your standing goal] take one concrete step", NOW - 8 * 3600 + 1)
     _msg(con, "s", "user", "[Heartbeat — recurring instruction, fires every 1h]", NOW - 8 * 3600 + 2)
     assert _due(mod, path)["s"][0] == 2
+
+
+def test_running_turn_or_fresh_activity_blocks_a_heartbeat(db):
+    path, con = db
+    mod = _load()
+    _goal(con, "s", waiting_on_session="proc_1")
+    _msg(con, "s", "user", "go", NOW - 3 * 3600)
+    con.execute("insert into sessions (id, session_key, ended_at, end_reason) values ('root', 'agent:x', ?, 'compression')",
+                (NOW - 4 * 3600,))
+    con.execute("update sessions set parent_session_id='root' where id='s'")
+    con.execute("insert into session_turn_leases values ('root', 'pid=1', ?, ?)", (NOW - 60, NOW + 240))
+    con.commit()
+    assert "s" not in _due(mod, path)  # mid-turn: the lease is keyed by the compression root
+    con.execute("delete from session_turn_leases")
+    con.execute("update sessions set last_activity_at=? where id='s'", (NOW - 120,))
+    con.commit()
+    assert "s" not in _due(mod, path)  # long turn still heart-beating activity
+    con.execute("update sessions set last_activity_at=? where id='s'", (NOW - 3 * 3600,))
+    con.commit()
+    assert "s" in _due(mod, path)
 
 
 def test_render_escalates_on_the_last_check():

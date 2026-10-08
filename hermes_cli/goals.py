@@ -1615,6 +1615,25 @@ class GoalManager:
         self._save()
         return True
 
+    def wait_barrier_live(self) -> bool:
+        """True while a set wait barrier still holds: the pid is alive, the process_registry session's
+        trigger has not fired, or the deadline is ahead with no awaited delegation back. Read-only:
+        unlike :meth:`is_waiting` it neither applies the age cap nor clears the barrier, so a caller
+        can ask "has anything this goal waits on changed?" without un-parking it."""
+        s = self._state
+        if s is None or s.status != "active":
+            return False
+        if s.waiting_on_session is not None:
+            return _session_waiting(s.waiting_on_session)
+        if s.waiting_on_pid is not None:
+            return _pid_alive(s.waiting_on_pid)
+        if s.waiting_until:
+            if time.time() >= s.waiting_until:
+                return False
+            return not (s.waiting_on_delegations > 0
+                        and count_active_delegations(self.session_id) < s.waiting_on_delegations)
+        return False
+
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
         (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier

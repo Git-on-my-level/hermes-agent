@@ -115,14 +115,15 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ),
     (
         "gateway/run_goals.py",
-        "and not self._silent_internal_turn(is_internal, final_text)",
-        "fork: silent internal turns do not drive /goal",
+        "if quiet_internal and await self._run_in_executor_with_context(mgr.wait_barrier_live):",
+        "fork: silent internal turns do not judge a goal whose wait still holds",
     ),
     (
         "tests/gateway/test_goal_silent_internal_turn.py",
-        "def test_silent_internal_turn_skips_goal_but_runs_loop_hook(",
+        "def test_quiet_turn_after_the_barrier_lifted_is_still_judged(",
         "fork: silent internal turn regression",
     ),
+    ("hermes_cli/goals.py", "def wait_barrier_live(self)", "fork: read-only wait-barrier liveness"),
     ("plugins/session-inject/__init__.py", "def confirm_sent(", "fork plugin: session-inject delivery confirmation"),
     ("plugins/session-inject/__init__.py", "def drain_once(", "fork plugin: session-inject spool drain"),
     ("plugins/session-inject/cli.py", "def queue(", "fork plugin: `hermes inject` CLI"),

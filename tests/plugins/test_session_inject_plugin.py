@@ -76,6 +76,9 @@ def test_dispatch_is_confirmed_only_when_the_session_persists_it(home):
     con.execute("insert into sessions values ('s1', 'agent:k', null, 't')")
     con.commit()
     (spool / "a.json").write_text(json.dumps({"session_key": "agent:k", "content": "continue the deploy"}))
+    con.execute("insert into messages (session_id, role, content, timestamp) values (?,?,?,?)",
+                ("s1", "user", "[David] continue the deploy", 1.0))  # an older identical turn
+    con.commit()
     mod.drain_once(Recorder(), spool)
     sent_at = json.loads((spool / "sent" / "a.json").read_text())["sent_at"]
     mod.confirm_sent(spool, home / "state.db", now=sent_at + 10)
@@ -85,6 +88,23 @@ def test_dispatch_is_confirmed_only_when_the_session_persists_it(home):
     con.commit()
     mod.confirm_sent(spool, home / "state.db", now=sent_at + 20)
     assert json.loads((spool / "done" / "a.json").read_text())["confirmed_at"] == sent_at + 20
+
+
+def test_timestamp_prefixed_inject_is_confirmed_after_the_gateway_strips_it(home):
+    mod = _load()
+    spool = mod.spool_dir(home)
+    con = _db(home)
+    con.execute("insert into sessions values ('s1', 'agent:k', null, 't')")
+    con.commit()
+    text = "[2026-04-13T17:02:06+0200] continue the deploy"
+    (spool / "a.json").write_text(json.dumps({"session_key": "agent:k", "content": text}))
+    mod.drain_once(Recorder(), spool)
+    # the gateway persists the stripped body, stamped with the embedded (older) time
+    con.execute("insert into messages (session_id, role, content, timestamp) values (?,?,?,?)",
+                ("s1", "user", "continue the deploy", 1776092526.0))
+    con.commit()
+    mod.confirm_sent(spool, home / "state.db")
+    assert (spool / "done" / "a.json").exists()
 
 
 def test_dispatch_the_gateway_dropped_fails_after_the_confirm_window(home):
