@@ -381,6 +381,10 @@ class GatewayGoalsMixin:
         if mgr is None:
             return
 
+        # Steering for the judge: the user's own message, when this turn ran under a goal that already
+        # existed (a goal inferred from this very message was drafted from it).
+        owner_message = getattr(event, "text", None) if mgr.has_goal() and self._turn_is_user_authored(event) else None
+
         # goals.auto_infer: a goal-less session whose reply commits to work gets an inferred goal
         # (Muse/Dots pattern). Skipped for heartbeat / continuation / internal turns so the loop
         # never feeds itself. Runs before the judge so this very reply gets judged against it.
@@ -416,7 +420,7 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, owner_message=owner_message,
             ),
         )
         msg = decision.get("message") or ""
