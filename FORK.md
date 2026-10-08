@@ -103,6 +103,14 @@ Open upstream goal ports (both automatic modes remain off by default):
 | NousResearch/hermes-agent#129380 | Continuations take a concrete action before replying | `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_gates.py` |
 | NousResearch/hermes-agent#117222 | Feed host-observed tool activity to the goal judge | `tests/hermes_cli/test_goals.py` |
 
+Fork-original plugins (new files only; opt-in per host through `plugins.enabled` and
+`plugins.entries.<id>.allow_gateway_injection: true`; upstream has no equivalent):
+
+| Plugin | Carried behavior | Contract tests |
+| --- | --- | --- |
+| `plugins/goal-heartbeat/` | Every `interval_minutes` (default 50) of silence in a gateway session with an active goal, inject a check-in turn so the agent re-judges a parked wait; check `escalate_after` (default 3) asks it to tell the user what is stuck. Closes the gap where a parked goal resumes only on a waiter's exit notice. | `tests/plugins/test_goal_heartbeat_plugin.py` |
+| `plugins/session-inject/` | `hermes inject <session> "msg"` queues a user turn that the gateway delivers through `ctx.inject_message` (resume a stalled session from a shell, cron, or another agent). | `tests/plugins/test_session_inject_plugin.py` |
+
 ## Branch retention
 
 Every sync added branches and nothing removed them: the fork reached 403
