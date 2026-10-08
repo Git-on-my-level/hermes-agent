@@ -167,6 +167,26 @@ class TestSiblingQuarantine:
         assert quarantined.is_file()
         assert quarantined.read_bytes() == bytes(4096)
 
+    def test_permission_error_on_existence_probe_is_not_absence(self, hermes_home, monkeypatch):
+        """A stat permission error is not the sibling-rename race.
+
+        The initial snapshot still uses ``Path.is_file``. The later probe must
+        not treat ``PermissionError`` as a missing file and skip the refusal.
+        """
+        db = hermes_home / "state.db"
+        db.write_bytes(bytes(4096))
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self == db:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        with pytest.raises(PermissionError):
+            preflight_db_writability(db, db_label="state.db")
+        assert db.read_bytes() == bytes(4096)
+
 
 class TestSkips:
 
