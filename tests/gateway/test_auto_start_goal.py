@@ -108,7 +108,7 @@ async def test_auto_start_and_inference_share_one_goal_loop(tmp_path, monkeypatc
     monkeypatch.setattr(runner, "_session_key_for_source", lambda source: "key")
     monkeypatch.setattr(runner, "_enqueue_fifo", lambda key, event, adapter: enqueued.append(event))
 
-    async def notice(source, text):
+    async def notice(source, text, **kwargs):
         notices.append(text)
 
     monkeypatch.setattr(runner, "_defer_goal_status_notice_after_delivery", notice)

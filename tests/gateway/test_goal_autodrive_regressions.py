@@ -184,7 +184,7 @@ async def test_goal_enabled_lifecycle_preserves_state_and_single_continuation(en
     runner, adapter = enabled_gateway
     infer = Mock(return_value="Ship the inferred release after CI passes")
     monkeypatch.setattr(goals, "infer_goal_from_turn", infer)
-    monkeypatch.setattr(goals, "draft_contract", lambda goal: goals.GoalContract(outcome=goal, verification="CI passes"))
+    monkeypatch.setattr(goals, "draft_contract", lambda goal, **kwargs: goals.GoalContract(outcome=goal, verification="CI passes"))
     judge = Mock(return_value=("continue", "unfinished", False, None, False))
     monkeypatch.setattr(goals, "judge_goal", judge)
 

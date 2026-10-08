@@ -929,10 +929,10 @@ class TestBlockedVerdict:
         assert decision["verdict"] == "blocked"
         assert decision["status"] == "paused"
         assert decision["should_continue"] is False
-        assert "unachievable" in decision["message"].lower()
+        assert "needs your input" in decision["message"].lower()
         assert mgr.state is not None
         assert mgr.state.status == "paused"
-        assert "unachievable" in (mgr.state.paused_reason or "").lower()
+        assert "needs your input" in (mgr.state.paused_reason or "").lower()
 
 
 def test_format_tool_call_line_evidence():

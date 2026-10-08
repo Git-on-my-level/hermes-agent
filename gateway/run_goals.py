@@ -262,33 +262,64 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
-        """Send a /goal judge status line back to the originating chat/thread."""
+    def _goal_notice_is_visible(self, message: str, notice_level: Optional[str]) -> bool:
+        # /loop shares this delivery helper; only classified goal notices use goals.notices.
+        if notice_level is None or notice_level == "important":
+            return True
+        from hermes_cli.goals import _goals_setting
+
+        config = getattr(self, "config", None)
+        goals_cfg = (config.get("goals") if isinstance(config, dict) else getattr(config, "goals", None)) or {}
+        mode = goals_cfg.get("notices", _goals_setting("notices", "important"))
+        # YAML's unquoted `off` may be parsed as False.
+        mode = "off" if mode is False else str(mode).strip().lower()
+        if mode not in {"important", "all", "off"}:
+            mode = "important"
+        visible = mode == "all" or (mode == "important" and notice_level == "info")
+        if not visible:
+            logger.info("goal notice (%s): %s", notice_level, message)
+        return visible
+
+    async def _send_goal_status_notice(
+        self, source: Any, message: str, *, notice_level: Optional[str] = None,
+    ) -> None:
+        """Send a goal notice at its configured verbosity, preserving thread routing."""
+        if not self._goal_notice_is_visible(message, notice_level):
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        if notice_level is not None:
+            metadata = dict(metadata or {})
+            metadata.pop("notify", None)
+            if notice_level == "important":
+                metadata["notify"] = True
         result = await adapter.send(source.chat_id, message, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, notice_level: Optional[str] = None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
         its one-shot post-delivery callback when available, else deliver directly (never drop).
         """
+        if not self._goal_notice_is_visible(message, notice_level):
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, notice_level=notice_level)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -362,7 +393,7 @@ class GatewayGoalsMixin:
                         lambda: maybe_infer_goal(mgr, last_user, final_response or ""),
                     )
                     if notice and source is not None:
-                        await self._defer_goal_status_notice_after_delivery(source, notice)
+                        await self._defer_goal_status_notice_after_delivery(source, notice, notice_level="info")
         if not mgr.is_active():
             return
         # A silent internal turn while the wait still holds reported "nothing changed": judging the
@@ -391,7 +422,7 @@ class GatewayGoalsMixin:
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, notice_level=decision["notice_level"])
         prompt = decision.get("continuation_prompt") or ""
         if source is None:
             return
