@@ -7,44 +7,48 @@ lazily, on the next turn, which never comes. This plugin is that turn. Every
 ``interval_minutes`` of session inactivity it injects a check-in, so the agent (not a
 liveness probe) re-judges whether the wait is still healthy and still the right wait.
 
-Escalation: heartbeats since the last real activity (the user, a process notice, or any
-other non-heartbeat user turn) are counted from the session's own history. Number
-``escalate_after`` asks the agent to tell the user what is stuck; after that, heartbeats stop
-until something else happens in the session.
+A healthy check-in ends with exactly ``[SILENT]``; the gateway then leaves the goal untouched
+(no judge call, no turn spent, no status line). Anything else goes through the goal judge as
+a normal turn.
 
-Config (plugins.entries.goal-heartbeat):
+Escalation: heartbeats since the last real event (a user message, a process notice; not a
+heartbeat or a goal continuation) are counted from the session's own history. Number
+``escalate_after`` asks the agent to tell the user what is stuck; after that, heartbeats stop
+until something real happens in the session.
+
+Config (plugins.entries.goal-heartbeat, re-read every minute):
   allow_gateway_injection: true   # required
-  interval_minutes: 50            # idle time before a heartbeat (default 50)
-  escalate_after: 3               # the Nth silent heartbeat escalates (default 3)
+  interval_minutes: 50            # idle time before a heartbeat (default 50, min 15)
+  escalate_after: 3               # the Nth heartbeat without a real event escalates (default 3)
   enabled: true                   # false stops new heartbeats without unloading
 
-Dry run against the live DB:  python3 __init__.py --dry-run [--interval M] [--escalate N]
+Dry run against a home's live DB:  python3 __init__.py --dry-run [--interval M] [--escalate N]
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import sys
 import threading
 import time
-import json
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "goal-heartbeat"
 MARKER = "[Goal heartbeat "
+# User rows that are not real events: our own check-ins, goal-loop continuations, upstream /heartbeat.
+SYNTHETIC_PREFIXES = (MARKER, "[Continuing toward your standing goal", "[Heartbeat")
 POLL_SECONDS = 60.0
+MIN_INTERVAL_MINUTES = 15.0
+RETRY_SECONDS = 600.0  # an injection that never shows up in the session is retried after this
 DEFAULTS = {"interval_minutes": 50, "escalate_after": 3, "enabled": True}
-# A plugin reload re-executes this module without stopping the old thread: the owner token and the
+# A plugin reload re-executes this module without stopping the old thread: the owner tokens and the
 # recent-fire map live on ``sys`` so they survive the re-import; a thread whose token is stale exits.
 _TOKENS = sys.__dict__.setdefault("_hermes_plugin_thread_tokens", {})
-_recent: dict = sys.__dict__.setdefault("_hermes_goal_heartbeat_recent", {})  # session_id -> injected_at
-
-
-def _home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+_recent: dict = sys.__dict__.setdefault("_hermes_goal_heartbeat_recent", {})  # (home, sid) -> injected_at
 
 
 def _settings() -> dict:
@@ -57,9 +61,19 @@ def _settings() -> dict:
                 out[k] = entry[k]
     except Exception:
         logger.debug("goal-heartbeat: config read failed; using defaults", exc_info=True)
-    out["interval_minutes"] = max(5.0, float(out["interval_minutes"]))
+    out["interval_minutes"] = max(MIN_INTERVAL_MINUTES, float(out["interval_minutes"]))
     out["escalate_after"] = max(1, int(out["escalate_after"]))
     return out
+
+
+def _plugin_still_enabled() -> bool:
+    """A disable + reload unloads the plugin without re-running register(): stop on our own."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        enabled = ((load_config_readonly() or {}).get("plugins") or {}).get("enabled") or []
+        return PLUGIN_ID in enabled
+    except Exception:
+        return True  # unreadable config is not a reason to stop
 
 
 def _in_gateway_process() -> bool:
@@ -80,11 +94,16 @@ def _target(goal: dict) -> str:
     return "nothing (goal active, no wait barrier)"
 
 
+def _is_synthetic_sql() -> str:
+    return " or ".join("instr(substr(coalesce(content,''),1,200), ?) > 0" for _ in SYNTHETIC_PREFIXES)
+
+
 def candidates(db_path: Path, interval_s: float, escalate_after: int, now: float):
     """Yield (session_id, session_key, k, idle_s, goal) for each heartbeat due now; k is 1-based."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    synthetic = _is_synthetic_sql()
     try:
-        for key, raw in con.execute("select key, value from state_meta where key like 'goal:%'"):
+        for key, raw in con.execute("select key, value from state_meta where key like 'goal:%'").fetchall():
             try:
                 goal = json.loads(raw)
             except Exception:
@@ -92,8 +111,7 @@ def candidates(db_path: Path, interval_s: float, escalate_after: int, now: float
             if goal.get("status") != "active":
                 continue
             sid = key[len("goal:"):]
-            row = con.execute(
-                "select session_key, ended_at from sessions where id=?", (sid,)).fetchone()
+            row = con.execute("select session_key, ended_at from sessions where id=?", (sid,)).fetchone()
             if not row or not row[0] or row[1] is not None or not str(row[0]).startswith("agent:"):
                 continue
             last = con.execute("select max(timestamp) from messages where session_id=?", (sid,)).fetchone()[0]
@@ -102,13 +120,12 @@ def candidates(db_path: Path, interval_s: float, escalate_after: int, now: float
             idle = now - float(last)
             if idle < interval_s:
                 continue
-            # Heartbeats since the last real (non-heartbeat) user turn.
             real = con.execute(
-                "select coalesce(max(id), 0) from messages where session_id=? and role='user' "
-                "and instr(coalesce(content,''), ?) = 0", (sid, MARKER)).fetchone()[0]
+                f"select coalesce(max(id), 0) from messages where session_id=? and role='user' "
+                f"and not ({synthetic})", (sid, *SYNTHETIC_PREFIXES)).fetchone()[0]
             beats = con.execute(
                 "select count(*) from messages where session_id=? and role='user' and id>? "
-                "and instr(coalesce(content,''), ?) > 0", (sid, real, MARKER)).fetchone()[0]
+                "and instr(substr(coalesce(content,''),1,200), ?) > 0", (sid, real, MARKER)).fetchone()[0]
             if beats >= escalate_after:
                 continue  # already escalated; wait for something real to happen
             yield sid, row[0], beats + 1, idle, goal
@@ -125,54 +142,64 @@ def render(k: int, n: int, idle_s: float, goal: dict) -> str:
                 "running, nothing is parked on an approval, and the condition can still happen. "
                 "If something finished, broke, or changed, act on it now. If it is healthy, make sure something "
                 "will wake you (a background process with notify that exits when the condition changes), then "
-                "reply exactly [SILENT].")
+                "reply with exactly [SILENT] and nothing else.")
     return (f"{head}\nGoal: {goal.get('goal', '')}\n"
             f"This is check {k} with no progress since the last real event. Do not reply [SILENT]. Send the user "
             "one short message: what the goal is waiting on, why it has not moved, and the one thing you need "
             "from them (or your default if they do nothing). Heartbeats stop until something new happens here.")
 
 
-def _tick(ctx) -> None:
+def _tick(ctx, home: Path) -> None:
     cfg = _settings()
     if not cfg["enabled"]:
         return
     interval_s = cfg["interval_minutes"] * 60
     now = time.time()
-    for sid, key, k, idle, goal in candidates(_home() / "state.db", interval_s, cfg["escalate_after"], now):
-        if now - _recent.get(sid, 0) < interval_s:
-            continue  # injected already; queued behind a running turn or not yet persisted
+    for sid, key, k, idle, goal in candidates(home / "state.db", interval_s, cfg["escalate_after"], now):
+        # Covers an injection not yet visible in the session; once its row lands the session is no
+        # longer idle. A dispatch the gateway dropped never lands and is retried after RETRY_SECONDS.
+        if now - _recent.get((str(home), sid), 0) < RETRY_SECONDS:
+            continue
         ok = False
         try:
             ok = bool(ctx.inject_message(render(k, cfg["escalate_after"], idle, goal), role="user", session_key=key))
         except Exception:
             logger.warning("goal-heartbeat: inject failed for %s", key, exc_info=True)
         if ok:
-            _recent[sid] = now
+            _recent[(str(home), sid)] = now
             logger.info("goal-heartbeat: fired %d/%d -> %s (idle %dm)", k, cfg["escalate_after"], sid, idle // 60)
 
 
-def _loop(ctx, token) -> None:
-    while _TOKENS.get(PLUGIN_ID) is token:
+def _loop(ctx, token_key: str, token, home: Path) -> None:
+    from hermes_constants import set_hermes_home_override
+    set_hermes_home_override(home)  # this thread's config reads and injection checks use its profile
+    while _TOKENS.get(token_key) is token:
         try:
+            if not _plugin_still_enabled():
+                logger.info("goal-heartbeat: disabled for %s; thread exiting", home)
+                return
             if _in_gateway_process():
-                _tick(ctx)
+                _tick(ctx, home)
         except Exception:
             logger.warning("goal-heartbeat: tick error", exc_info=True)
         time.sleep(POLL_SECONDS)
 
 
 def register(ctx):
-    token = object()
-    _TOKENS[PLUGIN_ID] = token  # retires any thread from a previous load
-    threading.Thread(target=_loop, args=(ctx, token), name=PLUGIN_ID, daemon=True).start()
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()  # the profile this load is scoped to (multiplexed gateways load once per profile)
+    token_key, token = f"{PLUGIN_ID}:{home}", object()
+    _TOKENS[token_key] = token  # retires any thread from a previous load of this profile
+    threading.Thread(target=_loop, args=(ctx, token_key, token, home), name=PLUGIN_ID, daemon=True).start()
 
 
 if __name__ == "__main__" and "--dry-run" in sys.argv:
     args = sys.argv
     interval = float(args[args.index("--interval") + 1]) if "--interval" in args else DEFAULTS["interval_minutes"]
     n = int(args[args.index("--escalate") + 1]) if "--escalate" in args else DEFAULTS["escalate_after"]
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     found = False
-    for sid, key, k, idle, goal in candidates(_home() / "state.db", interval * 60, n, time.time()):
+    for sid, key, k, idle, goal in candidates(home / "state.db", interval * 60, n, time.time()):
         found = True
         print(f"WOULD FIRE {k}/{n} -> {sid} ({key}) idle={int(idle // 60)}m")
         print("  " + render(k, n, idle, goal).replace("\n", "\n  "))

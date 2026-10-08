@@ -113,11 +113,22 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "def test_count_escalates_then_stops_until_a_real_event(",
         "fork plugin: goal-heartbeat escalation regression",
     ),
+    (
+        "gateway/run_goals.py",
+        "and not self._silent_internal_turn(is_internal, final_text)",
+        "fork: silent internal turns do not drive /goal",
+    ),
+    (
+        "tests/gateway/test_goal_silent_internal_turn.py",
+        "def test_silent_internal_turn_skips_goal_but_runs_loop_hook(",
+        "fork: silent internal turn regression",
+    ),
+    ("plugins/session-inject/__init__.py", "def confirm_sent(", "fork plugin: session-inject delivery confirmation"),
     ("plugins/session-inject/__init__.py", "def drain_once(", "fork plugin: session-inject spool drain"),
     ("plugins/session-inject/cli.py", "def queue(", "fork plugin: `hermes inject` CLI"),
     (
         "tests/plugins/test_session_inject_plugin.py",
-        "def test_concurrent_drains_deliver_each_request_exactly_once(",
+        "def test_concurrent_drains_dispatch_each_request_exactly_once(",
         "fork plugin: session-inject exactly-once regression",
     ),
     ("hermes_cli/update_git_target.py", "def configured_git_target", "presence-sensitive git deploy target"),

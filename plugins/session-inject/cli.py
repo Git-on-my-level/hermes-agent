@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 import uuid
@@ -10,7 +9,8 @@ from pathlib import Path
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())  # honors `hermes -p <profile>`
 
 
 def _db() -> sqlite3.Connection:
@@ -66,5 +66,6 @@ def handle(args) -> int:
     if not args.session or not args.message:
         raise SystemExit("usage: hermes inject <session_id|session_key> \"message\"")
     path = queue(resolve_key(args.session), args.message)
-    print(f"queued {path.name}; the gateway delivers it within ~5 s (see inject-spool/done)")
+    print(f"queued {path.name}; the gateway dispatches it within ~5 s. Status: inject-spool/sent/ "
+          "(dispatched), done/ (seen in the session), failed/ (refused or never seen)")
     return 0
