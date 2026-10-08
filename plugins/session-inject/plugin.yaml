@@ -1,0 +1,4 @@
+name: session-inject
+version: "1.0"
+description: "Queue a user turn into an existing gateway session from outside the gateway (`hermes inject`), e.g. to resume a session that stalled. Delivered by a gateway-side spool drain through ctx.inject_message."
+author: Git-on-my-level (fork)
