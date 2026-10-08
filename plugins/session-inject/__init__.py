@@ -133,7 +133,7 @@ def confirm_sent(spool: Path, db_path: Path, now: float | None = None) -> None:
         return
     for path in sorted(sent.glob("*.json")):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
             sent_at = float(record["sent_at"])
             if _observed(db_path, record["session_key"], record["content"], int(record.get("after_id", 0))):
                 record["confirmed_at"] = now
@@ -157,7 +157,7 @@ def drain_once(ctx, spool: Path | None = None, db_path: Path | None = None) -> N
         except OSError:
             continue
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
             key, content = record["session_key"], record["content"]
         except Exception as exc:
             logger.warning("session-inject: unreadable request %s: %s", path.name, exc)

@@ -31,7 +31,7 @@ def queue(session_key: str, content: str) -> Path:
     spool.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = spool / f"{int(time.time())}-{uuid.uuid4().hex[:8]}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"session_key": session_key, "content": content, "queued_at": time.time()}))
+    tmp.write_text(json.dumps({"session_key": session_key, "content": content, "queued_at": time.time()}), encoding="utf-8")
     tmp.rename(path)
     return path
 
