@@ -1403,6 +1403,9 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
+        # important: notify for pauses, silently show inferred/done, log progress only.
+        # all: post every status; off: post only important pauses.
+        "notices": "important",
         # Infer a goal from the agent's commitment after a real user turn (opt-in).
         "auto_infer": False,
         # Opt-in gateway behavior: start or replace the standing goal with each

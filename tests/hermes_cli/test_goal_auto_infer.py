@@ -14,6 +14,7 @@ from hermes_cli.goals import (
     GoalManager,
     GoalState,
     auto_infer_enabled,
+    draft_contract,
     infer_goal_from_turn,
     maybe_infer_goal,
 )
@@ -168,3 +169,40 @@ def test_turn_is_user_authored_filters_synthetic_events():
         SimpleNamespace(text="[Continuing toward your standing goal]\nGoal: x", internal=False)) is False
     assert M._turn_is_user_authored(
         SimpleNamespace(text="[Heartbeat — recurring instruction, fires every 30m]", internal=False)) is False
+
+
+@pytest.mark.parametrize("user_rules", ["", "Do not change code. Stop if credentials are required."])
+def test_inferred_contract_uses_exchange_and_only_user_rules(monkeypatch, user_rules):
+    import json
+
+    user = ("Once both hosts roll with K=0, verify live env on listen and pusher, then close the KB. " + user_rules).strip()
+    reply = "I will verify listen at K=0, pusher at K=0, live env on both, then close the KB."
+    checklist = "listen at K=0; pusher at K=0; live env verified on both; KB closed"
+    captured = []
+
+    def fake(call_llm, system, prompt, timeout):
+        captured.append((system, prompt))
+        if system == goals_mod.INFER_GOAL_SYSTEM_PROMPT:
+            return json.dumps({"goal": True, "objective": "Verify both hosts and close the KB"})
+        assert user in prompt and reply in prompt
+        assert system != goals_mod.DRAFT_CONTRACT_SYSTEM_PROMPT
+        assert "short checklist" in system
+        assert "ONLY what the USER explicitly stated" in system
+        assert "Never infer prohibitions" in system
+        return json.dumps({
+            "outcome": checklist, "verification": "Read K on each live host and check KB status",
+            "constraints": "Do not change code" if user_rules else "",
+            "boundaries": "", "stop_when": "credentials are required" if user_rules else "",
+        })
+
+    monkeypatch.setattr(goals_mod, "draft_contract", draft_contract)
+    monkeypatch.setattr(goals_mod, "_call_goal_judge_llm", fake)
+    manager = GoalManager("checklist")
+    notice = maybe_infer_goal(manager, user, reply)
+    contract = GoalManager("checklist").state.contract
+    assert checklist in notice
+    assert contract.outcome == checklist
+    assert contract.constraints == ("Do not change code" if user_rules else "")
+    assert contract.boundaries == ""
+    assert contract.stop_when == ("credentials are required" if user_rules else "")
+    assert len(captured) == 2

@@ -119,7 +119,7 @@ async def _drain_until(condition, timeout=5.0):
 
 @pytest.mark.asyncio
 async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
-    """When the judge says continue, both the 'continuing' status and the
+    """When the judge says continue, progress is quiet and the
     continuation-prompt event must be delivered. The continuation prompt is
     routed through the adapter's pending-messages FIFO so the goal loop
     proceeds on the next turn."""
@@ -136,11 +136,9 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
             source=src,
             final_response="here's a partial edit",
         )
-        await _drain_until(lambda: adapter.sends and adapter._pending_messages)
+        await _drain_until(lambda: adapter._pending_messages)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    assert adapter.sends == []
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
@@ -170,7 +168,68 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     content = adapter.sends[0]["content"]
     assert "paused" in content.lower()
     assert "turns used" in content.lower()
+    assert adapter.sends[0]["metadata"]["notify"] is True
     # No continuation enqueued when budget is exhausted
     assert not adapter._pending_messages
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["important", "all", "off"])
+@pytest.mark.parametrize("verdict", ["done", "blocked", "wait", "gap"])
+async def test_post_turn_goal_decision_carries_notice_level(hermes_home, mode, verdict):
+    """Real goal persistence and post-turn routing honor the judge decision's severity."""
+    from hermes_cli.goals import GoalManager
+
+    (hermes_home / "config.yaml").write_text(f'goals:\n  notices: "{mode}"\n', encoding="utf-8")
+    runner, adapter, entry, src = _make_runner_with_adapter()
+    manager = GoalManager(entry.session_id)
+    manager.set("Verify both hosts")
+    level = {"done": "info", "blocked": "important", "wait": "debug", "gap": "debug"}[verdict]
+    try:
+        with patch("hermes_cli.goals.judge_goal", return_value=(
+            verdict, "pusher needs verification", False, {"seconds": 60} if verdict == "wait" else None, False,
+        )):
+            await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="Done")
+        expected_send = level == "important" or mode == "all" or (level == "info" and mode == "important")
+        assert len(adapter.sends) == int(expected_send)
+        if expected_send:
+            assert adapter.sends[0]["metadata"].get("notify") is (True if level == "important" else None)
+        if verdict == "gap":
+            assert "ONE decision request" in next(iter(adapter._pending_messages.values())).text
+            assert GoalManager(entry.session_id).is_active()
+        else:
+            assert not adapter._pending_messages
+    finally:
+        runner._shutdown_executor(drain_timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["important", "all", "off"])
+async def test_inferred_goal_notice_is_info_and_shows_checklist(hermes_home, mode):
+    from gateway.platforms.event import MessageEvent, MessageType
+    from hermes_cli.goals import GoalContract, GoalManager
+
+    (hermes_home / "config.yaml").write_text(
+        f'goals:\n  auto_infer: true\n  notices: "{mode}"\n', encoding="utf-8",
+    )
+    runner, adapter, entry, src = _make_runner_with_adapter()
+    checklist = "listen at K=0; pusher at K=0; live env verified on both; KB closed"
+    event = MessageEvent(text="verify both and close KB", message_type=MessageType.TEXT, source=src)
+    try:
+        with (
+            patch("hermes_cli.goals.infer_goal_from_turn", return_value="Verify both and close KB"),
+            patch("hermes_cli.goals.draft_contract", return_value=GoalContract(outcome=checklist)),
+            patch("hermes_cli.goals.judge_goal", return_value=("wait", "rolls running", False, {"seconds": 60}, False)),
+        ):
+            await runner._post_turn_goal_continuation(
+                session_entry=entry, source=src, final_response="I will verify both and close KB", event=event,
+            )
+        assert GoalManager(entry.session_id).state.source == "auto"
+        inferred = [send for send in adapter.sends if "Goal inferred" in send["content"]]
+        assert len(inferred) == (0 if mode == "off" else 1)
+        if inferred:
+            assert checklist in inferred[0]["content"]
+            assert "notify" not in inferred[0]["metadata"]
+        assert len(adapter.sends) == {"important": 1, "all": 2, "off": 0}[mode]
+    finally:
+        runner._shutdown_executor(drain_timeout=2)
