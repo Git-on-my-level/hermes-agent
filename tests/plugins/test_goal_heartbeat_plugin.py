@@ -126,6 +126,8 @@ def test_render_escalates_on_the_last_check():
     normal, last = mod.render(1, 3, 3000, goal), mod.render(3, 3, 3000, goal)
     assert normal.startswith(mod.MARKER) and "pid 7" in normal and "exactly [SILENT]" in normal
     assert "Do not reply [SILENT]" in last and "Send the user" in last
+    unparked = mod.render(1, 3, 3000, {"goal": "merge PR"})
+    assert "[SILENT]" not in unparked and "next concrete step" in unparked
 
 
 def test_settings_defaults_and_clamps(monkeypatch):

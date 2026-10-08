@@ -10,7 +10,7 @@ the wrong thing", so this plugin wakes the model instead.
 
 Every `interval_minutes` without any message in such a session, it injects a check-in turn:
 verify the wait is still progressing and still the right wait; act if not; otherwise ensure a
-waker is armed and reply exactly `[SILENT]`. A silent internal turn leaves the goal untouched
+waker is armed and reply exactly `[SILENT]`. While the wait barrier holds, a silent internal turn leaves the goal untouched
 (`GatewayRunner._silent_internal_turn`: no judge call, no turn spent, no status line, no
 continuation). Heartbeats since the last real event (a user message or process notice; not a
 heartbeat or goal continuation) are counted from the session history; check number `escalate_after` asks the agent to message the user with what is
