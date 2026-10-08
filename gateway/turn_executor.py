@@ -96,7 +96,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
     def _start_registered(self, thread: threading.Thread, fut) -> None:
         try:
             # Outside the executor lock: a slow start must not stall another submit, including one
-            # issued on the event loop. The thread is already in ``_threads``.
+            # issued on the event loop. The worker adds itself to ``_threads`` once it is running.
             thread.start()
         except BaseException as exc:  # noqa: BLE001 - thread-limit and shutdown races are results
             with self._cv:
@@ -117,8 +117,8 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
                     fut.cancel()
             self._cv.notify_all()
             if not wait:
-                # Do not wait for a Thread.start that has not returned. The worker is already
-                # in ``_threads`` when start is in progress, so _stop_pool can join that snapshot.
+                # Do not wait for a Thread.start that has not returned. A start that never
+                # enters the worker is absent from ``_threads``; joining it would raise.
                 return
             while self._queue or self._inflight:
                 self._cv.wait()
