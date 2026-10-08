@@ -7,9 +7,10 @@ lazily, on the next turn, which never comes. This plugin is that turn. Every
 ``interval_minutes`` of session inactivity it injects a check-in, so the agent (not a
 liveness probe) re-judges whether the wait is still healthy and still the right wait.
 
-A healthy check-in ends with exactly ``[SILENT]``; the gateway then leaves the goal untouched
-(no judge call, no turn spent, no status line). Anything else goes through the goal judge as
-a normal turn.
+For a parked goal, a healthy check-in ends with exactly ``[SILENT]``; while the wait barrier
+still holds the gateway then leaves the goal untouched (no judge call, no turn spent, no status
+line). An active goal that is not parked gets no silent option: nothing is driving it, so the
+check-in asks for the next concrete step (a normal judged turn).
 
 Escalation: heartbeats since the last real event (a user message, a process notice; not a
 heartbeat or a goal continuation) are counted from the session's own history. Number
@@ -170,20 +171,30 @@ def candidates(db_path: Path, interval_s: float, escalate_after: int, now: float
         con.close()
 
 
+def _parked(goal: dict) -> bool:
+    return bool(goal.get("waiting_on_session") or goal.get("waiting_on_pid") or float(goal.get("waiting_until") or 0))
+
+
 def render(k: int, n: int, idle_s: float, goal: dict) -> str:
     head = f"{MARKER}{k}/{n} — no session activity for {int(idle_s // 60)}m; goal waiting on {_target(goal)}]"
-    if k < n:
-        return (f"{head}\nGoal: {goal.get('goal', '')}\n"
-                "Check that what you are waiting on is still progressing and is still the right thing to "
-                "wait on: the process is alive and its output is moving, the CI run/deploy/agent is actually "
-                "running, nothing is parked on an approval, and the condition can still happen. "
-                "If something finished, broke, or changed, act on it now. If it is healthy, make sure something "
-                "will wake you (a background process with notify that exits when the condition changes), then "
-                "reply with exactly [SILENT] and nothing else.")
-    return (f"{head}\nGoal: {goal.get('goal', '')}\n"
-            f"This is check {k} with no progress since the last real event. Do not reply [SILENT]. Send the user "
-            "one short message: what the goal is waiting on, why it has not moved, and the one thing you need "
-            "from them (or your default if they do nothing). Heartbeats stop until something new happens here.")
+    body = f"{head}\nGoal: {goal.get('goal', '')}\n"
+    if k >= n:
+        return (body + f"This is check {k} with no progress since the last real event. Do not reply [SILENT]. Send "
+                "the user one short message: what the goal is waiting on, why it has not moved, and the one thing "
+                "you need from them (or your default if they do nothing). Heartbeats stop until something new "
+                "happens here.")
+    if not _parked(goal):
+        # Not parked: a silent reply would be judged as not-waiting and continue the loop, so there is
+        # no [SILENT] option here. The goal is active and nothing is driving it.
+        return (body + "The goal is active but nothing is set to resume it. Take the next concrete step now. If "
+                "you are genuinely waiting on something, start a waker for it (a background process with notify "
+                "that exits when the condition changes) and say in one line what you are waiting on.")
+    return (body + "Check that what you are waiting on is still progressing and is still the right thing to "
+            "wait on: the process is alive and its output is moving, the CI run/deploy/agent is actually "
+            "running, nothing is parked on an approval, and the condition can still happen. "
+            "If something finished, broke, or changed, act on it now. If it is healthy, make sure something "
+            "will wake you (a background process with notify that exits when the condition changes), then "
+            "reply with exactly [SILENT] and nothing else.")
 
 
 def _tick(ctx, home: Path) -> None:
