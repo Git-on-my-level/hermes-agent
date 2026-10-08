@@ -54,10 +54,8 @@ def test_dead_pid_claiming_running_is_stale(tmp_path: Path):
     assert document["phase"] == "stale"
     assert document["healthy"] is False
     assert "secret-token-value" not in json.dumps(document)
-    receipt = document["proposed_receipt"]
-    assert receipt["schema"] == "app-health.v1"
-    assert receipt["app"] == "hermes"
-    assert receipt["phase"] == "stale"
+    assert document["application_readiness"] is None
+    assert not (tmp_path / "state" / "application-readiness.json").exists()
 
 
 def test_live_verified_gateway_with_a_fresh_heartbeat_is_ready(tmp_path: Path):

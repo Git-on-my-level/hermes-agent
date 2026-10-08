@@ -205,6 +205,37 @@ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_WATCHDOG_DUMP_RELATIVE)
 
 
+def write_loop_liveness(
+    *, pid: Optional[int] = None, start_time: Optional[float] = None,
+    home: Optional[Path] = None, extra: Optional[Dict[str, Any]] = None,
+    event_loop_at: Optional[datetime] = None,
+) -> Path:
+    """Heartbeat plus the hostctl receipt. ``event_loop_at`` was taken on the loop."""
+    path = write_loop_heartbeat(pid=pid, start_time=start_time, home=home, extra=extra)
+    from gateway.application_readiness import (
+        project_serving_phase, publish_application_readiness, receipt_path,
+    )
+
+    process = int(pid if pid is not None else os.getpid())
+    base = receipt_path(home).parent.parent
+    publish_application_readiness(
+        phase=project_serving_phase(base, process),
+        event_loop_at=event_loop_at,
+        home=home,
+        pid=process,
+    )
+    return path
+
+
+def publish_loop_stopped(*, home: Optional[Path] = None) -> None:
+    """A fresh stopped receipt. No event-loop signal: the loop is no longer the witness."""
+    from gateway.application_readiness import publish_application_readiness
+
+    publish_application_readiness(
+        phase="stopped", exit_reason="gateway loop stopped", home=home,
+    )
+
+
 def write_loop_heartbeat(
     *, pid: Optional[int] = None, start_time: Optional[float] = None,
     home: Optional[Path] = None, extra: Optional[Dict[str, Any]] = None) -> Path:
@@ -382,10 +413,15 @@ async def loop_heartbeat_forever(
     extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
     try:
         while True:  # first write is immediate so monitors see a fresh file at once
+            # Captured here, on the loop. The thread that writes the receipt must not
+            # substitute its own clock for the event_loop signal.
+            loop_at = datetime.now(timezone.utc)
             try:
-                await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
-                                        extra=extra)
-            except Exception:  # write_loop_heartbeat never raises: executor problem, keep the task
+                await asyncio.to_thread(
+                    write_loop_liveness, start_time=start_time, home=home,
+                    extra=extra, event_loop_at=loop_at,
+                )
+            except Exception:  # writers never raise: executor problem, keep the task
                 logger.debug("Loop heartbeat write failed off-loop", exc_info=True)
             if should_continue is not None and not should_continue():
                 return
@@ -393,6 +429,7 @@ async def loop_heartbeat_forever(
             if should_continue is not None and not should_continue():
                 return
     finally:
+        publish_loop_stopped(home=home)
         if tick_server is not None:
             tick_server.close()
             with contextlib.suppress(Exception):

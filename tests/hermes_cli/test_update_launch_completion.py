@@ -547,3 +547,12 @@ def test_supervised_gateway_sync_deadline_does_not_claim_success(
     assert record["blocking"] is False
     assert record["reason"] == "deadline exceeded"
     assert "hermes update" in record["recovery"]
+    from gateway.application_readiness import receipt_path
+    receipt = json.loads(receipt_path().read_text(encoding="utf-8"))
+    assert receipt["schema_version"] == "1"
+    assert receipt["application_id"] == "hermes-gateway"
+    assert receipt["phase"] == "maintenance"
+    assert "signals" not in receipt
+    assert receipt["pid"] > 1
+    assert str(receipt["pid_started_at"]).endswith("Z")
+    assert str(receipt["updated_at"]).endswith("Z")

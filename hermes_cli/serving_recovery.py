@@ -92,6 +92,21 @@ def clear_maintenance(home: Path | None = None) -> None:
         return
 
 
+def _publish_recovery_receipt(*, blocking: bool, summary: str, phase: str = "maintenance") -> None:
+    """Project this recovery phase into the hostctl receipt. No event-loop signal."""
+    from gateway.application_readiness import publish_application_readiness
+
+    deadline = None
+    if blocking:
+        deadline = (
+            datetime.now(timezone.utc) + timedelta(seconds=SERVING_DEPENDENCY_SYNC_DEADLINE_S)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    publish_application_readiness(
+        phase=phase,
+        progress={"summary": summary, "deadline_at": deadline} if deadline else {"summary": summary},
+    )
+
+
 def recover_serving_dependencies(root: Path) -> None:
     """Sync dependencies under a deadline, then return so the gateway can serve.
 
@@ -112,6 +127,7 @@ def recover_serving_dependencies(root: Path) -> None:
         deadline_s=SERVING_DEPENDENCY_SYNC_DEADLINE_S,
         waiting_on="package worker",
     )
+    _publish_recovery_receipt(blocking=True, summary="dependency sync")
     try:
         run_bounded_dependency_sync(
             root,
@@ -126,6 +142,7 @@ def recover_serving_dependencies(root: Path) -> None:
             waiting_on="package worker",
             reason="deadline exceeded",
         )
+        _publish_recovery_receipt(blocking=False, summary="dependency sync deadline exceeded")
         raise RuntimeError(
             "dependency sync exceeded its "
             f"{SERVING_DEPENDENCY_SYNC_DEADLINE_S:g}s deadline; "
@@ -138,12 +155,14 @@ def recover_serving_dependencies(root: Path) -> None:
             waiting_on="package worker",
             reason="sync failed",
         )
+        _publish_recovery_receipt(blocking=False, summary="dependency sync failed")
         raise
     if completed:
         # The stamp already names this tree. A stale venv was re-provisioned;
         # there is no product tail to owe.
         clear_completion(root)
     clear_maintenance()
+    _publish_recovery_receipt(blocking=False, summary="dependencies synced; gateway loop not up", phase="starting")
 
 
 def run_bounded_dependency_sync(root: Path, *, arm: bool, deadline: float) -> None:

@@ -5,8 +5,9 @@ Stdlib plus ``hermes_constants`` only. The command is dispatched from
 It reports the files the running gateway already writes (PID, ``gateway_state.json``,
 loop heartbeat, loop-tick socket) and does not create a second status store.
 
-Hostctl has not published the generic app-health receipt. ``proposed_receipt`` is the
-producer shape this probe would write once that contract exists; nothing is written here.
+The gateway process publishes ``state/application-readiness.json`` for hostctl.
+This probe only reads that file. It does not write a receipt, import plugins, or
+read credentials.
 """
 
 from __future__ import annotations
@@ -163,47 +164,8 @@ def collect_service_health(
             "pid": _coerce_pid(maintenance.get("pid")),
         },
     }
-    document["proposed_receipt"] = proposed_app_health_receipt(document)
+    document["application_readiness"] = _read_json(home / "state" / "application-readiness.json")
     return document
-
-
-def proposed_app_health_receipt(document: dict[str, Any]) -> dict[str, Any]:
-    """Generic receipt shape for a future hostctl contract. Not written to disk.
-
-    Version ``app-health.v1``. Hermes is the producer; hostctl would consume the
-    file only after it publishes the matching schema. Fields are the same facts as
-    the Hermes probe, with no credentials, log bodies, or command strings.
-    """
-    identity = document.get("identity") if isinstance(document.get("identity"), dict) else {}
-    freshness = document.get("freshness") if isinstance(document.get("freshness"), dict) else {}
-    revisions = document.get("revisions") if isinstance(document.get("revisions"), dict) else {}
-    update = document.get("update") if isinstance(document.get("update"), dict) else {}
-    return {
-        "schema": "app-health.v1",
-        "app": "hermes",
-        "phase": document.get("phase"),
-        "observed_at": document.get("observed_at"),
-        "identity": {
-            "pid": identity.get("pid"),
-            "start_time": identity.get("start_time"),
-            "verified": identity.get("verified"),
-        },
-        "supervisor": {"parent_pid": identity.get("parent_pid")},
-        "freshness": {
-            "heartbeat_age_s": freshness.get("heartbeat_age_s"),
-            "loop_tick": freshness.get("loop_tick"),
-        },
-        "revisions": {
-            "running": revisions.get("running"),
-            "installed": revisions.get("installed"),
-        },
-        "update": {
-            "phase": update.get("phase"),
-            "owed": update.get("owed"),
-            "owner_pid": update.get("owner_pid"),
-            "recovery": update.get("recovery"),
-        },
-    }
 
 
 def _phase(
