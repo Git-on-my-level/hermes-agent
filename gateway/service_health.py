@@ -224,7 +224,9 @@ def collect_service_health(
     current_start = _start_fingerprint(pid) if alive and pid else None
     identity = "unavailable" if liveness == "unavailable" else _identity(recorded_start, current_start, alive)
     parent_pid = _parent_pid(pid) if alive and pid else None
-    heartbeat_age = _age_seconds(heartbeat.get("updated_at"), observed)
+    heartbeat_age, heartbeat_state, heartbeat_owner = _heartbeat_schedule(
+        heartbeat, heartbeat_evidence, pid, identity, observed,
+    )
     state_age = _age_seconds(state.get("updated_at"), observed)
     loop_tick = _probe_loop_tick(home, pid) if alive and pid else "unavailable"
     platforms = _platforms(state.get("platforms"), observed)
@@ -259,8 +261,9 @@ def collect_service_health(
         },
         "freshness": {
             "heartbeat_age_s": heartbeat_age,
-            "heartbeat_fresh": _is_fresh(heartbeat_age),
-            "heartbeat_state": _clock_state(heartbeat_age, heartbeat_evidence),
+            "heartbeat_fresh": heartbeat_state == "fresh",
+            "heartbeat_state": heartbeat_state,
+            "heartbeat_owner": heartbeat_owner,
             "state_age_s": state_age,
             "state_clock": _clock_state(state_age, state_evidence),
             "loop_tick": loop_tick,
@@ -293,6 +296,36 @@ def collect_service_health(
         document["phase"] = "degraded"
         document["healthy"] = False
     return document
+
+
+def _heartbeat_schedule(
+    heartbeat: dict[str, Any],
+    evidence: str,
+    gateway_pid: int | None,
+    identity: str,
+    observed: datetime,
+) -> tuple[float | None, str, str]:
+    """Age of the loop-captured stamp only when this file names the verified gateway.
+
+    ``updated_at`` is the writer thread's clock. A wrong, missing, or non-finite
+    heartbeat PID, or a legacy record with no ``event_loop_at``, does not prove
+    this gateway is being scheduled.
+    """
+    if evidence == "missing":
+        return None, "unavailable", "missing"
+    if evidence in {"malformed", "unavailable", "oversized"}:
+        return None, "indeterminate", "unread"
+    raw_pid = heartbeat.get("pid")
+    heartbeat_pid = _coerce_pid(raw_pid)
+    if heartbeat_pid is None:
+        return None, "indeterminate", "missing" if raw_pid is None else "non_finite"
+    if gateway_pid is None or identity != "match" or heartbeat_pid != gateway_pid:
+        return None, "mismatch", "mismatch"
+    stamp = heartbeat.get("event_loop_at")
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None, "indeterminate", "match"
+    age = _age_seconds(stamp, observed)
+    return age, _clock_state(age, "ok"), "match"
 
 
 def _phase(

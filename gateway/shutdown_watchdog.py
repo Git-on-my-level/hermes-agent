@@ -211,7 +211,10 @@ def write_loop_liveness(
     event_loop_at: Optional[datetime] = None,
 ) -> Path:
     """Heartbeat plus the hostctl receipt. ``event_loop_at`` was taken on the loop."""
-    path = write_loop_heartbeat(pid=pid, start_time=start_time, home=home, extra=extra)
+    path = write_loop_heartbeat(
+        pid=pid, start_time=start_time, home=home, extra=extra,
+        event_loop_at=event_loop_at,
+    )
     from gateway.application_readiness import (
         project_serving_phase, publish_application_readiness, receipt_path,
     )
@@ -238,9 +241,15 @@ def publish_loop_stopped(*, home: Optional[Path] = None) -> None:
 
 def write_loop_heartbeat(
     *, pid: Optional[int] = None, start_time: Optional[float] = None,
-    home: Optional[Path] = None, extra: Optional[Dict[str, Any]] = None) -> Path:
+    home: Optional[Path] = None, extra: Optional[Dict[str, Any]] = None,
+    event_loop_at: Optional[datetime] = None) -> Path:
     """Atomically rewrite the loop-liveness heartbeat file; never raises.
-    ``start_time`` (process start, epoch seconds) lets supervisors detect PID reuse."""
+
+    ``updated_at`` is this writer's wall clock and is not scheduling evidence.
+    ``event_loop_at`` is the timestamp captured on the event loop before the
+    write was handed off. ``start_time`` (process start, epoch seconds) lets
+    supervisors detect PID reuse.
+    """
     path = get_loop_heartbeat_path(home)
     payload: Dict[str, Any] = {"pid": int(pid if pid is not None else os.getpid()),
                                "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -253,6 +262,10 @@ def write_loop_heartbeat(
             payload["mem"] = mem
     if extra:
         payload.update(extra)
+    if event_loop_at is not None:
+        from gateway.application_readiness import rfc3339_utc
+
+        payload["event_loop_at"] = rfc3339_utc(event_loop_at)
     try:
         atomic_json_write(path, payload, indent=None)
     except Exception:
@@ -373,6 +386,27 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
 
 
+async def _await_off_loop(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run blocking work off the loop, even when this task is already cancelled.
+
+    An async callable (socket close) stays on the loop; a plain function is
+    handed to a worker thread. Pending cancellation is restored afterward.
+    """
+    task = asyncio.current_task()
+    absorbed = 0
+    if task is not None:
+        while task.uncancel():
+            absorbed += 1
+    try:
+        if asyncio.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
+    finally:
+        if task is not None:
+            for _ in range(absorbed):
+                task.cancel()
+
+
 async def loop_heartbeat_forever(
     *, interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S, start_time: Optional[float] = None,
     home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None) -> None:
@@ -429,11 +463,17 @@ async def loop_heartbeat_forever(
             if should_continue is not None and not should_continue():
                 return
     finally:
-        publish_loop_stopped(home=home)
+        # Process-start and state reads stay on the writer thread. A pending
+        # cancellation is absorbed so this cleanup can finish, then restored so
+        # the task still ends cancelled.
+        try:
+            await _await_off_loop(publish_loop_stopped, home=home)
+        except Exception:
+            logger.debug("Stopped-loop receipt failed off-loop", exc_info=True)
         if tick_server is not None:
             tick_server.close()
             with contextlib.suppress(Exception):
-                await tick_server.wait_closed()
+                await _await_off_loop(tick_server.wait_closed)
             if tick_socket_path is not None:
                 with contextlib.suppress(Exception):
                     tick_socket_path.unlink(missing_ok=True)
