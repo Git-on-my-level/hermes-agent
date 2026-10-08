@@ -21,8 +21,9 @@ from hermes_cli import goals
 from tests.e2e.conftest import make_adapter, make_runner, make_session_entry, make_source
 
 
-def _judge_continue(*_a, **_kw):
-    return "continue", "keep going", False, None, False
+def _judge_done(*_a, **_kw):
+    # "done" so the post-exit evaluation ends the loop: exactly one judge call is expected.
+    return "done", "verified", False, None, False
 
 
 async def _settle(mock, calls: int, timeout: float = 5.0) -> None:
@@ -40,7 +41,7 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
     entry = make_session_entry(Platform.TELEGRAM, source)
     runner = make_runner(Platform.TELEGRAM, entry)
     runner._run_post_turn_hooks = GatewayRunner._run_post_turn_hooks.__get__(runner)  # the code under test
-    runner._handle_message_with_agent = AsyncMock(return_value={"final_response": "[SILENT]"})
+    runner._handle_message_with_agent = AsyncMock(return_value="[SILENT]")
     adapter = make_adapter(Platform.TELEGRAM, runner)
 
     mgr = goals.GoalManager(session_id=entry.session_id)
@@ -50,7 +51,7 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
         mgr.wait_on(child.pid, reason="CI watcher")
         mgr._state.waiting_since = time.time() - 3600  # a real heartbeat lands after the 30-min barrier cap
         mgr._save()
-        judge = patch("hermes_cli.goals.judge_goal", side_effect=_judge_continue)
+        judge = patch("hermes_cli.goals.judge_goal", side_effect=_judge_done)
         with judge as judge_mock:
             heartbeat = MessageEvent(
                 text="[Goal heartbeat 1/3 — no session activity for 50m; goal waiting on pid]",
@@ -74,7 +75,8 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
             ))
             await _settle(runner._handle_message_with_agent, 2)
             assert judge_mock.call_count == 1, "a silent turn after the process exited was not judged"
-            assert goals.load_goal(entry.session_id).waiting_on_pid is None
+            after = goals.load_goal(entry.session_id)
+            assert after.waiting_on_pid is None and after.status == "done"
     finally:
         if child.poll() is None:
             child.kill()
