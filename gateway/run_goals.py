@@ -415,7 +415,7 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        if final_text.strip() and not self._silent_internal_turn(is_internal, final_text):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
@@ -425,6 +425,17 @@ class GatewayGoalsMixin:
                     await hook(session_entry=session_entry, source=source, final_response=final_text)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
+
+    @staticmethod
+    def _silent_internal_turn(is_internal: bool, final_text: str) -> bool:
+        """An internal turn (process notice, plugin injection) whose reply is exactly the silence
+        marker reported "nothing changed": it must not drive /goal. Judging it reads the bare
+        marker as not-waiting, so the judge clears a valid wait barrier, spends a turn, posts a
+        status line, and enqueues a continuation for a turn that deliberately said nothing."""
+        if not is_internal:
+            return False
+        from gateway.response_filters import is_intentional_silence_response
+        return is_intentional_silence_response(final_text)
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:

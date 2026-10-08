@@ -103,12 +103,13 @@ Open upstream goal ports (both automatic modes remain off by default):
 | NousResearch/hermes-agent#129380 | Continuations take a concrete action before replying | `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_gates.py` |
 | NousResearch/hermes-agent#117222 | Feed host-observed tool activity to the goal judge | `tests/hermes_cli/test_goals.py` |
 
-Fork-original plugins (new files only; opt-in per host through `plugins.enabled` and
+Fork-original self-drive additions (plugins are new files, opt-in per host through `plugins.enabled` and
 `plugins.entries.<id>.allow_gateway_injection: true`; upstream has no equivalent):
 
-| Plugin | Carried behavior | Contract tests |
+| Addition | Carried behavior | Contract tests |
 | --- | --- | --- |
 | `plugins/goal-heartbeat/` | Every `interval_minutes` (default 50) of silence in a gateway session with an active goal, inject a check-in turn so the agent re-judges a parked wait; check `escalate_after` (default 3) asks it to tell the user what is stuck. Closes the gap where a parked goal resumes only on a waiter's exit notice. | `tests/plugins/test_goal_heartbeat_plugin.py` |
+| `gateway/run_goals.py` `_silent_internal_turn` (one guard in `_run_post_turn_hooks`) | An internal turn (process notice, plugin injection) answered with exactly the silence marker leaves `/goal` untouched. Without it the judge reads `[SILENT]` as not-waiting: clears a valid barrier, spends a turn, posts a status line, enqueues a continuation. Required by goal-heartbeat and by no-change waker wakes. | `tests/gateway/test_goal_silent_internal_turn.py` |
 | `plugins/session-inject/` | `hermes inject <session> "msg"` queues a user turn that the gateway delivers through `ctx.inject_message` (resume a stalled session from a shell, cron, or another agent). | `tests/plugins/test_session_inject_plugin.py` |
 
 ## Branch retention

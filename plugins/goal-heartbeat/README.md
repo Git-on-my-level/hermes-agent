@@ -10,9 +10,10 @@ the wrong thing", so this plugin wakes the model instead.
 
 Every `interval_minutes` without any message in such a session, it injects a check-in turn:
 verify the wait is still progressing and still the right wait; act if not; otherwise ensure a
-waker is armed and reply `[SILENT]` (suppressed on internal turns). Heartbeats since the last
-real event (a user message, a process notice, any non-heartbeat turn) are counted from the
-session history; check number `escalate_after` asks the agent to message the user with what is
+waker is armed and reply exactly `[SILENT]`. A silent internal turn leaves the goal untouched
+(`GatewayRunner._silent_internal_turn`: no judge call, no turn spent, no status line, no
+continuation). Heartbeats since the last real event (a user message or process notice; not a
+heartbeat or goal continuation) are counted from the session history; check number `escalate_after` asks the agent to message the user with what is
 stuck, and heartbeats stop until something new happens.
 
 ```yaml
@@ -21,7 +22,7 @@ plugins:
   entries:
     goal-heartbeat:
       allow_gateway_injection: true   # required
-      interval_minutes: 50            # default 50, min 5
+      interval_minutes: 50            # default 50, min 15
       escalate_after: 3               # default 3
       enabled: true                   # false pauses new heartbeats (re-read every minute)
 prompt_caching:
@@ -30,4 +31,6 @@ prompt_caching:
 
 Dry run against a home's live database: `python3 plugins/goal-heartbeat/__init__.py --dry-run [--interval M] [--escalate N]`.
 
-Scope: sessions in the gateway's own `$HERMES_HOME/state.db`, keyed `agent:*`.
+Scope: each profile load watches its own `state.db` (sessions keyed `agent:*`). A dispatch that never
+shows up in the session is retried after 10 minutes. Removing the plugin from `plugins.enabled`
+stops its thread on the next tick.

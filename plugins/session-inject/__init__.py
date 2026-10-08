@@ -4,8 +4,13 @@
 ``$HERMES_HOME/state/inject-spool/`` (``{"session_key": ..., "content": ...}``). Inside the gateway
 process only, a daemon thread drains that directory through the supported plugin API
 (``ctx.inject_message``), which routes the turn through the session's live adapter like a user
-message. Accepted requests move to ``done/``; requests the gateway keeps refusing (unknown session,
-gateway draining) move to ``failed/`` after ~10 min.
+message.
+
+``inject_message`` returning True means the gateway scheduled the dispatch, not that the session
+took it (an unknown route or failed authorization is only logged). So a dispatched request moves
+to ``sent/`` and is confirmed against the session's own history: ``done/`` once the message is
+persisted as a user turn, ``failed/`` if it never shows up within ``CONFIRM_SECONDS``. Requests the
+gateway refuses outright are retried every poll and move to ``failed/`` after ~10 min.
 
 Requires ``plugins.enabled`` to list this plugin and
 ``plugins.entries.session-inject.allow_gateway_injection: true``.
@@ -15,7 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import sqlite3
 import sys
 import threading
 import time
@@ -23,17 +28,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+PLUGIN_ID = "session-inject"
 POLL_SECONDS = 5.0
 MAX_ATTEMPTS = 120  # ~10 minutes of refusals before giving up on a request
+CONFIRM_SECONDS = 1800.0  # a dispatched turn can wait behind a long running turn
+STALE_INFLIGHT_SECONDS = 60.0
 # A plugin reload re-executes this module without stopping the old thread. The current owner token
 # lives on ``sys`` (survives the re-import); a thread whose token is no longer current exits.
 _TOKENS = sys.__dict__.setdefault("_hermes_plugin_thread_tokens", {})
-_TOKEN_KEY = "session-inject"
 
 
-def spool_dir() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "state" / "inject-spool"
+def spool_dir(home: Path | None = None) -> Path:
+    if home is None:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    return Path(home) / "state" / "inject-spool"
 
 
 def _in_gateway_process() -> bool:
@@ -44,11 +53,73 @@ def _in_gateway_process() -> bool:
         return False
 
 
-def _move(path: Path, sub: str, record: dict) -> None:
-    dest = path.parent / sub
+def _plugin_still_enabled() -> bool:
+    """A disable + reload unloads the plugin without re-running register(): stop on our own."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        enabled = ((load_config_readonly() or {}).get("plugins") or {}).get("enabled") or []
+        return PLUGIN_ID in enabled
+    except Exception:
+        return True
+
+
+def _move(path: Path, spool: Path, sub: str, record: dict) -> None:
+    dest = spool / sub
     dest.mkdir(mode=0o700, exist_ok=True)
     (dest / path.with_suffix(".json").name).write_text(json.dumps(record, indent=1), encoding="utf-8")
     path.unlink(missing_ok=True)
+
+
+def recover_stale_inflight(spool: Path, now: float | None = None) -> int:
+    """Return claims left by a process that died mid-dispatch to the queue."""
+    now = time.time() if now is None else now
+    n = 0
+    for path in spool.glob("*.inflight"):
+        try:
+            if now - path.stat().st_mtime >= STALE_INFLIGHT_SECONDS:
+                path.rename(path.with_suffix(".json"))
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
+def _observed(db_path: Path, session_key: str, content: str, since: float) -> bool:
+    """True once the injected text is persisted as a user turn in that session (any session id
+    the key has had, so compression rotation is covered)."""
+    snippet = content.strip()[:200]
+    if not snippet or not db_path.exists():
+        return False
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute(
+            "select 1 from messages m join sessions s on s.id = m.session_id "
+            "where s.session_key = ? and m.role = 'user' and m.timestamp >= ? "
+            "and instr(m.content, ?) > 0 limit 1", (session_key, since - 5, snippet)).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+
+def confirm_sent(spool: Path, db_path: Path, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    sent = spool / "sent"
+    if not sent.is_dir():
+        return
+    for path in sorted(sent.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            sent_at = float(record["sent_at"])
+            if _observed(db_path, record["session_key"], record["content"], sent_at):
+                record["confirmed_at"] = now
+                _move(path, spool, "done", record)
+                logger.info("session-inject: confirmed %s -> %s", path.name, record["session_key"])
+            elif now - sent_at > CONFIRM_SECONDS:
+                record["error"] = f"dispatched but never observed in the session within {int(CONFIRM_SECONDS)}s"
+                _move(path, spool, "failed", record)
+                logger.warning("session-inject: %s never reached %s", path.name, record["session_key"])
+        except Exception:
+            logger.warning("session-inject: confirm failed for %s", path.name, exc_info=True)
 
 
 def drain_once(ctx, spool: Path | None = None) -> None:
@@ -64,7 +135,7 @@ def drain_once(ctx, spool: Path | None = None) -> None:
             key, content = record["session_key"], record["content"]
         except Exception as exc:
             logger.warning("session-inject: unreadable request %s: %s", path.name, exc)
-            _move(path, "failed", {"file": path.name, "error": str(exc)})
+            _move(path, spool, "failed", {"file": path.name, "error": str(exc)})
             continue
         ok = False
         try:
@@ -73,31 +144,42 @@ def drain_once(ctx, spool: Path | None = None) -> None:
             logger.warning("session-inject: inject failed for %s", key, exc_info=True)
         record["attempts"] = int(record.get("attempts", 0)) + 1
         if ok:
-            record["delivered_at"] = time.time()
-            logger.info("session-inject: delivered %s -> %s", queued.name, key)
-            _move(path, "done", record)
+            record["sent_at"] = time.time()
+            logger.info("session-inject: dispatched %s -> %s", queued.name, key)
+            _move(path, spool, "sent", record)
         elif record["attempts"] >= MAX_ATTEMPTS:
             logger.warning("session-inject: giving up on %s -> %s", queued.name, key)
-            _move(path, "failed", record)
+            _move(path, spool, "failed", record)
         else:
             path.write_text(json.dumps(record), encoding="utf-8")
             path.rename(queued)  # release for the next poll
 
 
-def _loop(ctx, token) -> None:
-    while _TOKENS.get(_TOKEN_KEY) is token:
+def _loop(ctx, token_key: str, token, home: Path) -> None:
+    from hermes_constants import set_hermes_home_override
+    set_hermes_home_override(home)  # this thread's config reads and injection checks use its profile
+    spool = spool_dir(home)
+    while _TOKENS.get(token_key) is token:
         try:
-            if _in_gateway_process() and spool_dir().is_dir():
-                drain_once(ctx)
+            if not _plugin_still_enabled():
+                logger.info("session-inject: disabled for %s; thread exiting", home)
+                return
+            if _in_gateway_process() and spool.is_dir():
+                recover_stale_inflight(spool)
+                drain_once(ctx, spool)
+                confirm_sent(spool, home / "state.db")
         except Exception:
             logger.warning("session-inject: drain loop error", exc_info=True)
         time.sleep(POLL_SECONDS)
 
 
 def register(ctx):
+    from hermes_constants import get_hermes_home
+
     from .cli import handle, setup
     ctx.register_cli_command("inject", "Queue a user turn into an existing gateway session",
                              setup, handle, description=(__doc__ or "").split("\n\n")[0])
-    token = object()
-    _TOKENS[_TOKEN_KEY] = token  # retires any thread from a previous load
-    threading.Thread(target=_loop, args=(ctx, token), name="session-inject", daemon=True).start()
+    home = get_hermes_home()  # the profile this load is scoped to (multiplexed gateways load once per profile)
+    token_key, token = f"{PLUGIN_ID}:{home}", object()
+    _TOKENS[token_key] = token  # retires any thread from a previous load of this profile
+    threading.Thread(target=_loop, args=(ctx, token_key, token, home), name=PLUGIN_ID, daemon=True).start()

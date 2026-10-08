@@ -50,8 +50,8 @@ def _msg(con, sid, role, content, ts):
     con.commit()
 
 
-def _due(mod, path, interval_min=50, n=3):
-    return {sid: (k, goal) for sid, _key, k, _idle, goal in mod.candidates(path, interval_min * 60, n, NOW)}
+def _due(mod, path, interval_min=50, n=3, now=NOW):
+    return {sid: (k, goal) for sid, _key, k, _idle, goal in mod.candidates(path, interval_min * 60, n, now)}
 
 
 def test_only_idle_active_gateway_goals_are_due(db):
@@ -76,21 +76,32 @@ def test_count_escalates_then_stops_until_a_real_event(db):
     path, con = db
     mod = _load()
     _goal(con, "s", waiting_on_session="proc_1")
-    _msg(con, "s", "user", "ship it", NOW - 9 * 3600)
+    _msg(con, "s", "user", "[David] ship it", NOW - 9 * 3600)
     for k in (1, 2, 3):
         assert _due(mod, path)["s"][0] == k
-        _msg(con, "s", "user", mod.render(k, 3, 3600, {"goal": "g"}), NOW - 8 * 3600 + k)
+        _msg(con, "s", "user", "[David] " + mod.render(k, 3, 3600, {"goal": "g"}), NOW - 8 * 3600 + k)
         _msg(con, "s", "assistant", "[SILENT]", NOW - 8 * 3600 + k)
     assert "s" not in _due(mod, path)  # escalated: wait for something real
-    _msg(con, "s", "user", "[IMPORTANT: Background process proc_1 completed]", NOW - 7200)
+    _msg(con, "s", "user", "[David] [IMPORTANT: Background process proc_1 completed]", NOW - 7200)
     assert _due(mod, path)["s"][0] == 1
+
+
+def test_goal_continuations_do_not_reset_the_count(db):
+    path, con = db
+    mod = _load()
+    _goal(con, "s", waiting_on_session="proc_1")
+    _msg(con, "s", "user", "ship it", NOW - 9 * 3600)
+    _msg(con, "s", "user", mod.render(1, 3, 3600, {"goal": "g"}), NOW - 8 * 3600)
+    _msg(con, "s", "user", "[Continuing toward your standing goal] take one concrete step", NOW - 8 * 3600 + 1)
+    _msg(con, "s", "user", "[Heartbeat — recurring instruction, fires every 1h]", NOW - 8 * 3600 + 2)
+    assert _due(mod, path)["s"][0] == 2
 
 
 def test_render_escalates_on_the_last_check():
     mod = _load()
     goal = {"goal": "merge PR", "waiting_on_pid": 7}
     normal, last = mod.render(1, 3, 3000, goal), mod.render(3, 3, 3000, goal)
-    assert normal.startswith(mod.MARKER) and "pid 7" in normal and "[SILENT]" in normal
+    assert normal.startswith(mod.MARKER) and "pid 7" in normal and "exactly [SILENT]" in normal
     assert "Do not reply [SILENT]" in last and "Send the user" in last
 
 
@@ -100,38 +111,62 @@ def test_settings_defaults_and_clamps(monkeypatch):
     monkeypatch.setattr(config, "load_config_readonly", lambda: {"plugins": {"entries": {
         "goal-heartbeat": {"interval_minutes": 1, "escalate_after": 0}}}})
     s = mod._settings()
-    assert s["interval_minutes"] == 5.0 and s["escalate_after"] == 1 and s["enabled"] is True
+    assert s["interval_minutes"] == mod.MIN_INTERVAL_MINUTES == 15.0
+    assert s["escalate_after"] == 1 and s["enabled"] is True
 
 
-def test_tick_injects_once_per_interval(db, monkeypatch):
+class Ctx:
+    def __init__(self):
+        self.calls = []
+
+    def inject_message(self, content, role="user", *, session_key=None):
+        self.calls.append((session_key, content))
+        return True
+
+
+def test_tick_injects_once_then_retries_a_dropped_dispatch(db, monkeypatch):
     path, con = db
     mod = _load()
     mod._recent.clear()
     _goal(con, "s", waiting_on_session="proc_1")
     _msg(con, "s", "user", "go", time.time() - 3 * 3600)
-    monkeypatch.setattr(mod, "_home", lambda: path.parent)
-    calls = []
-
-    class Ctx:
-        def inject_message(self, content, role="user", *, session_key=None):
-            calls.append((session_key, content))
-            return True
-
-    mod._tick(Ctx())
-    mod._tick(Ctx())  # not yet persisted in messages: the recent-fire map must hold it back
-    assert len(calls) == 1 and calls[0][0] == "agent:main:telegram:dm:1"
-    assert calls[0][1].startswith(f"{mod.MARKER}1/3")
+    monkeypatch.setattr(mod, "_settings", lambda: dict(mod.DEFAULTS, interval_minutes=50.0))
+    ctx = Ctx()
+    mod._tick(ctx, path.parent)
+    mod._tick(ctx, path.parent)  # not yet visible in the session: held back
+    assert len(ctx.calls) == 1 and ctx.calls[0][0] == "agent:main:telegram:dm:1"
+    assert ctx.calls[0][1].startswith(f"{mod.MARKER}1/3")
+    later = mod._recent[(str(path.parent), "s")] + mod.RETRY_SECONDS + 1
+    monkeypatch.setattr(mod.time, "time", lambda: later)
+    mod._tick(ctx, path.parent)  # never landed: the gateway dropped it, so retry
+    assert len(ctx.calls) == 2
 
 
-def test_reload_retires_the_previous_heartbeat_thread(monkeypatch):
-    first = _load("gh_first")
-    monkeypatch.setattr(first, "POLL_SECONDS", 0.01)
-    token = object()
-    first._TOKENS[first.PLUGIN_ID] = token
-    t = threading.Thread(target=first._loop, args=(object(), token), daemon=True)
+def _start_loop(mod, home, monkeypatch, enabled=True):
+    monkeypatch.setattr(mod, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(mod, "_plugin_still_enabled", lambda: enabled)
+    monkeypatch.setattr(mod, "_in_gateway_process", lambda: False)
+    key, token = f"{mod.PLUGIN_ID}:{home}", object()
+    mod._TOKENS[key] = token
+    t = threading.Thread(target=mod._loop, args=(Ctx(), key, token, home), daemon=True)
     t.start()
+    return t, key
+
+
+def test_reload_retires_the_previous_heartbeat_thread(tmp_path, monkeypatch):
+    first = _load("gh_first")
+    t, key = _start_loop(first, tmp_path, monkeypatch)
+    time.sleep(0.05)
+    assert t.is_alive()
     second = _load("gh_second")
     assert second._recent is first._recent
-    second._TOKENS[second.PLUGIN_ID] = object()
+    second._TOKENS[key] = object()
+    t.join(timeout=2)
+    assert not t.is_alive()
+
+
+def test_disabled_plugin_thread_exits(tmp_path, monkeypatch):
+    mod = _load("gh_disabled")
+    t, _ = _start_loop(mod, tmp_path, monkeypatch, enabled=False)
     t.join(timeout=2)
     assert not t.is_alive()
