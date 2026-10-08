@@ -21,8 +21,7 @@ def test_linux_start_ticks_match_the_hostctl_division():
 
 def test_darwin_lstart_parses_the_hostctl_sample():
     started = readiness.parse_darwin_lstart("S Thu Oct  8 23:48:08 2026\n")
-    local = datetime.now().astimezone().tzinfo
-    assert started == datetime(2026, 10, 8, 23, 48, 8, tzinfo=local)
+    assert started == datetime(2026, 10, 8, 23, 48, 8, tzinfo=timezone.utc)
 
 
 def test_ready_receipt_keeps_the_loop_timestamp(tmp_path: Path):
@@ -31,7 +30,7 @@ def test_ready_receipt_keeps_the_loop_timestamp(tmp_path: Path):
         phase="ready", event_loop_at=loop_at, home=tmp_path, pid=os.getpid(),
     )
     assert path is not None and path.is_file() and not path.is_symlink()
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
     assert document["schema_version"] == "1"
     assert document["application_id"] == "hermes-gateway"
     assert document["phase"] == "ready"
@@ -48,7 +47,7 @@ def test_ready_receipt_keeps_the_loop_timestamp(tmp_path: Path):
 
 def test_ready_without_a_loop_timestamp_is_not_ready(tmp_path: Path):
     path = readiness.publish_application_readiness(phase="ready", home=tmp_path, pid=os.getpid())
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
     assert document["phase"] == "starting"
     assert "signals" not in document
 
@@ -72,7 +71,7 @@ def test_stopped_receipt_drops_the_loop_signal(tmp_path: Path):
         home=tmp_path,
         pid=os.getpid(),
     )
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
     assert document["phase"] == "stopped"
     assert document["exit_reason"] == "gateway loop stopped"
     assert "signals" not in document
@@ -95,15 +94,15 @@ def test_this_process_start_matches_the_native_observation():
     if sys.platform == "darwin":
         completed = subprocess.run(
             ["/bin/ps", "-p", str(os.getpid()), "-o", "state=,lstart="],
-            capture_output=True, text=True, timeout=2,
-            env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, encoding="utf-8", timeout=2,
+            env={"LC_ALL": "C", "LANG": "C", "TZ": "UTC", "PATH": "/usr/bin:/bin"},
             check=True,
         )
         assert started == readiness.parse_darwin_lstart(completed.stdout)
     elif sys.platform == "linux":
-        stat = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
+        stat = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8-sig")
         btime = next(
-            int(line.split()[1]) for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            int(line.split()[1]) for line in Path("/proc/stat").read_text(encoding="utf-8-sig").splitlines()
             if line.startswith("btime ")
         )
         hz = int(os.sysconf("SC_CLK_TCK"))

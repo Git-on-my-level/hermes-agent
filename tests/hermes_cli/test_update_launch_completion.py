@@ -543,12 +543,12 @@ def test_supervised_gateway_sync_deadline_does_not_claim_success(
     with pytest.raises(RuntimeError, match="hermes update"):
         venv_sync.prepare_launch(root, ["gateway", "run"])
     assert completion_tail == []
-    record = json.loads(maintenance_path().read_text(encoding="utf-8"))
+    record = json.loads(maintenance_path().read_text(encoding="utf-8-sig"))
     assert record["blocking"] is False
     assert record["reason"] == "deadline exceeded"
     assert "hermes update" in record["recovery"]
     from gateway.application_readiness import receipt_path
-    receipt = json.loads(receipt_path().read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path().read_text(encoding="utf-8-sig"))
     assert receipt["schema_version"] == "1"
     assert receipt["application_id"] == "hermes-gateway"
     assert receipt["phase"] == "maintenance"

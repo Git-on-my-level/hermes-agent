@@ -85,7 +85,12 @@ def parse_linux_start(stat_text: str, btime_seconds: int, hz: int) -> datetime |
 
 
 def parse_darwin_lstart(output: str) -> datetime | None:
-    """Parse ``ps -o state=,lstart=`` the way hostctl's procfact parser does."""
+    """Parse ``ps -o lstart`` as UTC.
+
+    The process is invoked with ``TZ=UTC``, and the timestamp is read as UTC.
+    Parsing it in the caller's local zone disagrees with a hostctl reader that
+    does the same, by the offset between those zones.
+    """
     fields = output.split()
     if len(fields) < 6 or fields[0].startswith("Z"):
         return None
@@ -93,33 +98,44 @@ def parse_darwin_lstart(output: str) -> datetime | None:
         naive = datetime.strptime(" ".join(fields[1:6]), "%a %b %d %H:%M:%S %Y")
     except ValueError:
         return None
-    local = datetime.now().astimezone().tzinfo
-    if local is None:
-        return None
-    return naive.replace(tzinfo=local)
+    return naive.replace(tzinfo=timezone.utc)
 
 
 def project_serving_phase(home: Path, pid: int) -> str:
     """Phase a looping gateway may claim from files it already writes.
 
-    ``ready`` is withheld while blocking maintenance is in force or the state file
-    does not say the gateway is running. ``stale`` is an observer verdict, not a
-    phase this file may contain.
+    Blocking maintenance overrides the loop only when the record names this
+    process's kernel start. Draining is not ready: the gateway is no longer
+    accepting work. ``stale`` is an observer verdict, not a phase in the receipt.
     """
     maintenance = _read_json(home / "state" / "gateway-maintenance.json")
-    if (
-        isinstance(maintenance, dict)
-        and maintenance.get("blocking") is True
-        and _coerce_pid(maintenance.get("pid")) == pid
-    ):
+    if isinstance(maintenance, dict) and _maintenance_names_this_process(maintenance, pid):
         return "maintenance"
     state = _read_json(home / "gateway_state.json")
     claimed = state.get("gateway_state") if isinstance(state, dict) else None
-    if claimed == "degraded":
+    if claimed in {"degraded", "draining"}:
         return "degraded"
-    if claimed in {"running", "draining"}:
+    if claimed == "running":
         return "ready"
     return "starting"
+
+
+def _maintenance_names_this_process(maintenance: dict, pid: int) -> bool:
+    if maintenance.get("blocking") is not True or _coerce_pid(maintenance.get("pid")) != pid:
+        return False
+    recorded = maintenance.get("pid_started_at")
+    if not isinstance(recorded, str):
+        return False
+    observed = kernel_started_at(pid)
+    if observed is None:
+        return False
+    try:
+        claimed = datetime.fromisoformat(recorded.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if claimed.tzinfo is None:
+        claimed = claimed.replace(tzinfo=timezone.utc)
+    return abs((observed - claimed.astimezone(timezone.utc)).total_seconds()) <= 2.0
 
 
 def _publish(
@@ -252,6 +268,11 @@ def _utc_timestamp(value: str) -> str | None:
     return text
 
 
+def rfc3339_utc(value: datetime) -> str:
+    """UTC RFC3339 with a ``Z`` suffix. Hostctl rejects numeric offsets."""
+    return _rfc3339_z(value)
+
+
 def _rfc3339_z(value: datetime) -> str:
     utc = value.astimezone(timezone.utc)
     fraction = f".{utc.microsecond:06d}" if utc.microsecond else ""
@@ -260,7 +281,7 @@ def _rfc3339_z(value: datetime) -> str:
 
 def _linux_started_at(pid: int) -> datetime | None:
     try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig")
         hz = int(os.sysconf("SC_CLK_TCK"))
         btime = _linux_btime()
     except (OSError, ValueError):
@@ -272,7 +293,7 @@ def _linux_started_at(pid: int) -> datetime | None:
 
 def _linux_btime() -> int | None:
     try:
-        text = Path("/proc/stat").read_text(encoding="utf-8")
+        text = Path("/proc/stat").read_text(encoding="utf-8-sig")
     except OSError:
         return None
     for line in text.splitlines():
@@ -304,7 +325,7 @@ def _darwin_started_at(pid: int) -> datetime | None:
             capture_output=True,
             text=True,
             timeout=2,
-            env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            env={"LC_ALL": "C", "LANG": "C", "TZ": "UTC", "PATH": "/usr/bin:/bin"},
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -316,7 +337,7 @@ def _darwin_started_at(pid: int) -> datetime | None:
 
 def _read_json(path: Path) -> Any:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data

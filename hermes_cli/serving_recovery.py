@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -73,7 +72,12 @@ def publish_maintenance(
     }
     if deadline_s is not None:
         payload["deadline_s"] = deadline_s
-        payload["deadline_at"] = (now + timedelta(seconds=deadline_s)).isoformat()
+        payload["deadline_at"] = (now + timedelta(seconds=deadline_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    from gateway.application_readiness import kernel_started_at, rfc3339_utc
+
+    started = kernel_started_at(os.getpid())
+    if started is not None:
+        payload["pid_started_at"] = rfc3339_utc(started)
     path = maintenance_path(home)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,12 +200,16 @@ def _wait_process_group(process: subprocess.Popen, deadline: float, *, phase: st
 
 
 def _kill_process_group(process: subprocess.Popen) -> None:
-    if os.name != "nt":
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            process.kill()
-    else:
+    """Stop the sync child and its descendants. psutil is cross-platform; no killpg/SIGKILL."""
+    try:
+        import psutil
+
+        parent = psutil.Process(process.pid)
+        descendants = parent.children(recursive=True)
+        for child in descendants:
+            child.kill()
+        parent.kill()
+    except Exception:
         process.kill()
     try:
         process.wait(timeout=5)

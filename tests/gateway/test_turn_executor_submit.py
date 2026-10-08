@@ -62,3 +62,116 @@ def test_submit_after_shutdown_is_refused():
         assert "shutdown" in str(exc)
     else:
         raise AssertionError("submit after shutdown was accepted")
+
+
+def test_start_that_joins_the_worker_does_not_retain_it(monkeypatch):
+    real_start = threading.Thread.start
+
+    def joining_start(self, *args, **kwargs):
+        if self.name.startswith("review-worker_"):
+            real_start(self, *args, **kwargs)
+            self.join()
+            return None
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", joining_start)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    future = executor.submit(lambda: 7)
+    assert future.result(timeout=2) == 7
+    executor.shutdown(wait=True)
+    assert not [thread for thread in executor._threads if thread.name.startswith("review-worker_")]
+
+
+def test_shutdown_wait_drains_work_the_dispatcher_has_not_started(monkeypatch):
+    gate = threading.Event()
+    entered = threading.Event()
+    real_dispatch = _UnboundedThreadExecutor._dispatch
+
+    def gated(self):
+        entered.set()
+        assert gate.wait(2), "dispatcher gate was never released"
+        return real_dispatch(self)
+
+    monkeypatch.setattr(_UnboundedThreadExecutor, "_dispatch", gated)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    future = executor.submit(lambda: "done")
+    assert entered.wait(1), "dispatcher never blocked"
+    assert not future.done()
+    holder = threading.Thread(target=lambda: executor.shutdown(wait=True))
+    holder.start()
+    time.sleep(0.05)
+    assert holder.is_alive(), "shutdown(wait=True) returned while the accepted future was pending"
+    assert not future.done()
+    gate.set()
+    holder.join(2)
+    assert not holder.is_alive()
+    assert future.result(timeout=1) == "done"
+
+
+def test_shutdown_wait_false_returns_while_thread_start_hangs(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    real_start = threading.Thread.start
+
+    def hanging_start(self, *args, **kwargs):
+        if self.name.startswith("review-worker_"):
+            started.set()
+            assert release.wait(2), "hanging start was never released"
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", hanging_start)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    try:
+        future = executor.submit(lambda: "ran")
+        assert started.wait(1), "dispatcher never reached Thread.start"
+        began = time.monotonic()
+        executor.shutdown(wait=False)
+        assert time.monotonic() - began < 0.2
+        assert not future.done()
+    finally:
+        release.set()
+        assert future.result(timeout=2) == "ran"
+
+
+def test_thread_start_exception_fails_the_future(monkeypatch):
+    real_start = threading.Thread.start
+
+    def boom(self, *args, **kwargs):
+        if self.name.startswith("review-worker_"):
+            raise RuntimeError("thread limit")
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    future = executor.submit(lambda: 1)
+    try:
+        future.result(timeout=2)
+    except RuntimeError as exc:
+        assert "thread limit" in str(exc)
+    else:
+        raise AssertionError("start failure was not the future's result")
+    executor.shutdown(wait=True)
+    assert not [thread for thread in executor._threads if thread.name.startswith("review-worker_")]
+    assert executor._inflight == 0
+
+
+def test_cancel_futures_drops_work_still_queued(monkeypatch):
+    gate = threading.Event()
+    entered = threading.Event()
+    ran = threading.Event()
+    real_dispatch = _UnboundedThreadExecutor._dispatch
+
+    def gated(self):
+        entered.set()
+        assert gate.wait(2), "dispatcher gate was never released"
+        return real_dispatch(self)
+
+    monkeypatch.setattr(_UnboundedThreadExecutor, "_dispatch", gated)
+    executor = _UnboundedThreadExecutor(thread_name_prefix="review-worker")
+    future = executor.submit(lambda: ran.set())
+    assert entered.wait(1)
+    executor.shutdown(wait=False, cancel_futures=True)
+    assert future.cancelled()
+    gate.set()
+    time.sleep(0.05)
+    assert not ran.is_set()

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
@@ -17,7 +16,7 @@ def test_deadline_kills_the_sync_process_group(tmp_path):
     script = (
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-        f"handle = open({str(pidfile)!r}, 'w')\n"
+        f"handle = open({str(pidfile)!r}, 'w', encoding='utf-8')\n"
         "handle.write(str(child.pid))\n"
         "handle.close()\n"
         "time.sleep(30)\n"
@@ -31,7 +30,7 @@ def test_deadline_kills_the_sync_process_group(tmp_path):
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert pidfile.exists(), "sync child did not publish its worker pid"
-        grandchild = int(pidfile.read_text(encoding="utf-8"))
+        grandchild = int(pidfile.read_text(encoding="utf-8-sig"))
         with pytest.raises(PhaseDeadlineExceeded) as caught:
             _wait_process_group(process, 0.2, phase="dependency_sync")
         assert caught.value.phase == "dependency_sync"
@@ -44,10 +43,10 @@ def test_deadline_kills_the_sync_process_group(tmp_path):
 
 
 def _assert_dead(pid: int) -> None:
+    import psutil
+
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not psutil.pid_exists(pid):
             return
         time.sleep(0.05)
     raise AssertionError(f"pid {pid} was still alive after the phase deadline")

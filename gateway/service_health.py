@@ -13,8 +13,10 @@ read credentials.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -25,7 +27,10 @@ from hermes_constants import get_process_hermes_home
 
 _SCHEMA = "hermes.service_health.v1"
 _HEARTBEAT_FRESH_S = 90.0
+_FUTURE_SKEW_S = 2.0
 _LOOP_TICK_TIMEOUT_S = 0.2
+_READ_LIMIT = 65536
+_MAX_PID = 2**32
 _CONNECTED = {"connected", "running", "ok"}
 _RUNNING_STATES = {"running", "degraded", "starting", "draining"}
 # Top-level flags that take a value, so `hermes -p name gateway health` still matches.
@@ -56,7 +61,50 @@ def maybe_run_readonly_health(argv: list[str]) -> int | None:
     tokens = command_tokens(argv)
     if tokens[:2] != ["gateway", "health"]:
         return None
-    return main(tokens[2:])
+    return main(argv)
+
+
+def explicit_profile_name(argv: list[str]) -> str | None:
+    """``-p``/``--profile`` before ``--``. Does not import the CLI parser or profile store."""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if token in {"-p", "--profile"} and index + 1 < len(argv):
+            return argv[index + 1].strip().casefold()
+        if token.startswith("--profile="):
+            return token.split("=", 1)[1].strip().casefold()
+        index += 1
+    return None
+
+
+class _ProfileUnusable(Exception):
+    """The requested profile cannot be observed without creating or borrowing another home."""
+
+
+def home_for_explicit_profile(name: str | None) -> Path:
+    """Home for an explicit profile flag. ``None`` keeps the process home.
+
+    A named profile that is not already live is refused. Resolving it must not
+    create the directory or fall through to another profile's files.
+    """
+    from hermes_constants import PROFILE_ID_RE, get_process_hermes_home, named_profile_is_live
+
+    current = get_process_hermes_home()
+    if name is None:
+        return current
+    if not PROFILE_ID_RE.fullmatch(name):
+        raise _ProfileUnusable(f"hermes: {name!r} is not a profile name")
+    root = current.parent.parent if current.parent.name == "profiles" else current
+    if name == "default":
+        return root
+    candidate = root / "profiles" / name
+    if not named_profile_is_live(candidate):
+        raise _ProfileUnusable(
+            f"hermes: profile {name!r} is not a live profile; health will not create it or read another home"
+        )
+    return candidate
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,7 +123,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     source = Path(__file__).resolve().parents[1]
-    document = collect_service_health(source_root=source)
+    try:
+        home = home_for_explicit_profile(explicit_profile_name(args))
+    except _ProfileUnusable as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    document = collect_service_health(home, source_root=source)
     json.dump(document, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0
@@ -90,40 +143,44 @@ def collect_service_health(
     """Observe one Hermes home. Reads files and one short loop-tick connect; writes nothing."""
     home = Path(home) if home is not None else get_process_hermes_home()
     observed = now or datetime.now(timezone.utc)
-    state = _read_json(home / "gateway_state.json") or {}
-    pid_record = _read_json(home / "gateway.pid") or {}
-    if not isinstance(state, dict):
-        state = {}
-    if not isinstance(pid_record, dict):
-        pid_record = {}
-    heartbeat = _read_json(home / "state" / "gateway.heartbeat") or {}
-    maintenance = _read_json(home / "state" / "gateway-maintenance.json") or {}
-    if not isinstance(heartbeat, dict):
-        heartbeat = {}
-    if not isinstance(maintenance, dict):
-        maintenance = {}
+    state, state_evidence = _read_record(home / "gateway_state.json")
+    pid_record, pid_evidence = _read_record(home / "gateway.pid")
+    heartbeat, heartbeat_evidence = _read_record(home / "state" / "gateway.heartbeat")
+    maintenance, maintenance_evidence = _read_record(home / "state" / "gateway-maintenance.json")
+    evidence = {
+        "state": state_evidence,
+        "pid": pid_evidence,
+        "heartbeat": heartbeat_evidence,
+        "maintenance": maintenance_evidence,
+    }
+    unreadable = any(item in {"malformed", "unavailable", "oversized"} for item in evidence.values())
 
     pid = _coerce_pid(state.get("pid")) or _coerce_pid(pid_record.get("pid"))
     recorded_start = state.get("start_time")
     if recorded_start is None:
         recorded_start = pid_record.get("start_time")
-    alive = bool(pid) and _pid_alive(pid)
+    liveness = _pid_liveness(pid)
+    alive = liveness == "alive"
     current_start = _start_fingerprint(pid) if alive and pid else None
-    identity = _identity(recorded_start, current_start, alive)
+    identity = "unavailable" if liveness == "unavailable" else _identity(recorded_start, current_start, alive)
     parent_pid = _parent_pid(pid) if alive and pid else None
     heartbeat_age = _age_seconds(heartbeat.get("updated_at"), observed)
     state_age = _age_seconds(state.get("updated_at"), observed)
     loop_tick = _probe_loop_tick(home, pid) if alive and pid else "unavailable"
     platforms = _platforms(state.get("platforms"), observed)
+    maintenance_trusted = _maintenance_trusted(maintenance, observed)
     update = _update_view(home, source_root, maintenance, observed)
     phase = _phase(
         state=state,
         alive=alive,
+        liveness=liveness,
         identity=identity,
         heartbeat_age=heartbeat_age,
+        state_age=state_age,
         loop_tick=loop_tick,
         platforms=platforms,
-        maintenance=maintenance,
+        maintenance_trusted=maintenance_trusted,
+        unreadable=unreadable,
     )
     gateway_state = state.get("gateway_state") if isinstance(state.get("gateway_state"), str) else None
     document = {
@@ -142,10 +199,13 @@ def collect_service_health(
         },
         "freshness": {
             "heartbeat_age_s": heartbeat_age,
-            "heartbeat_fresh": heartbeat_age is not None and heartbeat_age <= _HEARTBEAT_FRESH_S,
+            "heartbeat_fresh": _is_fresh(heartbeat_age),
+            "heartbeat_state": _clock_state(heartbeat_age, heartbeat_evidence),
             "state_age_s": state_age,
+            "state_clock": _clock_state(state_age, state_evidence),
             "loop_tick": loop_tick,
         },
+        "evidence": evidence,
         "revisions": _revisions(state, source_root),
         "platforms": platforms,
         "update": update,
@@ -156,6 +216,8 @@ def collect_service_health(
         },
         "maintenance": {
             "blocking": bool(maintenance.get("blocking")),
+            "trusted": maintenance_trusted,
+            "evidence": maintenance_evidence,
             "phase": maintenance.get("phase") if isinstance(maintenance.get("phase"), str) else None,
             "deadline_at": maintenance.get("deadline_at") if isinstance(maintenance.get("deadline_at"), str) else None,
             "waiting_on": maintenance.get("waiting_on") if isinstance(maintenance.get("waiting_on"), str) else None,
@@ -164,7 +226,12 @@ def collect_service_health(
             "pid": _coerce_pid(maintenance.get("pid")),
         },
     }
-    document["application_readiness"] = _read_json(home / "state" / "application-readiness.json")
+    receipt, receipt_evidence = _read_record(home / "state" / "application-readiness.json")
+    document["evidence"]["receipt"] = receipt_evidence
+    document["application_readiness"] = receipt or None
+    if receipt_evidence in {"malformed", "unavailable", "oversized"} and document["phase"] == "ready":
+        document["phase"] = "degraded"
+        document["healthy"] = False
     return document
 
 
@@ -172,31 +239,39 @@ def _phase(
     *,
     state: dict[str, Any],
     alive: bool,
+    liveness: str,
     identity: str,
     heartbeat_age: float | None,
+    state_age: float | None,
     loop_tick: str,
     platforms: list[dict[str, Any]],
-    maintenance: dict[str, Any],
+    maintenance_trusted: bool,
+    unreadable: bool,
 ) -> str:
-    maintenance_pid = _coerce_pid(maintenance.get("pid"))
-    if maintenance.get("blocking") and maintenance_pid and _pid_alive(maintenance_pid):
+    if maintenance_trusted:
         return "maintenance"
     claimed = state.get("gateway_state") if isinstance(state.get("gateway_state"), str) else ""
+    if liveness == "unavailable" or unreadable:
+        return "degraded"
     if not alive:
         return "stale" if claimed in _RUNNING_STATES else "stopped"
     if identity == "mismatch":
         return "stale"
-    heartbeat_fresh = heartbeat_age is not None and heartbeat_age <= _HEARTBEAT_FRESH_S
-    loop_live = loop_tick == "answered"
-    connected = [row for row in platforms if row.get("connected")]
-    disconnected = bool(platforms) and not connected
-    if claimed in {"starting"} or (claimed not in {"running", "degraded", "draining"} and not heartbeat_fresh):
-        return "starting"
     if identity != "match":
         return "degraded"
+    if _is_future(heartbeat_age) or _is_future(state_age) or any(_is_future(row.get("age_s")) for row in platforms):
+        return "degraded"
+    heartbeat_fresh = _is_fresh(heartbeat_age)
+    loop_live = loop_tick == "answered"
+    connected = [row for row in platforms if row.get("connected") and _timestamp_supports_connection(row.get("age_s"))]
+    disconnected = bool(platforms) and not connected
+    if claimed == "draining":
+        return "degraded"
+    if claimed in {"starting"} or (claimed not in {"running", "degraded"} and not heartbeat_fresh):
+        return "starting"
     if claimed == "degraded" or disconnected or (not heartbeat_fresh and not loop_live):
         return "degraded"
-    if claimed in {"running", "draining"} and (heartbeat_fresh or loop_live):
+    if claimed == "running" and (heartbeat_fresh or loop_live):
         return "ready"
     return "starting"
 
@@ -204,13 +279,76 @@ def _phase(
 def _identity(recorded: Any, current: int | None, alive: bool) -> str:
     if not alive:
         return "dead"
-    if not isinstance(recorded, (int, float)) or isinstance(recorded, bool):
+    recorded_start = _coerce_start(recorded)
+    if recorded_start is None or current is None:
         return "unverified"
-    if current is None:
-        return "unverified"
-    if int(recorded) == int(current):
+    if recorded_start == int(current):
         return "match"
     return "mismatch"
+
+
+def _coerce_start(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _is_future(age: float | None) -> bool:
+    return age is not None and age < -_FUTURE_SKEW_S
+
+
+def _is_fresh(age: float | None) -> bool:
+    return age is not None and -_FUTURE_SKEW_S <= age <= _HEARTBEAT_FRESH_S
+
+
+def _clock_state(age: float | None, evidence: str) -> str:
+    if evidence in {"malformed", "unavailable", "oversized"}:
+        return "indeterminate"
+    if evidence == "missing" or age is None:
+        return "unavailable"
+    if _is_future(age):
+        return "indeterminate"
+    if _is_fresh(age):
+        return "fresh"
+    return "stale"
+
+
+def _timestamp_supports_connection(age: float | None) -> bool:
+    """A platform stamp in the future, or with no parseable time, is not a live connection."""
+    return _is_fresh(age)
+
+
+def _maintenance_trusted(maintenance: dict[str, Any], now: datetime) -> bool:
+    """A blocking marker overrides the gateway only with a live, matching kernel start and a fresh clock."""
+    if maintenance.get("blocking") is not True:
+        return False
+    pid = _coerce_pid(maintenance.get("pid"))
+    if pid is None or _pid_liveness(pid) != "alive":
+        return False
+    recorded = maintenance.get("pid_started_at")
+    if not isinstance(recorded, str):
+        return False
+    from gateway.application_readiness import kernel_started_at
+
+    observed = kernel_started_at(pid)
+    claimed = _parse_time(recorded)
+    if observed is None or claimed is None:
+        return False
+    if abs((observed - claimed).total_seconds()) > _FUTURE_SKEW_S:
+        return False
+    started_age = _age_seconds(maintenance.get("started_at"), now)
+    if started_age is None or _is_future(started_age):
+        return False
+    deadline_age = _age_seconds(maintenance.get("deadline_at"), now)
+    if deadline_age is None:
+        return started_age <= _HEARTBEAT_FRESH_S
+    # deadline_at in the future has a negative age. Past the skew, the marker is stale.
+    return deadline_age <= _FUTURE_SKEW_S
 
 
 def _platforms(raw: Any, now: datetime) -> list[dict[str, Any]]:
@@ -225,7 +363,7 @@ def _platforms(raw: Any, now: datetime) -> list[dict[str, Any]]:
         rows.append({
             "name": name,
             "state": state,
-            "connected": (state or "").lower() in _CONNECTED,
+            "connected": (state or "").lower() in _CONNECTED and _timestamp_supports_connection(_age_seconds(updated, now)),
             "updated_at": updated,
             "age_s": _age_seconds(updated, now),
             "error_code": payload.get("error_code") if isinstance(payload.get("error_code"), str) else None,
@@ -285,36 +423,53 @@ def _completion_pending(source_root: Path) -> bool:
 
 def _read_update_marker(home: Path) -> dict[str, Any]:
     """Read the update lock marker without deleting it. Health must not mutate."""
-    path = home / ".hermes-update-in-progress"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+    text, evidence = _read_bounded(home / ".hermes-update-in-progress")
+    if evidence != "ok" or text is None:
         return {}
+    lines = text.splitlines()
     try:
         pid = int(lines[0].strip())
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, OverflowError):
+        return {}
+    pid = _coerce_pid(pid)
+    if pid is None:
         return {}
     try:
         started = float(lines[1].strip())
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, OverflowError):
         started = None
-    age = None if started is None else max(0.0, datetime.now(timezone.utc).timestamp() - started)
+    if started is None or not math.isfinite(started):
+        age = None
+    else:
+        age = max(0.0, datetime.now(timezone.utc).timestamp() - started)
     return {"pid": pid, "age_s": age, "alive": _pid_alive(pid)}
 
 
 def _latest_receipt(home: Path, now: datetime) -> dict[str, Any] | None:
     directory = home / "logs" / "update_receipts"
     try:
-        files = [path for path in directory.iterdir() if path.is_file()]
+        names = list(directory.iterdir())
+    except FileNotFoundError:
+        return None
     except OSError:
+        return {"state": "unavailable"}
+    latest: Path | None = None
+    latest_mtime: float | None = None
+    for path in names:
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            continue
+        if latest_mtime is None or info.st_mtime >= latest_mtime:
+            latest, latest_mtime = path, info.st_mtime
+    if latest is None or latest_mtime is None:
         return None
-    if not files:
-        return None
-    latest = max(files, key=lambda path: path.stat().st_mtime)
     try:
-        modified = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
+        modified = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
     except (OSError, OverflowError, ValueError):
-        return {"name": latest.name}
+        return {"name": latest.name, "state": "indeterminate"}
     summary: dict[str, Any] = {
         "name": latest.name,
         "age_s": round((now - modified).total_seconds(), 3),
@@ -353,7 +508,7 @@ def _start_fingerprint(pid: int) -> int | None:
     """
     stat_path = Path(f"/proc/{pid}/stat")
     try:
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
+        return int(stat_path.read_text(encoding="utf-8-sig").split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
     try:
@@ -363,28 +518,45 @@ def _start_fingerprint(pid: int) -> int | None:
         return None
 
 
-def _pid_alive(pid: int | None) -> bool:
-    if not pid or pid <= 0:
-        return False
+def _pid_liveness(pid: int | None) -> str:
+    """``alive``, ``dead``, or ``unavailable``. Never uses ``os.kill(pid, 0)`` (destructive on Windows)."""
+    if pid is None or pid <= 1 or pid >= _MAX_PID:
+        return "dead"
+    if sys.platform.startswith("linux"):
+        proc = Path(f"/proc/{pid}")
+        try:
+            return "alive" if proc.is_dir() else "dead"
+        except OSError:
+            return "unavailable"
+    if sys.platform == "darwin":
+        try:
+            completed = subprocess.run(
+                ["/bin/ps", "-p", str(pid), "-o", "pid="],
+                capture_output=True, text=True, encoding="utf-8", timeout=1, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "unavailable"
+        return "alive" if completed.returncode == 0 and completed.stdout.strip() else "dead"
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        import psutil
+        return "alive" if psutil.pid_exists(pid) else "dead"
+    except Exception:
+        return "unavailable"
+
+
+def _pid_alive(pid: int | None) -> bool:
+    return _pid_liveness(pid) == "alive"
 
 
 def _parent_pid(pid: int) -> int | None:
     if sys.platform == "win32":
         return None
     try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "ppid="],
-            capture_output=True, text=True, timeout=1, check=False,
-        )
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid="],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=1, check=False,
+            )
     except (OSError, subprocess.TimeoutExpired):
         return None
     try:
@@ -397,14 +569,18 @@ def _parent_pid(pid: int) -> int | None:
 def _coerce_pid(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     try:
         pid = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return pid if pid > 0 else None
+    if pid <= 1 or pid >= _MAX_PID:
+        return None
+    return pid
 
 
-def _age_seconds(raw: Any, now: datetime) -> float | None:
+def _parse_time(raw: Any) -> datetime | None:
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
@@ -412,22 +588,79 @@ def _age_seconds(raw: Any, now: datetime) -> float | None:
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return round((now - parsed.astimezone(timezone.utc)).total_seconds(), 3)
+    return parsed.astimezone(timezone.utc)
+
+
+def _age_seconds(raw: Any, now: datetime) -> float | None:
+    parsed = _parse_time(raw)
+    if parsed is None:
+        return None
+    try:
+        return round((now - parsed).total_seconds(), 3)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _read_record(path: Path) -> tuple[dict[str, Any], str]:
+    """Return ``(object, evidence)``. A bad file is an empty object plus an explicit status, never healthy input."""
+    text, evidence = _read_bounded(path)
+    if evidence != "ok" or text is None:
+        return {}, evidence
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}, "malformed"
+    if not isinstance(payload, dict):
+        return {}, "malformed"
+    return payload, "ok"
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    payload, evidence = _read_record(path)
+    return payload if evidence == "ok" else None
+
+
+def _read_bounded(path: Path, limit: int = _READ_LIMIT) -> tuple[str | None, str]:
+    """Read one regular file, at most ``limit`` bytes, without following a final symlink or blocking on a FIFO."""
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    if len(raw) > 1_000_000:
-        raw = raw[:1_000_000]
+        info = path.lstat()
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unavailable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "unavailable"
+    if info.st_size > limit:
+        return None, "oversized"
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+        fd = os.open(path, flags)
+    except OSError:
+        return None, "unavailable"
+    try:
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            try:
+                data = os.read(fd, min(remaining, 65536))
+            except OSError:
+                return None, "unavailable"
+            if not data:
+                break
+            chunks.append(data)
+            remaining -= len(data)
+    finally:
+        os.close(fd)
+    blob = b"".join(chunks)
+    if len(blob) > limit:
+        return None, "oversized"
+    try:
+        return blob.decode("utf-8-sig"), "ok"
+    except UnicodeError:
+        return None, "malformed"
