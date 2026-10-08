@@ -124,6 +124,11 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "fork: silent internal turn regression",
     ),
     ("hermes_cli/goals.py", "def wait_barrier_live(self)", "fork: read-only wait-barrier liveness"),
+    (
+        "tests/e2e/test_goal_heartbeat_e2e.py",
+        "def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exits(",
+        "fork: e2e silent heartbeat through the real gateway path",
+    ),
     ("plugins/session-inject/__init__.py", "def confirm_sent(", "fork plugin: session-inject delivery confirmation"),
     ("plugins/session-inject/__init__.py", "def drain_once(", "fork plugin: session-inject spool drain"),
     ("plugins/session-inject/cli.py", "def queue(", "fork plugin: `hermes inject` CLI"),
