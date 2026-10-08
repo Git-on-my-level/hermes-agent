@@ -130,6 +130,7 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "fork: e2e silent heartbeat through the real gateway path",
     ),
     ("hermes_cli/goals.py", "DRAFT_INFERRED_CONTRACT_SYSTEM_PROMPT", "fork: inferred checklist prompt"),
+    ("hermes_cli/goals.py", "data = {k: v for k, v in data.items() if k in _INFERRED_CONTRACT_FIELDS}", "fork: inferred contracts drop drafted rules"),
     ("hermes_cli/goals.py", "exchange=(last_user_message, last_response)", "fork: inference drafts from the exchange"),
     ("hermes_cli/goals.py", "consecutive_gaps", "fork: persisted completion-gap streak"),
     ("hermes_cli/goals.py", "ONE decision", "fork: gap asks for one decision request"),
@@ -139,7 +140,7 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ("gateway/run_goals.py", 'metadata["notify"] = True', "fork: important goal notices notify"),
     (
         "tests/hermes_cli/test_goal_auto_infer.py",
-        "def test_inferred_contract_uses_exchange_and_only_user_rules(",
+        "def test_inferred_contract_keeps_only_the_promised_checklist(",
         "fork: inferred checklist regression",
     ),
     (

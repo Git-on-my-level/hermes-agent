@@ -144,7 +144,8 @@ JUDGE_SYSTEM_PROMPT = (
     "contract items are unmet or lack concrete verification. Name each missing "
     "item in the reason. Missing items alone are not BLOCKED: give the agent "
     "a chance to finish them. If the agent itself says it needs user input, "
-    "choose BLOCKED instead.\n\n"
+    "choose BLOCKED instead. If a listed background process is still working "
+    "toward a missing item, choose WAIT instead.\n\n"
     "BLOCKED — the response explains it cannot proceed without user input:\n"
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
@@ -230,9 +231,10 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return GAP if the response claims or implies completion "
-    "and name the missing criteria; otherwise CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "is NOT done — return WAIT if a listed background process is still working "
+    "on a missing criterion (this takes precedence); otherwise GAP if the "
+    "response claims or implies completion, naming the missing criteria; "
+    "otherwise CONTINUE.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -249,15 +251,18 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "the response shows concrete evidence of it (a command result, file "
     "contents excerpt, test/benchmark output) — not a claim like 'done' or "
     "'all tests pass' without evidence.\n"
-    "- If the response claims or implies completion but any Outcome item or "
-    "Verification is unmet, return GAP with the missing items in the reason. "
-    "Do not turn missing evidence into an invented prohibition or a BLOCKED verdict.\n"
-    "- If any stated Constraint was violated, the goal is NOT done — GAP if "
-    "completion was claimed, otherwise CONTINUE.\n"
     "- If the response shows the agent is waiting on a listed background "
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
-    "instead of re-poking — re-poking now would be pure busy-work.\n"
+    "instead of re-poking — re-poking now would be pure busy-work. WAIT takes "
+    "precedence over GAP: a completion claim with the verifying work still "
+    "running is a WAIT.\n"
+    "- If the response claims or implies completion but any Outcome item or "
+    "Verification is unmet (and nothing listed is still working on it), return "
+    "GAP with the missing items in the reason. Do not turn missing evidence into "
+    "an invented prohibition or a BLOCKED verdict.\n"
+    "- If any stated Constraint was violated, the goal is NOT done — GAP if "
+    "completion was claimed, otherwise CONTINUE.\n"
     "- If the response explains the work is genuinely unachievable or hits "
     "the stated Stop condition and needs user input, the goal is NOT done — "
     "return BLOCKED with the reason describing the block.\n"
@@ -288,20 +293,19 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 
 
 DRAFT_INFERRED_CONTRACT_SYSTEM_PROMPT = (
-    "Extract a completion contract from the actual user/assistant exchange. "
-    "Do not expand the inferred objective into new rules. The five fields are:\n"
-    "- outcome: the concrete items the assistant promised, as a short checklist "
-    "separated by semicolons (e.g. listen at K=0; pusher at K=0; live env "
-    "verified on both; KB closed). Preserve every promised item.\n"
-    "- verification: how each promised item is checked.\n"
-    "- constraints, boundaries, stop_when: ONLY what the USER explicitly stated "
-    "in the exchange; otherwise use an empty string. Assistant statements are "
-    "not user restrictions. Never infer prohibitions, sequencing rules, scope "
-    "limits, or stop conditions from the objective or a promise.\n\n"
+    "Extract a completion checklist from the actual user/assistant exchange. "
+    "Do not expand the inferred objective into new rules. Two fields:\n"
+    "- outcome: the concrete items the assistant promised in THIS exchange, as a "
+    "short checklist separated by semicolons (format: <item>; <item>; <item>). "
+    "Preserve every promised item and add none.\n"
+    "- verification: how each promised item is checked.\n\n"
     "Reply ONLY with one JSON object:\n"
-    '{"outcome": "...", "verification": "...", "constraints": "", '
-    '"boundaries": "", "stop_when": ""}'
+    '{"outcome": "...", "verification": "..."}'
 )
+
+# An inferred goal was never reviewed by the user: it may only hold the agent to what it promised.
+# Prohibitions, scope limits and stop conditions are dropped in code, whatever the drafter returns.
+_INFERRED_CONTRACT_FIELDS = ("outcome", "verification")
 
 GAP_CONTINUATION_INSTRUCTION = (
     "You reported this done, but {missing_items}. Finish them now. "
@@ -1312,6 +1316,8 @@ def draft_contract(
     if not isinstance(data, dict):
         logger.debug("goal draft: reply was not JSON: %r", _truncate(raw, 200))
         return None
+    if exchange is not None:
+        data = {k: v for k, v in data.items() if k in _INFERRED_CONTRACT_FIELDS}
     contract = GoalContract.from_dict(data)
     return None if contract.is_empty() else contract
 

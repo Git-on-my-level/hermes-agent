@@ -171,11 +171,12 @@ def test_turn_is_user_authored_filters_synthetic_events():
         SimpleNamespace(text="[Heartbeat — recurring instruction, fires every 30m]", internal=False)) is False
 
 
-@pytest.mark.parametrize("user_rules", ["", "Do not change code. Stop if credentials are required."])
-def test_inferred_contract_uses_exchange_and_only_user_rules(monkeypatch, user_rules):
+def test_inferred_contract_keeps_only_the_promised_checklist(monkeypatch):
+    """Incident 20261004_181132_fb432485: the drafter invented prohibitions the user never stated and
+    the judge enforced them. Whatever the drafter returns, an inferred goal holds only its checklist."""
     import json
 
-    user = ("Once both hosts roll with K=0, verify live env on listen and pusher, then close the KB. " + user_rules).strip()
+    user = "Once both hosts roll with K=0, verify live env on listen and pusher, then close the KB."
     reply = "I will verify listen at K=0, pusher at K=0, live env on both, then close the KB."
     checklist = "listen at K=0; pusher at K=0; live env verified on both; KB closed"
     captured = []
@@ -185,14 +186,13 @@ def test_inferred_contract_uses_exchange_and_only_user_rules(monkeypatch, user_r
         if system == goals_mod.INFER_GOAL_SYSTEM_PROMPT:
             return json.dumps({"goal": True, "objective": "Verify both hosts and close the KB"})
         assert user in prompt and reply in prompt
-        assert system != goals_mod.DRAFT_CONTRACT_SYSTEM_PROMPT
-        assert "short checklist" in system
-        assert "ONLY what the USER explicitly stated" in system
-        assert "Never infer prohibitions" in system
-        return json.dumps({
+        assert system == goals_mod.DRAFT_INFERRED_CONTRACT_SYSTEM_PROMPT
+        assert "K=0" not in system  # a format sketch, not a copyable real checklist
+        return json.dumps({  # a non-compliant drafter, exactly the incident's invented rules
             "outcome": checklist, "verification": "Read K on each live host and check KB status",
-            "constraints": "Do not change code" if user_rules else "",
-            "boundaries": "", "stop_when": "credentials are required" if user_rules else "",
+            "constraints": "Do not alter chart values, do not trigger additional rolls, make no code or config changes",
+            "boundaries": "Out of scope: chart definitions, application code",
+            "stop_when": "Stop and ask if either listen or pusher fails to roll to K=0",
         })
 
     monkeypatch.setattr(goals_mod, "draft_contract", draft_contract)
@@ -202,7 +202,27 @@ def test_inferred_contract_uses_exchange_and_only_user_rules(monkeypatch, user_r
     contract = GoalManager("checklist").state.contract
     assert checklist in notice
     assert contract.outcome == checklist
-    assert contract.constraints == ("Do not change code" if user_rules else "")
-    assert contract.boundaries == ""
-    assert contract.stop_when == ("credentials are required" if user_rules else "")
+    assert contract.verification
+    assert (contract.constraints, contract.boundaries, contract.stop_when) == ("", "", "")
     assert len(captured) == 2
+
+
+def test_goal_draft_keeps_user_reviewed_rules(monkeypatch):
+    import json
+
+    monkeypatch.setattr(goals_mod, "draft_contract", draft_contract)
+    monkeypatch.setattr(goals_mod, "_call_goal_judge_llm", lambda c, system, p, t: json.dumps({
+        "outcome": "o", "verification": "v", "constraints": "c", "boundaries": "b", "stop_when": "s"}))
+    contract = draft_contract("ship it")
+    assert (contract.constraints, contract.boundaries, contract.stop_when) == ("c", "b", "s")
+
+
+@pytest.mark.parametrize("template_name", [
+    "JUDGE_SYSTEM_PROMPT", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE"])
+def test_wait_takes_precedence_over_gap(template_name):
+    text = getattr(goals_mod, template_name)
+    if template_name == "JUDGE_SYSTEM_PROMPT":
+        gap = text.index("GAP —")
+        assert "choose WAIT instead" in text[gap:text.index("BLOCKED —")]
+    else:
+        assert text.index("WAIT") < text.index("GAP")
