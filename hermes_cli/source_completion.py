@@ -97,8 +97,6 @@ def _complete_locked(
         print(f"⚠ Could not provide git for the source completion: {exc}", file=sys.stderr)
     publish_launchers(root)
     build_update_products(root, desktop=desktop)
-    if announce:
-        print(announce)
     complete = _run_post_update_maintenance(
         assume_yes=assume_yes,
         gateway_mode=gateway_mode,
@@ -107,15 +105,20 @@ def _complete_locked(
         pre_update_version=pre_update_version,
         completion_message=completion_message,
     )
-    if complete:
-        from hermes_cli.source_stamp import write_source_stamp
+    if not complete:
+        return False
+    from hermes_cli.source_stamp import write_source_stamp
 
-        try:
-            write_source_stamp(root)
-        except (OSError, ValueError) as exc:
-            print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
-                  file=sys.stderr)
-    return complete
+    try:
+        write_source_stamp(root)
+    except (OSError, ValueError) as exc:
+        print(f"⚠ Source update maintenance finished, but the install stamp could not be written: {exc}",
+              file=sys.stderr)
+        return False
+    # Success is the stamp, not the product build that preceded maintenance.
+    if announce:
+        print(announce)
+    return True
 
 
 def _bootstrap_command(root: Path, argv: list[str]) -> list[str]:

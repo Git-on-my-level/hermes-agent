@@ -7,6 +7,8 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import ssl
+import threading
 from typing import Iterable, Optional
 
 import httpx
@@ -58,6 +60,35 @@ _DOH_PROVIDERS: list[dict] = [
 # first-try connect targets so a blackholed IPv6 AAAA for the hostname can't pin initialize().
 SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
 _UNSET = object()
+_ssl_context_lock = threading.Lock()
+_ssl_context: ssl.SSLContext | None = None
+
+
+def _telegram_ssl_context() -> ssl.SSLContext:
+    """One hostname-verifying context for every Telegram pool.
+
+    ``AsyncHTTPTransport()`` builds a default context in its constructor. On this
+    process that is ``truststore``'s Security.framework path, and fallback/reset
+    was doing it on the event loop. Reusing one context keeps verification,
+    SNI, and the CA store, and moves the slow build off the loop (the caller
+    constructs transports via ``asyncio.to_thread``).
+    """
+    global _ssl_context
+    with _ssl_context_lock:
+        if _ssl_context is None:
+            from httpx._config import create_ssl_context
+
+            ctx = create_ssl_context(verify=True, trust_env=True)
+            if not ctx.check_hostname or ctx.verify_mode != ssl.CERT_REQUIRED:
+                raise RuntimeError("Telegram TLS context lost hostname verification")
+            _ssl_context = ctx
+        return _ssl_context
+
+
+def _build_inner_transport(transport_kwargs: dict) -> httpx.AsyncHTTPTransport:
+    built = dict(transport_kwargs)
+    built.setdefault("verify", _telegram_ssl_context())
+    return httpx.AsyncHTTPTransport(**built)
 
 
 def _resolve_proxy_url(target_hosts=None) -> str | None:
@@ -81,7 +112,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         transport_kwargs.setdefault("limits", self._POOL_LIMITS)
         transport_kwargs.setdefault("socket_options", tcp_keepalive_socket_options())
         self._transport_kwargs = transport_kwargs
-        self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
+        # Built on first use, off the event loop. Constructing here stalled the loop inside
+        # truststore while connect/reset ran on it.
+        self._primary: Optional[httpx.AsyncHTTPTransport] = None
         self._primary_lock = asyncio.Lock()
         self._primary_closed = False
         # Built on demand and discarded on failure — see _reset_fallback.
@@ -92,22 +125,36 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._sticky_lock = asyncio.Lock()
         self._last_failure: tuple[str, str] | None = None
 
+    async def _ensure_primary(self) -> httpx.AsyncHTTPTransport:
+        async with self._primary_lock:
+            if self._primary_closed:
+                raise RuntimeError("Telegram transport is closed")
+            if self._primary is None:
+                self._primary = await asyncio.to_thread(_build_inner_transport, self._transport_kwargs)
+            return self._primary
+
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
             transport = self._fallbacks.get(ip)
             if transport is None:
-                transport = httpx.AsyncHTTPTransport(**self._transport_kwargs)
+                transport = await asyncio.to_thread(_build_inner_transport, self._transport_kwargs)
                 self._fallbacks[ip] = transport
             return transport
 
     async def _reset_primary(self, transport: httpx.AsyncHTTPTransport) -> None:
-        # Retryable primary failures leave half-closed sockets in the pool; replace the generation first.
+        # Build the replacement off the loop before taking the lock, so a slow truststore
+        # context does not stall other coroutines waiting on this transport.
+        replacement = await asyncio.to_thread(_build_inner_transport, self._transport_kwargs)
         async with self._primary_lock:
             if self._primary_closed or transport is not self._primary:
-                return
-            self._primary = httpx.AsyncHTTPTransport(**self._transport_kwargs)
+                discarded: Optional[httpx.AsyncHTTPTransport] = replacement
+            else:
+                self._primary = replacement
+                discarded = transport
+        if discarded is None:
+            return
         try:
-            await transport.aclose()
+            await discarded.aclose()
         except Exception as exc:
             logger.debug("[Telegram] Error closing primary transport: %s", exc)
 
@@ -140,11 +187,12 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
-            return await self._primary.handle_async_request(request)
+            primary = await self._ensure_primary()
+            return await primary.handle_async_request(request)
         last_error: Exception | None = None
         for ip in self._attempt_order():
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
-            transport = self._primary if ip is None else await self._get_fallback(ip)
+            transport = await self._ensure_primary() if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
                 if self._last_failure is not None:
@@ -193,7 +241,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         async with self._primary_lock:
             self._primary_closed = True
             primary = self._primary
-        await primary.aclose()
+            self._primary = None
+        if primary is not None:
+            await primary.aclose()
         async with self._fallback_lock:
             transports = list(self._fallbacks.values())
             self._fallbacks.clear()

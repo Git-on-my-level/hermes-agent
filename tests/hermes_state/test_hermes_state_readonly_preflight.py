@@ -142,6 +142,52 @@ class TestRefusalOutsideScope:
             os.chmod(wal, 0o644)
 
 
+class TestSiblingQuarantine:
+    def test_rename_during_access_is_not_a_readonly_file(self, hermes_home, monkeypatch):
+        """A sibling that quarantines the file between exists and access is not a permission defect.
+
+        The 4096-byte copy must survive under the new name. The absent path must
+        not raise the read-only OperationalError.
+        """
+        db = hermes_home / "state.db"
+        db.write_bytes(bytes(4096))
+        quarantined = hermes_home / "state.quarantined"
+        real_access = os.access
+
+        def access(path, mode, *args, **kwargs):
+            target = Path(path)
+            if target == db and db.is_file():
+                db.rename(quarantined)
+            return real_access(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "access", access)
+        preflight_db_writability(db, db_label="state.db")
+
+        assert not db.exists()
+        assert quarantined.is_file()
+        assert quarantined.read_bytes() == bytes(4096)
+
+    def test_permission_error_on_existence_probe_is_not_absence(self, hermes_home, monkeypatch):
+        """A stat permission error is not the sibling-rename race.
+
+        The initial snapshot still uses ``Path.is_file``. The later probe must
+        not treat ``PermissionError`` as a missing file and skip the refusal.
+        """
+        db = hermes_home / "state.db"
+        db.write_bytes(bytes(4096))
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self == db:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        with pytest.raises(PermissionError):
+            preflight_db_writability(db, db_label="state.db")
+        assert db.read_bytes() == bytes(4096)
+
+
 class TestSkips:
 
 

@@ -466,13 +466,11 @@ def test_supervised_launch_leaves_a_pending_tail_to_the_cli(
 def test_supervised_launch_with_stale_dependencies_still_syncs(
     tmp_path, monkeypatch, completion_tail
 ):
-    """Stale dependencies stay one-shot for a supervised child (#123340 review).
+    """A supervised non-gateway command still syncs and finishes the tail (#123340).
 
-    A hand-run ``git pull`` leaves the tree's lockfile ahead of the installed
-    tools with no pending marker; a manager restart must still sync and finish
-    (pre-image behavior) instead of booting on the stale dependency graph — or
-    crash-looping under ``Restart=always`` with no sync at all. The sticky-tail
-    exemption above must not swallow this one-shot condition.
+    ``gateway run`` is the exception: it syncs under its own deadline and serves.
+    A hand-run ``git pull`` followed by a supervised ``hermes update`` must still
+    finish the product tail instead of booting on the stale graph.
     """
     import pm
     from hermes_cli import _launchers
@@ -484,7 +482,77 @@ def test_supervised_launch_with_stale_dependencies_still_syncs(
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
     monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
 
-    venv_sync.prepare_launch(root, ["gateway", "run"])
+    venv_sync.prepare_launch(root, ["update"])
     assert syncs, "a supervised child booted on a stale dependency graph without syncing"
     assert completion_tail, "the tail armed by that sync was never finished"
     assert not venv_sync.completion_pending_path(root).is_file()
+
+
+def test_supervised_gateway_restart_syncs_without_running_the_product_tail(
+    tmp_path, monkeypatch, completion_tail
+):
+    """Watchdog restart syncs dependencies and leaves the product tail owed.
+
+    The serving process must not block on product builds and post-update
+    maintenance. The marker stays so ``hermes update`` still finishes them.
+    """
+    import pm
+    from hermes_cli import _launchers
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    syncs = []
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
+    monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: syncs.append(a))
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+    monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
+
+    def _in_process(sync_root, *, arm, deadline):
+        assert deadline > 0
+        venv_sync._sync_source_dependencies(sync_root, arm=arm)
+
+    monkeypatch.setattr(
+        "hermes_cli.serving_recovery.run_bounded_dependency_sync", _in_process,
+    )
+
+    venv_sync.prepare_launch(root, ["gateway", "run"])
+    assert syncs, "a supervised gateway skipped the dependency sync"
+    assert completion_tail == [], "the serving process ran the product tail"
+    assert venv_sync.completion_pending_path(root).is_file()
+
+
+def test_supervised_gateway_sync_deadline_does_not_claim_success(
+    tmp_path, monkeypatch, completion_tail
+):
+    """A stuck package worker ends the phase; the tail is not marked finished."""
+    import pm
+    from hermes_cli import _launchers
+    from hermes_cli.serving_recovery import PhaseDeadlineExceeded, maintenance_path
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+    monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
+
+    def _stuck(sync_root, *, arm, deadline):
+        raise PhaseDeadlineExceeded("dependency_sync", deadline)
+
+    monkeypatch.setattr(
+        "hermes_cli.serving_recovery.run_bounded_dependency_sync", _stuck,
+    )
+
+    with pytest.raises(RuntimeError, match="hermes update"):
+        venv_sync.prepare_launch(root, ["gateway", "run"])
+    assert completion_tail == []
+    record = json.loads(maintenance_path().read_text(encoding="utf-8-sig"))
+    assert record["blocking"] is False
+    assert record["reason"] == "deadline exceeded"
+    assert "hermes update" in record["recovery"]
+    from gateway.application_readiness import receipt_path
+    receipt = json.loads(receipt_path().read_text(encoding="utf-8-sig"))
+    assert receipt["schema_version"] == "1"
+    assert receipt["application_id"] == "hermes-gateway"
+    assert receipt["phase"] == "maintenance"
+    assert "signals" not in receipt
+    assert receipt["pid"] > 1
+    assert str(receipt["pid_started_at"]).endswith("Z")
+    assert str(receipt["updated_at"]).endswith("Z")

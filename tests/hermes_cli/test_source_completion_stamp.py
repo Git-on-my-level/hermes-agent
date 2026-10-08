@@ -50,6 +50,47 @@ def test_successful_source_completion_writes_checkout_identity(tmp_path, monkeyp
     assert (root / "install-stamp.json").is_file()
 
 
+def test_success_banner_follows_the_install_stamp(tmp_path, monkeypatch, capsys):
+    """``Code updated!`` is not printed until maintenance and the stamp succeed."""
+    root = _repo(tmp_path)
+    order = []
+
+    def maintenance(**_kwargs):
+        order.append("maintenance")
+        assert not (root / "install-stamp.json").exists()
+        return True
+
+    _completion_dependencies(monkeypatch, maintenance)
+    real_stamp = write_source_stamp
+
+    def stamp(path):
+        order.append("stamp")
+        return real_stamp(path)
+
+    monkeypatch.setattr("hermes_cli.source_stamp.write_source_stamp", stamp)
+
+    assert complete_source_checkout(
+        root, desktop=False, assume_yes=True, announce="\n✓ Code updated!",
+    )
+    order.append("banner" if "Code updated!" in capsys.readouterr().out else "silent")
+    assert order == ["maintenance", "stamp", "banner"]
+
+
+def test_stamp_failure_is_not_a_successful_update(tmp_path, monkeypatch, capsys):
+    root = _repo(tmp_path)
+    _completion_dependencies(monkeypatch, lambda **_kwargs: True)
+
+    def stamp(_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("hermes_cli.source_stamp.write_source_stamp", stamp)
+
+    assert complete_source_checkout(
+        root, desktop=False, assume_yes=True, announce="\n✓ Code updated!",
+    ) is False
+    assert "Code updated!" not in capsys.readouterr().out
+
+
 def test_failed_source_completion_does_not_publish_identity(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     _completion_dependencies(monkeypatch, lambda **_kwargs: False)
@@ -216,3 +257,62 @@ def test_full_checkout_refreshes_release_tags_before_publishing_identity(tmp_pat
     assert stamp is not None
     assert (stamp["baseVersion"], stamp["distance"]) == (versions[1][1], 1)
     assert stamp["commit"] == commit == git(checkout, "rev-parse", "HEAD")
+
+
+def test_finish_prints_success_only_after_a_terminal_receipt(tmp_path, monkeypatch, capsys):
+    """``hermes update`` announces success after the terminal receipt exists."""
+    from hermes_cli import update_completion
+
+    home = tmp_path / "home"
+    receipt_dir = home / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    update_id = "receipt-order"
+    order: list[str] = []
+
+    def finalize(code, reason):
+        order.append("finalize")
+        (receipt_dir / f"update_x_{update_id}.json").write_text(
+            json.dumps({"update_id": update_id, "finished_at": "t", "exit_code": code}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(update_completion, "_complete_selected", lambda request: order.append("complete"))
+    monkeypatch.setattr("pm.receipt.accept_worker_receipt", lambda data, update_id: None)
+    monkeypatch.setattr("hermes_cli.update_receipt.record_stage", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.update_receipt.finalize_pending_update_receipt", finalize)
+
+    request = {
+        "receipt": {"update_id": update_id},
+        "pm_receipt": {"update_id": update_id},
+        "gateway_mode": False,
+        "windows_resume": None,
+        "home": str(home),
+    }
+    code = update_completion._finish(request, tmp_path / "result.json")
+
+    assert code == 0
+    assert order == ["complete", "finalize"]
+    assert "✓ Code updated!" in capsys.readouterr().out
+
+
+def test_finish_without_a_terminal_receipt_does_not_announce_success(tmp_path, monkeypatch, capsys):
+    from hermes_cli import update_completion
+
+    monkeypatch.setattr(update_completion, "_complete_selected", lambda request: None)
+    monkeypatch.setattr("pm.receipt.accept_worker_receipt", lambda data, update_id: None)
+    monkeypatch.setattr("hermes_cli.update_receipt.record_stage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.finalize_pending_update_receipt", lambda code, reason: None,
+    )
+    request = {
+        "receipt": {"update_id": "missing"},
+        "pm_receipt": None,
+        "gateway_mode": False,
+        "windows_resume": None,
+        "home": str(tmp_path / "home"),
+    }
+
+    code = update_completion._finish(request, tmp_path / "result.json")
+
+    assert code == 1
+    assert "Code updated!" not in capsys.readouterr().out

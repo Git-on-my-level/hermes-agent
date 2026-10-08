@@ -67,17 +67,11 @@ def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:
 
 def command_argv(argv: list[str]) -> list[str]:
     """Subcommand and its arguments, excluding top-level flags and their values."""
+    from hermes_cli.profile_argv import command_positionals
+
     required, optional = top_level_value_flag_sets()
     value_flags = required | optional | {flag for flag, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value}
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == "--":
-            return argv[i + 1:]
-        if not token.startswith("-"):
-            return argv[i:]
-        i += 2 if "=" not in token and token in value_flags and i + 1 < len(argv) else 1
-    return []
+    return command_positionals(argv, value_flags)
 
 
 def _inherited_flag(parser, *args, **kwargs):
