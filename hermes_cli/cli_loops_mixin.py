@@ -700,6 +700,14 @@ class CLILoopsMixin:
         mgr = self._get_goal_manager()
         if mgr is None:
             return
+        # Steering for the judge: the last user message, if this turn ran under an existing goal
+        # (continuations are filtered out by evaluate_after_turn).
+        owner_message = None
+        if mgr.has_goal():
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "user":
+                    owner_message = msg.get("content") if isinstance(msg.get("content"), str) else None
+                    break
         # goals.auto_infer (CLI): a goal-less turn whose reply commits to work seeds an inferred goal.
         if not mgr.has_goal():
             try:
@@ -759,7 +767,8 @@ class CLILoopsMixin:
         except Exception:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+            owner_message=owner_message)
         _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

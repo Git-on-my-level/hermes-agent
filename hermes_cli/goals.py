@@ -61,6 +61,15 @@ _GATE_OUTPUT_TAIL_CHARS = 3000
 # from SessionDB so every surface (CLI/TUI/gateway) feeds the judge the same evidence without
 # call-site changes. Bounded so a tool-heavy turn cannot bloat the judge prompt.
 _TOOL_ACTIVITY_MAX_ITEMS = 12
+# Owner steering kept for the judge: the newest messages only, each clipped.
+OWNER_MESSAGES_MAX = 6
+_OWNER_MESSAGE_CHARS = 600
+# Machine-authored user turns: never steering. Matched near the start because the gateway may
+# prepend a sender label ("[David] [Continuing toward ..."); the notification footer can be anywhere.
+_SYNTHETIC_TURN_MARKERS = (
+    "[Continuing toward your standing goal", "[Heartbeat", "[Goal heartbeat ", "[IMPORTANT: Background process",
+)
+_INTERNAL_NOTIFICATION_MARKER = "[INTERNAL NOTIFICATION"
 _TOOL_ACTIVITY_ARG_KEYS = ("path", "command", "query", "url", "name", "pattern", "task_id")
 JUDGE_TOOL_ACTIVITY_BLOCK_TEMPLATE = (
     "Tool activity observed during the agent's most recent turn (host-observed, "
@@ -132,8 +141,11 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, the agent's host-observed tool activity for that "
-    "turn (when present), and — when present — a list of background "
-    "processes the agent has running. Decide one of five verdicts.\n\n"
+    "turn (when present), any messages the user sent after the goal was set "
+    "(when present), and — when present — a list of background "
+    "processes the agent has running. The user's later messages are newer "
+    "than the goal text and override it where they conflict. Decide one of "
+    "five verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
@@ -203,6 +215,17 @@ JUDGE_DELEGATIONS_BLOCK_TEMPLATE = (
     "their results are delivered to it automatically when they finish.\n\n"
 )
 
+# Judge prompt block: the user's own messages since the goal was set. A stored goal/contract is a
+# snapshot; without these the judge holds the agent to text the user has since changed (an inferred
+# "do not merge" enforced after the user said "merge on green").
+JUDGE_OWNER_MESSAGES_BLOCK_TEMPLATE = (
+    "Messages the user sent after this goal was set, oldest first (the user's own words, newer "
+    "than the goal and any contract above):\n{owner_lines}\n"
+    "Where these conflict with the goal or contract, the newer message wins: work the user added "
+    "counts toward done, work the user dropped no longer counts, and anything the user explicitly "
+    "allowed is not a violation.\n\n"
+)
+
 # Judge prompt block listing running background processes (WAIT vs CONTINUE, which pid).
 JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
     "Background processes the agent currently has running (it may be waiting "
@@ -211,6 +234,7 @@ JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
 
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
+    "{owner_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
@@ -222,6 +246,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
+    "{owner_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
@@ -243,6 +268,7 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
+    "{owner_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
@@ -262,7 +288,8 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "GAP with the missing items in the reason. Do not turn missing evidence into "
     "an invented prohibition or a BLOCKED verdict.\n"
     "- If any stated Constraint was violated, the goal is NOT done — GAP if "
-    "completion was claimed, otherwise CONTINUE.\n"
+    "completion was claimed, otherwise CONTINUE. A later user message that "
+    "allowed the action lifts that Constraint.\n"
     "- If the response explains the work is genuinely unachievable or hits "
     "the stated Stop condition and needs user input, the goal is NOT done — "
     "return BLOCKED with the reason describing the block.\n"
@@ -615,6 +642,9 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # "user" (/goal), "auto" (inferred commitment), or "auto_start" (gateway prompt).
     source: str = "user"
+    # The user's own messages since the goal was set ({"at", "text"}, newest last, capped): the judge
+    # reads them as steering that overrides the stored goal/contract where they conflict.
+    owner_messages: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -638,6 +668,11 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
             source=str(data.get("source") or "user"),
+            owner_messages=[
+                {"at": float(m.get("at") or 0.0), "text": str(m.get("text") or "")}
+                for m in (data.get("owner_messages") or [])
+                if isinstance(m, dict) and str(m.get("text") or "").strip()
+            ][-OWNER_MESSAGES_MAX:],
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
@@ -1070,6 +1105,30 @@ def _format_tool_call_line(call: Any, result_by_id: dict) -> str:
     return f"- {name}{detail}{outcome}"
 
 
+def is_owner_authored_text(text: Any) -> bool:
+    """False for empty text and for machine turns (goal continuations, heartbeats, process
+    notifications) that reach the transcript as user messages."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    head = text.lstrip()[:300]
+    if any(marker in head for marker in _SYNTHETIC_TURN_MARKERS):
+        return False
+    return _INTERNAL_NOTIFICATION_MARKER not in text
+
+
+def render_owner_messages_block(owner_messages: Optional[List[Dict[str, Any]]]) -> str:
+    """Judge prompt block for the user's messages since the goal was set (``""`` when none)."""
+    lines = []
+    for m in (owner_messages or [])[-OWNER_MESSAGES_MAX:]:
+        text = " ".join(str(m.get("text") or "").split())
+        if not text:
+            continue
+        at = float(m.get("at") or 0.0)
+        stamp = safe_strftime(datetime.fromtimestamp(at, tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M") if at else "?"
+        lines.append(f"- [{stamp}] {_truncate(text, 2 * _OWNER_MESSAGE_CHARS)}")  # stored already clipped
+    return JUDGE_OWNER_MESSAGES_BLOCK_TEMPLATE.format(owner_lines="\n".join(lines)) if lines else ""
+
+
 def gather_tool_activity(session_id: Optional[str], *, max_items: int = _TOOL_ACTIVITY_MAX_ITEMS) -> str:
     """Host-observed tool calls from the session's most recent assistant turn, as a judge prompt
     block (``""`` when nothing extractable — prompts stay byte-identical to the no-evidence case).
@@ -1139,6 +1198,7 @@ def judge_goal(
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
     tool_activity: str = "",
+    owner_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1170,6 +1230,7 @@ def judge_goal(
         + _render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
         current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
+        owner_block=render_owner_messages_block(owner_messages),
     )
     if contract is not None and not contract.is_empty():
         contract_block = contract.render_block()
@@ -1762,17 +1823,33 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
+    def _note_owner_message(self, text: Optional[str]) -> bool:
+        """Keep a real user message as judge-visible steering. True when state changed."""
+        state = self._state
+        if state is None or not is_owner_authored_text(text):
+            return False
+        clipped = _truncate(str(text).strip(), _OWNER_MESSAGE_CHARS)
+        if state.owner_messages and state.owner_messages[-1].get("text") == clipped:
+            return False   # the same message seen twice (retry / re-evaluation)
+        state.owner_messages = (state.owner_messages + [{"at": time.time(), "text": clipped}])[-OWNER_MESSAGES_MAX:]
+        return True
+
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
+        owner_message: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
+        """Run gates + judge and update state. ``owner_message``: the user's own message that started
+        this turn (never a continuation, heartbeat or notification); kept for the judge as steering. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
         own continuations increment ``turns_used`` — both consume model budget."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+
+        if self._note_owner_message(owner_message):
+            self._save()
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
@@ -1796,7 +1873,7 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            tool_activity=gather_tool_activity(self.session_id),
+            tool_activity=gather_tool_activity(self.session_id), owner_messages=state.owner_messages or None,
         )
         state.last_verdict = verdict
         state.last_reason = reason

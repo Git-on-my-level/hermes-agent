@@ -148,6 +148,17 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "def test_gap_repairs_once_then_pauses_and_persists(",
         "fork: completion-gap escalation regression",
     ),
+    ("hermes_cli/goals.py", "JUDGE_OWNER_MESSAGES_BLOCK_TEMPLATE", "fork: owner steering reaches the goal judge"),
+    (
+        "tests/hermes_cli/test_goal_owner_steering.py",
+        "def test_owner_permission_reaches_the_judge_with_the_override_rule(",
+        "fork: owner steering regression",
+    ),
+    (
+        "tests/e2e/test_goal_owner_steering_e2e.py",
+        "def test_user_message_mid_goal_is_judge_steering_and_continuations_are_not(",
+        "fork: owner steering gateway e2e",
+    ),
     (
         "tests/gateway/test_goal_status_notice.py",
         "def test_goal_notice_modes_route_levels_and_notify(",
