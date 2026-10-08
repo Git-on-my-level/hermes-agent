@@ -33,27 +33,25 @@ _READ_LIMIT = 65536
 _MAX_PID = 2**32
 _CONNECTED = {"connected", "running", "ok"}
 _RUNNING_STATES = {"running", "degraded", "starting", "draining"}
-# Top-level flags that take a value, so `hermes -p name gateway health` still matches.
-# Kept local: importing the CLI parser pulls the rest of the application.
-_VALUE_FLAGS = frozenset({
-    "-p", "--profile", "-m", "--model", "--provider", "--reasoning",
-    "-z", "--oneshot", "-t", "--toolsets", "-r", "--resume", "-s", "--skills",
-    "--usage-file", "--output-format", "--in",
-})
+
+
+def _fallback_value_flags() -> frozenset[str]:
+    """Canonical top-level value flags, without building the CLI parser."""
+    from hermes_cli._parser import (
+        PRE_ARGPARSE_INHERITED_FLAGS,
+        _OPTIONAL_VALUE_FLAGS_FALLBACK,
+        _VALUE_FLAGS_FALLBACK,
+    )
+
+    inherited = {flag for flag, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value}
+    return _VALUE_FLAGS_FALLBACK | _OPTIONAL_VALUE_FLAGS_FALLBACK | inherited
 
 
 def command_tokens(argv: list[str]) -> list[str]:
-    """Positional argv, skipping a fixed set of value flags. Does not import the CLI parser."""
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
-            return argv[index + 1:]
-        if token.startswith("-"):
-            index += 2 if "=" not in token and token in _VALUE_FLAGS and index + 1 < len(argv) else 1
-            continue
-        return argv[index:]
-    return []
+    """Positional argv using the shared walk and the parser's fallback flag snapshot."""
+    from hermes_cli.profile_argv import command_positionals
+
+    return command_positionals(argv, _fallback_value_flags())
 
 
 def maybe_run_readonly_health(argv: list[str]) -> int | None:
@@ -65,18 +63,30 @@ def maybe_run_readonly_health(argv: list[str]) -> int | None:
 
 
 def explicit_profile_name(argv: list[str]) -> str | None:
-    """``-p``/``--profile`` before ``--``. Does not import the CLI parser or profile store."""
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
+    """``-p``/``--profile`` before ``--``, skipping values owned by other flags.
+
+    Uses the same walk as ``hermes_cli.main._scan_profile_flag`` and the parser's
+    fallback flag snapshot, so this probe does not build the CLI parser. An invalid
+    explicit name raises ``_ProfileUnusable`` instead of borrowing another home.
+    A flag after a subcommand that is not a profile id is ignored, matching the CLI.
+    """
+    from hermes_cli._parser import _OPTIONAL_VALUE_FLAGS_FALLBACK, _VALUE_FLAGS_FALLBACK
+    from hermes_cli.profile_argv import scan_profile_flag
+
+    found = scan_profile_flag(argv, _VALUE_FLAGS_FALLBACK, _OPTIONAL_VALUE_FLAGS_FALLBACK)
+    if found.rejected:
+        if found.saw_subcommand or found.option_looking:
             return None
-        if token in {"-p", "--profile"} and index + 1 < len(argv):
-            return argv[index + 1].strip().casefold()
-        if token.startswith("--profile="):
-            return token.split("=", 1)[1].strip().casefold()
-        index += 1
-    return None
+        raise _ProfileUnusable(f"hermes: {found.rejected!r} is not a profile name")
+    if found.name is not None and not _profile_id(found.name):
+        raise _ProfileUnusable(f"hermes: {found.name!r} is not a profile name")
+    return found.name
+
+
+def _profile_id(name: str) -> bool:
+    from hermes_constants import PROFILE_ID_RE
+
+    return PROFILE_ID_RE.fullmatch(name) is not None
 
 
 class _ProfileUnusable(Exception):
@@ -107,6 +117,56 @@ def home_for_explicit_profile(name: str | None) -> Path:
     return candidate
 
 
+def home_for_health_invocation(argv: list[str]) -> Path:
+    """Home a ``gateway health`` invocation observes.
+
+    Explicit ``-p``/``--profile`` wins. Otherwise a root ``HERMES_HOME`` follows the
+    sticky ``active_profile`` file, with the same supervisor / Desktop SSH / s6
+    exceptions as ``hermes_cli.main._apply_profile_override``. A missing file means
+    no selection. A saved name that is not a live profile is an error: health does
+    not report the default home's readiness in its place. Recovery commands such as
+    ``profile use default`` are not this probe, and this function does not apply
+    their fallback.
+    """
+    from hermes_cli.profile_argv import sticky_profile_applies
+    from hermes_constants import (
+        PROFILE_ID_RE,
+        get_default_hermes_root,
+        get_process_hermes_home,
+        named_profile_is_live,
+    )
+
+    name = explicit_profile_name(argv)
+    if name is not None:
+        return home_for_explicit_profile(name)
+    current = get_process_hermes_home()
+    if current.parent.name == "profiles" or not sticky_profile_applies(argv):
+        return current
+    root = get_default_hermes_root()
+    text, evidence = _read_bounded(root / "active_profile")
+    if evidence == "missing":
+        return current
+    if evidence != "ok" or text is None:
+        raise _ProfileUnusable(
+            "hermes: saved active_profile cannot be read; health will not borrow the default home"
+        )
+    selected = text.strip().casefold()
+    if not selected or selected == "default":
+        return root
+    if PROFILE_ID_RE.fullmatch(selected) is None:
+        raise _ProfileUnusable(
+            f"hermes: saved profile {selected!r} is not a profile name; "
+            "health will not borrow the default home"
+        )
+    candidate = root / "profiles" / selected
+    if not named_profile_is_live(candidate):
+        raise _ProfileUnusable(
+            f"hermes: saved profile {selected!r} is not a live profile; "
+            "health will not borrow the default home"
+        )
+    return candidate
+
+
 def main(argv: list[str] | None = None) -> int:
     """Print one JSON document on stdout. Exit 0 when the probe itself succeeded.
 
@@ -124,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     source = Path(__file__).resolve().parents[1]
     try:
-        home = home_for_explicit_profile(explicit_profile_name(args))
+        home = home_for_health_invocation(args)
     except _ProfileUnusable as exc:
         print(str(exc), file=sys.stderr)
         return 2

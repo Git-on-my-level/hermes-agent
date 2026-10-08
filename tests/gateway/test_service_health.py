@@ -261,6 +261,22 @@ def _oversized() -> int:
     return _READ_LIMIT + 10
 
 
+def test_profile_scan_skips_foreign_values_and_passthrough():
+    from hermes_cli._parser import _OPTIONAL_VALUE_FLAGS_FALLBACK, _VALUE_FLAGS_FALLBACK
+    from hermes_cli.profile_argv import scan_profile_flag
+
+    flags, optional = _VALUE_FLAGS_FALLBACK, _OPTIONAL_VALUE_FLAGS_FALLBACK
+    assert scan_profile_flag(["--model", "-p", "gateway", "health"], flags, optional).name is None
+    assert scan_profile_flag(["gateway", "health", "--", "--profile", "beta"], flags, optional).name is None
+    assert scan_profile_flag(
+        ["mcp", "add", "srv", "--args", "docker", "--profile", "other"], flags, optional,
+    ).name is None
+    selected = scan_profile_flag(
+        ["-m", "dummy", "--profile", "beta", "gateway", "health"], flags, optional,
+    )
+    assert selected.name == "beta"
+
+
 def test_nonfinite_pid_does_not_raise(tmp_path: Path):
     (tmp_path / "gateway_state.json").write_text(
         '{"pid": 1e309, "gateway_state": "running"}', encoding="utf-8",
@@ -270,8 +286,8 @@ def test_nonfinite_pid_does_not_raise(tmp_path: Path):
     assert document["phase"] != "ready"
 
 
-def test_gateway_health_entry_point_stays_on_the_named_profile(tmp_path: Path):
-    """Real ``hermes`` entry: default, named profile, default again. No home writes."""
+def test_gateway_health_entry_point_follows_explicit_and_saved_profile(tmp_path: Path):
+    """Real entry: explicit A→B→A, then a saved profile, without borrowing a bad one."""
     import os
 
     root = tmp_path / "hermes-home"
@@ -285,30 +301,67 @@ def test_gateway_health_entry_point_stays_on_the_named_profile(tmp_path: Path):
     (other / "gateway_state.json").write_text(
         json.dumps({"code_sha": "canary-b", "gateway_state": "stopped"}), encoding="utf-8",
     )
-    before = (_files(root), _files(other))
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HERMES_HOME"] = str(root)
     env["PYTHONPATH"] = str(repo) + os.pathsep + env.get("PYTHONPATH", "")
-    env.pop("HERMES_PROFILE", None)
+    for key in (
+        "HERMES_PROFILE",
+        "HERMES_SUPERVISED_CHILD",
+        "HERMES_S6_SUPERVISED_CHILD",
+        "HERMES_GATEWAY_EXTERNAL_SUPERVISOR",
+        "INVOCATION_ID",
+    ):
+        env.pop(key, None)
 
-    def invoke(args: list[str]) -> subprocess.CompletedProcess[str]:
+    def invoke(args: list[str], **extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", *args],
-            cwd=repo, env=env, capture_output=True, text=True, encoding="utf-8", timeout=60,
+            cwd=repo,
+            env=env | extra,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
         )
 
-    first = invoke(["gateway", "health"])
-    second = invoke(["--profile", "beta", "gateway", "health"])
-    third = invoke(["gateway", "health"])
+    def sees(result: subprocess.CompletedProcess[str], code: str, other_code: str) -> None:
+        assert result.returncode == 0, result.stderr
+        assert code in result.stdout and other_code not in result.stdout
 
-    assert first.returncode == 0, first.stderr
-    assert "canary-a" in first.stdout and "canary-b" not in first.stdout
-    assert second.returncode == 0, second.stderr
-    assert "canary-b" in second.stdout and "canary-a" not in second.stdout
-    assert third.returncode == 0, third.stderr
-    assert "canary-a" in third.stdout and "canary-b" not in third.stdout
-    assert (_files(root), _files(other)) == before
+    sees(invoke(["gateway", "health"]), "canary-a", "canary-b")
+    sees(invoke(["--profile", "beta", "gateway", "health"]), "canary-b", "canary-a")
+    sees(invoke(["--profile", "default", "gateway", "health"]), "canary-a", "canary-b")
+
+    (root / "active_profile").write_text("beta\n", encoding="utf-8")
+    sees(invoke(["gateway", "health"]), "canary-b", "canary-a")
+    sees(invoke(["-m", "dummy", "--profile", "default", "gateway", "health"]), "canary-a", "canary-b")
+    sees(invoke(["gateway", "health"]), "canary-b", "canary-a")
+    sees(invoke(["--reasoning", "high", "gateway", "health"]), "canary-b", "canary-a")
+    sees(invoke(["--model", "-p", "gateway", "health"]), "canary-b", "canary-a")
+
+    (root / "active_profile").write_text("default\n", encoding="utf-8")
+    sees(invoke(["gateway", "health", "--", "--profile", "beta"]), "canary-a", "canary-b")
+
+    refused = invoke(["--profile", "gone", "gateway", "health"])
+    assert refused.returncode == 2, refused.stderr
+    assert "canary-a" not in refused.stdout and "canary-b" not in refused.stdout
+
+    (root / "active_profile").write_text("gone\n", encoding="utf-8")
+    stale = invoke(["gateway", "health"])
+    assert stale.returncode == 2, stale.stderr
+    assert "canary-a" not in stale.stdout and "canary-b" not in stale.stdout
+
+    (root / "active_profile").write_text("beta\n", encoding="utf-8")
+    sees(invoke(["gateway", "health"], HERMES_SUPERVISED_CHILD="1"), "canary-a", "canary-b")
+
+    assert _files(root) == {
+        "gateway_state.json",
+        "active_profile",
+        "profiles/beta/config.yaml",
+        "profiles/beta/gateway_state.json",
+    }
+    assert _files(other) == {"config.yaml", "gateway_state.json"}
 
 
 def _files(root: Path) -> set[str]:
