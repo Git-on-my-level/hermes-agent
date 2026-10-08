@@ -518,6 +518,16 @@ if _legacy_post_swap is not None:
     raise SystemExit(_continue_legacy_post_swap(_handoff_path, argv_tail=_argv_tail))
 
 
+# Read-only health is dispatched before PM activation, launch preparation, or the
+# CLI parser. A broken dependency sync is exactly when the probe has to work.
+if "gateway" in sys.argv and "health" in sys.argv:
+    from gateway.service_health import maybe_run_readonly_health
+
+    _health_code = maybe_run_readonly_health(sys.argv[1:])
+    if _health_code is not None:
+        raise SystemExit(_health_code)
+
+
 class RelaunchExit(SystemExit):
     """Exit carrying a relaunched child's status: that child already produced this run's output,
     so callers that report their own boot failures (the Bot Chat delivery runner) must not."""

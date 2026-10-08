@@ -296,6 +296,22 @@ def _is_tail_script(root: Path, argv0: str) -> bool:
     return script.name in _TAIL_SCRIPTS and script.resolve().parent == root / "hermes_cli"
 
 
+def _is_supervised_serving_gateway(argv: list[str]) -> bool:
+    """True for the process launchd/systemd restarts to serve, not for ``hermes update``.
+
+    A supervised ``gateway`` / ``gateway run`` must reach its loop without the product
+    tail. Other supervised commands still finish that tail in place.
+    """
+    if not _supervised_child():
+        return False
+    from hermes_cli._parser import command_argv
+
+    cmd = command_argv(argv)
+    if not cmd or cmd[0] != "gateway":
+        return False
+    return len(cmd) == 1 or cmd[1] == "run"
+
+
 def _supervised_child() -> bool:
     """A launcher-marked child: booted by a manager, not a user's shell.
 
@@ -412,6 +428,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                 if not pm.venv_is_current(project_root=root):
                     # Relaunching would land back here and sync again, forever.
                     raise RuntimeError("dependency sync left this install out of date")
+            elif _is_supervised_serving_gateway(argv) and not current:
+                # The serving process syncs dependencies under its own deadline and
+                # returns to the loop. Product builds and post-update maintenance stay
+                # owed to `hermes update`; they must not run before the gateway serves.
+                from hermes_cli.serving_recovery import recover_serving_dependencies
+
+                recover_serving_dependencies(root)
             else:
                 _finish_source_update(root, current=current, pending=pending)
         finally:
