@@ -19,6 +19,7 @@ These tests pin the two halves of the fix:
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -121,5 +122,39 @@ class TestStreamedSilenceSuppression:
         adapter.delete_message.assert_awaited_once_with("chat_1", "preview_1")
         assert consumer.final_content_delivered is False
         assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_internal_note_is_held_and_then_suppressed(self):
+        """Partial text on an internal turn must not post before a trailing marker arrives."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+            internal_turn=True, session_key="agent:main:telegram:dm:1",
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checked: CI still running.\n\n")
+        await asyncio.sleep(0.3)
+        assert all("CI still running" not in text for text in _sent_and_edited(adapter))
+        consumer.on_delta("[SILENT]")
+        consumer.finish()
+        await task
+        assert all("CI still running" not in text and "[SILENT]" not in text
+                   for text in _sent_and_edited(adapter))
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_user_note_plus_marker_is_streamed(self):
+        """A real user turn keeps the exact rule, so the same note is delivered."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checked: CI still running.\n\n[SILENT]")
+        consumer.finish()
+        await task
+        assert any("CI still running" in text for text in _sent_and_edited(adapter))
 
 

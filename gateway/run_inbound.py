@@ -1418,6 +1418,22 @@ class GatewayInboundMixin:
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            # The turn handler already blanks a silent reply. This catches a handler that
+            # returned the raw text (a test double, or a path that skipped the inner filter)
+            # so an internal note-plus-marker never reaches adapter.send. The terminal turn's
+            # flag, when the handler set it, wins over the opener.
+            _silence_internal = getattr(event, "_silence_internal", is_internal)
+            if _silence_internal and isinstance(_agent_result, str):
+                from gateway.response_filters import (
+                    is_autonomous_silence_response, is_intentional_silence_response,
+                )
+                if is_autonomous_silence_response(_agent_result):
+                    if not is_intentional_silence_response(_agent_result):
+                        logger.info(
+                            "Suppressing internal reply under autonomous silence rule: session=%s",
+                            _quick_key or "unknown",
+                        )
+                    _agent_result = ""
             return _agent_result
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,

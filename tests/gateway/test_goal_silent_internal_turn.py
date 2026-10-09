@@ -32,7 +32,11 @@ async def _run_hooks(runner, text, *, internal):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["[SILENT]", " [SILENT] ", "NO_REPLY"])
+@pytest.mark.parametrize("text", [
+    "[SILENT]", " [SILENT] ", "NO_REPLY",
+    "Checked: CI still running.\n\n[SILENT]",
+    "[SILENT] but CI failed, fixing",
+])
 async def test_silent_internal_turn_is_flagged_quiet_and_loop_hook_still_runs(text):
     runner = _hooks_runner()
     await _run_hooks(runner, text, internal=True)
@@ -43,8 +47,9 @@ async def test_silent_internal_turn_is_flagged_quiet_and_loop_hook_still_runs(te
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("text", "internal"), [
     ("[SILENT]", False),
+    ("Checked: CI still running.\n\n[SILENT]", False),
     ("Still waiting on CI run 123; waker armed.", True),
-    ("[SILENT] but CI failed, fixing", True),
+    ("the lane said [SILENT] mid-sentence and kept talking", True),
 ])
 async def test_other_turns_are_not_quiet(text, internal):
     runner = _hooks_runner()

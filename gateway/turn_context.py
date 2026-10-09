@@ -19,6 +19,9 @@ class TurnContext:
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False
+    # MessageEvent.internal. Internal turns use the autonomous silence rule and do not
+    # stream the reply: a trailing marker is unknowable until the text is complete.
+    internal: bool = False
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"

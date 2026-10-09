@@ -968,8 +968,12 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
-        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
+        # Internal turns do not stream the reply: a trailing silence marker is unknowable
+        # until the text is complete. Cron decides on the finished response; progressive
+        # delivery, native streams, and tool-boundary segment finalizes would post the note.
+        quiet_until_final = ctx.scheduled_heartbeat or bool(ctx.internal)
+        want_stream_deltas = not quiet_until_final and scfg.enabled_for(plat_streaming)
+        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not quiet_until_final
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.commentary_preview import telegram_preview_channel
@@ -1015,6 +1019,7 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        internal_turn=bool(ctx.internal), session_key=ctx.session_key,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
