@@ -165,6 +165,7 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "check the deployment"
     assert event.internal is True
+    assert event.plugin_injected is True
     assert event.allow_gateway_control is False
     assert event.get_command() is None
     assert event.source == entry.origin

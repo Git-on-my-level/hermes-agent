@@ -272,13 +272,15 @@ async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_pa
         run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
         context_prompt=None, result_holder=[None])
     pending_event = SimpleNamespace(source=_source(), message_id="43", channel_prompt=None,
-                                    message_type=None, internal=True, metadata={}, reply_expected=True)
+                                    message_type=None, internal=True, plugin_injected=True,
+                                    metadata={}, reply_expected=True)
 
     merged = await gateway_run.GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None)
 
     followup = runner._run_agent.await_args.kwargs
+    assert followup["plugin_injected"] is True
     assert followup["persist_user_display_kind"] == "internal_notification"
     assert followup["reply_expected"] is True
     assert followup["persist_user_display_metadata"]["reply_expected"] is True

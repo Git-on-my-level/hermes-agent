@@ -124,13 +124,13 @@ class TestStreamedSilenceSuppression:
         assert consumer.already_sent is False
 
     @pytest.mark.asyncio
-    async def test_internal_note_is_held_and_then_suppressed(self):
-        """Partial text on an internal turn must not post before a trailing marker arrives."""
+    async def test_plugin_injected_note_is_held_and_then_suppressed(self):
+        """A plugin-injected turn holds partial text until a trailing marker can be judged."""
         adapter = _make_adapter()
         consumer = GatewayStreamConsumer(
             adapter, "chat_1",
             StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
-            internal_turn=True, session_key="agent:main:telegram:dm:1",
+            quiet_until_final=True, session_key="agent:main:telegram:dm:1",
         )
         task = asyncio.create_task(consumer.run())
         consumer.on_delta("Checked: CI still running.\n\n")
@@ -156,5 +156,46 @@ class TestStreamedSilenceSuppression:
         consumer.finish()
         await task
         assert any("CI still running" in text for text in _sent_and_edited(adapter))
+
+
+def _streaming_turn(plugin_injected: bool):
+    """A turn with interim commentary and text streaming enabled."""
+    from gateway.config import StreamingConfig
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    ctx = TurnContext(
+        internal=True, plugin_injected=plugin_injected,
+        interim_assistant_messages_enabled=True, user_config={},
+        resolve_display_setting=lambda *_args: None,
+        source=SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat_1"),
+        session_key="agent:main:telegram:dm:1", _run_still_current=lambda: True,
+    )
+    runner = SimpleNamespace(
+        config=SimpleNamespace(streaming=StreamingConfig(enabled=True)),
+        _delivery_adapter_for=lambda _source: MagicMock(SUPPORTS_MESSAGE_EDITING=True),
+        _build_stream_consumer_config=lambda *_a, **_k: (StreamConsumerConfig(), None),
+    )
+    return TurnRunner(runner, ctx)._setup_stream_consumer("telegram")
+
+
+def test_internal_notification_keeps_interim_messages():
+    """A process notice or goal wakeup is internal and still streams its work."""
+    _consumer, delta_cb, interim_cb, want_interim = _streaming_turn(plugin_injected=False)
+    agent = SimpleNamespace()
+    agent.interim_assistant_callback = interim_cb if want_interim else None
+    assert want_interim is True
+    assert agent.interim_assistant_callback is not None
+    assert delta_cb is not None
+
+
+def test_plugin_injected_turn_is_quiet_until_final():
+    """A heartbeat injection holds the reply; interim commentary is not wired."""
+    _consumer, delta_cb, interim_cb, want_interim = _streaming_turn(plugin_injected=True)
+    agent = SimpleNamespace()
+    agent.interim_assistant_callback = interim_cb if want_interim else None
+    assert want_interim is False
+    assert agent.interim_assistant_callback is None
+    assert delta_cb is None
 
 
