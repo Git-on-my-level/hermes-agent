@@ -337,8 +337,22 @@ def _turn_outcome(result: Any, error_surface: dict | None = None) -> tuple[Any, 
     return raw, status, last_reasoning
 
 
+def _goal_existed_before_turn(session: dict) -> bool:
+    """Whether a goal was already stored before this turn started.
+
+    A goal inferred from this very message was drafted from it, so it is not steering.
+    Read after the turn's profile scope is bound."""
+    from hermes_cli.goals import GoalManager
+    try:
+        return GoalManager(session_id=str(session.get("session_key") or "")).has_goal()
+    except Exception:
+        return False
+
+
 def _goal_followup_after_turn(
-    sid: str, session: dict, result: Any, status: str, raw: Any) -> str | None:
+    sid: str, session: dict, result: Any, status: str, raw: Any, *,
+    user_text: Any = None, goal_existed: bool = False, goal_continuation: bool = False,
+) -> str | None:
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
@@ -368,8 +382,16 @@ def _goal_followup_after_turn(
                 _active_deleg = count_active_delegations(getattr(session.get("agent"), "session_id", None))
             except Exception:
                 _bg_procs = None
+            # Steering only for a goal that already existed, and never for the continuation
+            # prompt this hook chains as the next turn. is_owner_authored_text still drops
+            # heartbeats and notifications if one reaches here as user_text.
+            owner_message = (
+                user_text if goal_existed and not goal_continuation and isinstance(user_text, str)
+                else None
+            )
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+                owner_message=owner_message)
             if verdict_msg := decision.get("message") or "":
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
@@ -419,12 +441,12 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
-                            on_done=None, on_error=None) -> None:
+                            on_done=None, on_error=None, goal_continuation: bool = False) -> None:
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
     release ``running``."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        _run_prompt_submit(rid, sid, session, prompt, goal_continuation=goal_continuation)
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -454,7 +476,8 @@ def _run_post_turn_followups(
             if session.get("_turn_cancel_requested"):
                 return  # the user pressed Stop; the goal resumes after their next prompt
             session["running"] = True
-        _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
+        _dispatch_followup_turn(
+            rid, sid, session, goal_followup, "goal continuation dispatch", goal_continuation=True)
     # Safety net for completion events that arrived mid-turn.  Ownership is positive-proof
     # and compression-chain aware (same fail-closed gate as the poller): session B must
     # not consume session A's event.  Unclaimable events are requeued for the poller.
@@ -502,6 +525,8 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    goal_existed: bool = False
+    goal_continuation: bool = False
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -1111,7 +1136,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, goal_continuation: bool = False) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1156,7 +1181,7 @@ def _run_prompt_submit(
         runtime_session_token = _current_runtime_session_record.set(session)
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
-            receipt_committed=terminal_callback is None)
+            receipt_committed=terminal_callback is None, goal_continuation=goal_continuation)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
@@ -1170,6 +1195,8 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            # After profile scope is bound, before the agent can infer a goal from this message.
+            st.goal_existed = _goal_existed_before_turn(session)
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
@@ -1177,7 +1204,9 @@ def _run_prompt_submit(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
             _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+            goal_followup = _goal_followup_after_turn(
+                sid, session, st.result, status, raw, user_text=text,
+                goal_existed=st.goal_existed, goal_continuation=st.goal_continuation)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the

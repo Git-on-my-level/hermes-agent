@@ -160,6 +160,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "fork: owner steering gateway e2e",
     ),
     (
+        "tui_gateway/prompt_turn.py",
+        "goal_existed and not goal_continuation",
+        "fork: TUI owner steering skips continuations and new goals",
+    ),
+    (
+        "tests/tui_gateway/test_goal_command.py",
+        "def test_user_turn_under_an_active_goal_is_owner_steering(",
+        "fork: TUI owner steering regression",
+    ),
+    (
         "gateway/response_filters.py",
         "Internal turns use the autonomous rule",
         "fork: internal turns accept a silence note",
