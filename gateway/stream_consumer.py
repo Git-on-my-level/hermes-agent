@@ -28,6 +28,7 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR)
 from gateway.response_filters import (
+    is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
@@ -122,9 +123,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        *,
+        internal_turn: bool = False,
+        session_key: Optional[str] = None):
         self.adapter = adapter
         self.chat_id = chat_id
+        # Event flag, not inferred from the text. Holds the reply until the turn ends and
+        # applies the autonomous silence rule, so a note cannot post before a trailing marker.
+        self._internal_turn = bool(internal_turn)
+        self._session_key = session_key
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
         # Hooks (exceptions swallowed): on_new_message per fresh content bubble (next
@@ -579,8 +587,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
                     self._flush_think_buffer()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
-                    # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    # preview, so retract it here instead of finalizing. Internal turns
+                    # use the autonomous rule (note on its own last line).
+                    _cleaned = self._clean_for_display(self._accumulated)
+                    _silent = (
+                        _is_autonomous_silence_response(_cleaned)
+                        if self._internal_turn
+                        else _is_intentional_silence_response(_cleaned)
+                    )
+                    if _silent:
+                        if self._internal_turn and not _is_intentional_silence_response(_cleaned):
+                            logger.info(
+                                "Suppressing internal reply under autonomous silence rule: session=%s",
+                                self._session_key or "unknown",
+                            )
                         await self._suppress_silence_marker()
                         return
 
@@ -743,7 +763,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
         """Decide whether this tick flushes an edit/frame."""
         if not tick.is_interim:
             return True
-        if self.cfg.buffer_only:
+        # Internal turns hold every interim frame. A trailing [SILENT] is unknowable until
+        # the reply is complete; posting the note first would leak it (cron never streams).
+        if self._internal_turn or self.cfg.buffer_only:
             return False
         if self._use_native_streaming:
             # No platform edit-rate limit: push every delta immediately.

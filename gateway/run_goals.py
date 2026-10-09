@@ -472,12 +472,14 @@ class GatewayGoalsMixin:
 
     @staticmethod
     def _silent_internal_turn(is_internal: bool, final_text: str) -> bool:
-        """An internal turn (process notice, plugin injection) whose reply is exactly the silence
-        marker; the goal hook then skips judging while the goal's wait barrier still holds."""
+        """An internal turn (process notice, plugin injection) whose reply is a silence marker,
+        including a short note on its own first or last line. The goal hook then skips judging
+        while the goal's wait barrier still holds. A marker buried mid-sentence is not silence.
+        ``is_internal`` is the event flag, never inferred from the text."""
         if not is_internal:
             return False
-        from gateway.response_filters import is_intentional_silence_response
-        return is_intentional_silence_response(final_text)
+        from gateway.response_filters import is_autonomous_silence_response
+        return is_autonomous_silence_response(final_text)
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:

@@ -96,9 +96,17 @@ def is_autonomous_silence_response(response: Any) -> bool:
     )
 
 
-def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers suppress delivery only for successful agent turns."""
-    return isinstance(agent_result, dict) and not agent_result.get("failed") and is_intentional_silence_response(response)
+def is_intentional_silence_agent_result(
+    agent_result: dict | None, response: Any, *, internal: bool = False,
+) -> bool:
+    """Silence markers suppress delivery only for successful agent turns.
+
+    ``internal`` is the event flag, never inferred from the text. Internal turns use the autonomous rule
+    (a marker on its own first or last line, or a bracketed marker that opens the response).
+    User turns still require an exact marker.
+    """
+    matcher = is_autonomous_silence_response if internal else is_intentional_silence_response
+    return isinstance(agent_result, dict) and not agent_result.get("failed") and matcher(response)
 
 
 def display_kind_for_event(event: Any) -> str | None:

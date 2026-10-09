@@ -26,7 +26,8 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    display_kind_for_event, is_intentional_silence_response, is_machinery_display_kind,
+    reply_expected_metadata, silence_allowed,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -395,10 +396,10 @@ class GatewayTurnMixin:
         return None
 
     @staticmethod
-    def _is_intentional_silence(agent_result, response) -> bool:
+    def _is_intentional_silence(agent_result, response, *, internal: bool = False) -> bool:
         try:
             from gateway.response_filters import is_intentional_silence_agent_result
-            return is_intentional_silence_agent_result(agent_result, response)
+            return is_intentional_silence_agent_result(agent_result, response, internal=internal)
         except Exception:
             return False
 
@@ -1505,6 +1506,7 @@ class GatewayTurnMixin:
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        internal: bool = False,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -1519,7 +1521,10 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # A queued chain's terminal turn owns the flag; a single turn uses the event's.
+        if isinstance(agent_result, dict) and "queued_terminal_internal" in agent_result:
+            internal = bool(agent_result.get("queued_terminal_internal"))
+        _intentional_silence = self._is_intentional_silence(agent_result, response, internal=internal)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
@@ -1536,6 +1541,14 @@ class GatewayTurnMixin:
             logger.debug(
                 "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
+            )
+        if (
+            _intentional_silence and internal
+            and not is_intentional_silence_response(response)
+        ):
+            logger.info(
+                "Suppressing internal reply under autonomous silence rule: session=%s",
+                session_key or "unknown",
             )
 
         # "(empty)" = the model produced no visible content after exhausting all retries. One
@@ -2210,6 +2223,7 @@ class GatewayTurnMixin:
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                internal=bool(getattr(event, "internal", False)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2225,6 +2239,11 @@ class GatewayTurnMixin:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
+                event._silence_internal = bool(
+                    agent_result["queued_terminal_internal"]
+                    if "queued_terminal_internal" in agent_result
+                    else getattr(event, "internal", False)
+                )
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -2237,6 +2256,7 @@ class GatewayTurnMixin:
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
+                internal=bool(getattr(event, "internal", False)),
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
@@ -2757,7 +2777,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, internal: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2813,8 +2833,10 @@ class GatewayTurnMixin:
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        # Internal turns do not stream: a trailing silence marker is unknowable until the
+        # reply is complete, and posting the note first would deliver it (cron never streams).
         _stream_consumer = (
-            None if scheduled_heartbeat
+            None if scheduled_heartbeat or internal
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
@@ -3760,12 +3782,19 @@ class GatewayTurnMixin:
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
+        _first_internal = bool(getattr(turn_ctx, "internal", False))
+        if self._is_intentional_silence(_delivery_result, first_response, internal=_first_internal):
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
-                logger.info(
-                    "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
-                    session_key or "?",
-                )
+                if _first_internal and not is_intentional_silence_response(first_response):
+                    logger.info(
+                        "Suppressing internal reply under autonomous silence rule: session=%s",
+                        session_key or "unknown",
+                    )
+                else:
+                    logger.info(
+                        "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                        session_key or "?",
+                    )
                 first_response = ""
             else:
                 logger.warning(
@@ -3953,6 +3982,7 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                internal=bool(getattr(pending_event, "internal", False)),
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -3977,6 +4007,7 @@ class GatewayTurnMixin:
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_internal": bool(getattr(pending_event, "internal", False)),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -4281,6 +4312,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        internal: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4290,6 +4322,7 @@ class GatewayTurnMixin:
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                internal=internal,
             )
 
         from run_agent import AIAgent
@@ -4320,12 +4353,13 @@ class GatewayTurnMixin:
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            internal=internal,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
-        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
+        if not (scheduled_heartbeat or turn_ctx.internal or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )

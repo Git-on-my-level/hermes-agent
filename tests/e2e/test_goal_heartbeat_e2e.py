@@ -80,3 +80,50 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
     finally:
         if child.poll() is None:
             child.kill()
+
+
+def _sent_texts(adapter) -> list[str]:
+    texts = []
+    for call in adapter.send.await_args_list:
+        if len(call.args) > 1:
+            texts.append(str(call.args[1]))
+        elif call.kwargs.get("content") is not None:
+            texts.append(str(call.kwargs["content"]))
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_plus_silent_stays_quiet_while_the_wait_holds():
+    """A heartbeat that answers with a note and a trailing marker is not delivered and is not judged."""
+    source = make_source(Platform.TELEGRAM)
+    entry = make_session_entry(Platform.TELEGRAM, source)
+    runner = make_runner(Platform.TELEGRAM, entry)
+    runner._run_post_turn_hooks = GatewayRunner._run_post_turn_hooks.__get__(runner)
+    runner._handle_message_with_agent = AsyncMock(
+        return_value="Checked: CI still running.\n\n[SILENT]")
+    adapter = make_adapter(Platform.TELEGRAM, runner)
+
+    mgr = goals.GoalManager(session_id=entry.session_id)
+    mgr.set("ship the release")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        mgr.wait_on(child.pid, reason="CI watcher")
+        mgr._state.waiting_since = time.time() - 3600
+        mgr._save()
+        judge = patch("hermes_cli.goals.judge_goal", side_effect=_judge_done)
+        with judge as judge_mock:
+            await adapter.handle_message(MessageEvent(
+                text="[Goal heartbeat 1/3 — no session activity for 50m; goal waiting on pid]",
+                message_type=MessageType.TEXT, source=source, internal=True, allow_gateway_control=False,
+            ))
+            await _settle(runner._handle_message_with_agent, 1)
+            assert judge_mock.call_count == 0, "a note-plus-marker turn judged a goal whose wait still holds"
+            state = goals.load_goal(entry.session_id)
+            assert state.status == "active" and state.waiting_on_pid == child.pid
+            assert state.turns_used == 0
+            sent = _sent_texts(adapter)
+            assert not any("CI still running" in s or "[SILENT]" in s or "Goal" in s or "Continuing" in s
+                           for s in sent), sent
+    finally:
+        if child.poll() is None:
+            child.kill()

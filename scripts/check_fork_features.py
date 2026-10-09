@@ -160,6 +160,41 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "fork: owner steering gateway e2e",
     ),
     (
+        "gateway/response_filters.py",
+        "Internal turns use the autonomous rule",
+        "fork: internal turns accept a silence note",
+    ),
+    (
+        "gateway/run_goals.py",
+        "return is_autonomous_silence_response(final_text)",
+        "fork: internal silence includes a trailing note",
+    ),
+    (
+        "gateway/run_turn.py",
+        "Suppressing internal reply under autonomous silence rule: session=%s",
+        "fork: logged suppression of an internal silence note",
+    ),
+    (
+        "gateway/run_turn_runner.py",
+        "Internal turns do not stream the reply",
+        "fork: internal turns do not stream a silence note",
+    ),
+    (
+        "gateway/stream_consumer.py",
+        "if self._internal_turn or self.cfg.buffer_only:",
+        "fork: internal streams hold the reply until the silence marker",
+    ),
+    (
+        "tests/gateway/test_gateway_silence_tokens.py",
+        "def test_internal_note_plus_silent_is_not_delivered(",
+        "fork: internal note-plus-silent is not delivered",
+    ),
+    (
+        "tests/e2e/test_goal_heartbeat_e2e.py",
+        "def test_heartbeat_note_plus_silent_stays_quiet_while_the_wait_holds(",
+        "fork: e2e note-plus-silent heartbeat",
+    ),
+    (
         "tests/gateway/test_goal_status_notice.py",
         "def test_goal_notice_modes_route_levels_and_notify(",
         "fork: goal notice verbosity regression",
