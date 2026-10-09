@@ -1958,7 +1958,7 @@ class GatewayInboundMixin:
 
         await adapter.handle_message(MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
-            allow_gateway_control=False,
+            allow_gateway_control=False, plugin_injected=True,
             metadata={
                 "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,

@@ -186,13 +186,18 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ),
     (
         "gateway/run_turn_runner.py",
-        "Internal turns do not stream the reply",
-        "fork: internal turns do not stream a silence note",
+        "Plugin-injected turns do not stream the reply",
+        "fork: plugin injections do not stream a silence note",
     ),
     (
         "gateway/stream_consumer.py",
-        "if self._internal_turn or self.cfg.buffer_only:",
-        "fork: internal streams hold the reply until the silence marker",
+        "if self._quiet_until_final or self.cfg.buffer_only:",
+        "fork: plugin injections hold the reply until the silence marker",
+    ),
+    (
+        "gateway/platforms/event.py",
+        "plugin_injected: bool = False",
+        "fork: plugin injection is marked on the event",
     ),
     (
         "tests/gateway/test_gateway_silence_tokens.py",

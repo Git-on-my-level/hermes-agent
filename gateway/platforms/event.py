@@ -101,6 +101,10 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Set only by plugin message injection. Those turns stay quiet until the reply is finished
+    # (a trailing silence marker is unknowable while text is streaming). Other internal turns
+    # — process notices, goal wakeups — still stream. The silence rule itself uses ``internal``.
+    plugin_injected: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

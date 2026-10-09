@@ -125,13 +125,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
         *,
-        internal_turn: bool = False,
+        quiet_until_final: bool = False,
         session_key: Optional[str] = None):
         self.adapter = adapter
         self.chat_id = chat_id
-        # Event flag, not inferred from the text. Holds the reply until the turn ends and
-        # applies the autonomous silence rule, so a note cannot post before a trailing marker.
-        self._internal_turn = bool(internal_turn)
+        # Plugin-injected turns only. Holds every interim frame and applies the autonomous
+        # silence rule at the end, so a note cannot post before a trailing marker. Other
+        # internal turns stream; their final reply is filtered on the delivery path.
+        self._quiet_until_final = bool(quiet_until_final)
         self._session_key = session_key
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
@@ -587,16 +588,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
                     self._flush_think_buffer()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
-                    # preview, so retract it here instead of finalizing. Internal turns
-                    # use the autonomous rule (note on its own last line).
+                    # preview, so retract it here instead of finalizing. A plugin-injected
+                    # turn held until now uses the autonomous rule (note on its own last line).
                     _cleaned = self._clean_for_display(self._accumulated)
                     _silent = (
                         _is_autonomous_silence_response(_cleaned)
-                        if self._internal_turn
+                        if self._quiet_until_final
                         else _is_intentional_silence_response(_cleaned)
                     )
                     if _silent:
-                        if self._internal_turn and not _is_intentional_silence_response(_cleaned):
+                        if self._quiet_until_final and not _is_intentional_silence_response(_cleaned):
                             logger.info(
                                 "Suppressing internal reply under autonomous silence rule: session=%s",
                                 self._session_key or "unknown",
@@ -763,9 +764,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
         """Decide whether this tick flushes an edit/frame."""
         if not tick.is_interim:
             return True
-        # Internal turns hold every interim frame. A trailing [SILENT] is unknowable until
-        # the reply is complete; posting the note first would leak it (cron never streams).
-        if self._internal_turn or self.cfg.buffer_only:
+        # Plugin-injected turns hold every interim frame. A trailing [SILENT] is unknowable
+        # until the reply is complete; posting the note first would leak it (cron never streams).
+        if self._quiet_until_final or self.cfg.buffer_only:
             return False
         if self._use_native_streaming:
             # No platform edit-rate limit: push every delta immediately.

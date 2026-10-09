@@ -2224,6 +2224,7 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
                 internal=bool(getattr(event, "internal", False)),
+                plugin_injected=bool(getattr(event, "plugin_injected", False)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2777,7 +2778,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False, internal: bool = False,
+        scheduled_heartbeat: bool = False, plugin_injected: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2833,10 +2834,10 @@ class GatewayTurnMixin:
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
-        # Internal turns do not stream: a trailing silence marker is unknowable until the
-        # reply is complete, and posting the note first would deliver it (cron never streams).
+        # Plugin-injected turns do not stream: a trailing silence marker is unknowable until
+        # the reply is complete, and posting the note first would deliver it (cron never streams).
         _stream_consumer = (
-            None if scheduled_heartbeat or internal
+            None if scheduled_heartbeat or plugin_injected
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
@@ -3983,6 +3984,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
                 internal=bool(getattr(pending_event, "internal", False)),
+                plugin_injected=bool(getattr(pending_event, "plugin_injected", False)),
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4313,6 +4315,7 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
         internal: bool = False,
+        plugin_injected: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4322,7 +4325,7 @@ class GatewayTurnMixin:
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
-                internal=internal,
+                plugin_injected=plugin_injected,
             )
 
         from run_agent import AIAgent
@@ -4354,12 +4357,15 @@ class GatewayTurnMixin:
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
             internal=internal,
+            plugin_injected=plugin_injected,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
-        if not (scheduled_heartbeat or turn_ctx.internal or turn_ctx.mute_notification_reply):
+        # Quiet until the reply is finished: a scheduled heartbeat, a plugin injection (a trailing
+        # silence marker is unknowable mid-stream), or a muted diagnostic wake. Other internal
+        # turns still speak as they work.
+        if not (scheduled_heartbeat or turn_ctx.plugin_injected or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )
