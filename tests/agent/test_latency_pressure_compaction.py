@@ -275,3 +275,123 @@ def test_compressor_ctor_rejects_bool_threshold():
         latency_pressure_threshold_seconds=True,  # would coerce to 1.0s if unguarded
     )
     assert c.latency_pressure_threshold_seconds == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Automatic-compaction guards must still stop latency-pressure compaction
+# ---------------------------------------------------------------------------
+
+
+def test_latency_pressure_respects_automatic_compaction_guards():
+    """Anti-thrash and structural no-op backoff suppress leftover slowness samples.
+
+    ``should_compress`` is False both under threshold and when those breakers trip;
+    the latency-pressure trigger must not treat that False as permission to compact.
+    """
+    c = _compressor(latency_pressure_threshold_seconds=120)
+    _feed(c, [(300.0, 400_000), (300.0, 450_000), (240.0, 500_000)])
+    assert c.latency_pressure() is True
+
+    c._ineffective_compression_count = 2
+    assert c.latency_pressure() is False
+
+    c._ineffective_compression_count = 0
+    assert c.latency_pressure() is True
+
+    c._record_structural_no_op("empty window")
+    assert c.latency_pressure() is False
+
+
+@pytest.mark.asyncio
+async def test_preflight_ignores_latency_pressure_when_automatic_compaction_blocked():
+    """Even with leftover slow samples (mocked pressure True), a tripped breaker
+    must stop the turn-start preflight from running lossy compaction."""
+    from agent.turn_context_compaction import run_turn_start_compaction
+
+    compressor = _compressor(latency_pressure_threshold_seconds=120)
+    compressor.threshold_tokens = 1_114_000
+    compressor.context_length = 1_310_720
+    compressor.should_compress = MagicMock(return_value=False)
+    compressor.should_defer_preflight_to_real_usage = lambda _tokens: False
+    compressor.get_active_compression_failure_cooldown = lambda: None
+    compressor.snapshot_preflight_display_tokens = None
+    compressor.maybe_seed_preflight_display_tokens = None
+    compressor.latency_pressure = lambda: True
+    compressor._ineffective_compression_count = 2
+    agent = _preflight_agent(compressor)
+    agent._compress_context = MagicMock()
+    msgs = [{"role": "user", "content": f"msg {i}"} for i in range(8)]
+    out = run_turn_start_compaction(
+        agent, messages=msgs, system_message=None, active_system_prompt="sys",
+        conversation_history=None, current_turn_user_idx=7, user_message="msg 7",
+        effective_task_id="t",
+    )
+    assert not agent._compress_context.called
+    assert out.compressed is False
+
+
+# ---------------------------------------------------------------------------
+# Latency samples are the successful attempt, not the retry-loop wall clock
+# ---------------------------------------------------------------------------
+
+
+def test_latency_sample_uses_successful_attempt_not_retry_loop_wall_time():
+    """429/overload backoff lives on the retry-loop clock (``api_duration``);
+    the sample must use the successful HTTP attempt instead."""
+    from agent.turn_usage import record_response_usage
+
+    c = _compressor(latency_pressure_threshold_seconds=120)
+    agent = SimpleNamespace(
+        model="glm-5.3-flash", provider="zai", api_mode="chat_completions",
+        base_url="https://x", api_key="", context_compressor=c, client=None,
+        _session_db=None, verbose_logging=False, quiet_mode=True,
+        session_api_calls=0, session_estimated_cost_usd=0.0, session_id="s1",
+        platform="cli", log_prefix="", _safe_print=lambda *a, **k: None,
+        _last_api_attempt_duration=5.0, session_cost_status=None, session_cost_source=None,
+        _last_prompt_size_tokens=0, _last_turn_usage=None,
+        _api_latency_history=None, _api_output_history=None, _usage_anchor=None,
+        _current_streamed_assistant_text="",
+    )
+    for name in ("prompt", "completion", "total", "input", "output", "cache_read", "cache_write", "reasoning"):
+        setattr(agent, f"session_{name}_tokens", 0)
+    response = SimpleNamespace(
+        usage={"prompt_tokens": 400_000, "completion_tokens": 10, "total_tokens": 400_010}
+    )
+    record_response_usage(
+        agent, response, messages=[{"role": "user", "content": "hi"}],
+        api_call_count=1, api_duration=180.0, compression_attempts=0, max_compression_attempts=3,
+    )
+    assert len(c.api_latency_samples) == 1
+    assert c.api_latency_samples[0][1] == 5.0
+    assert c.api_latency_samples[0][2] == 400_000
+
+
+def test_perform_api_call_stamps_successful_attempt_duration(monkeypatch):
+    """The attempt stamp is the HTTP call, not prior retry backoff."""
+    import agent.turn_api_call as turn_api_call
+    from agent.turn_api_call import perform_api_call
+
+    clock = {"t": 10.0}
+    monkeypatch.setattr(turn_api_call.time, "time", lambda: clock["t"])
+
+    def _fake_middleware(*_a, **_k):
+        clock["t"] += 7.5
+        return SimpleNamespace(usage=None)
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware", _fake_middleware
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions", _disable_streaming=True,
+        _model_request_active=None, _pending_redirect_lock=None, _pending_redirect=None,
+        _has_pending_redirect=lambda: False, session_id="s", platform="cli",
+        model="m", provider="p", base_url="http://x", thinking_callback=None,
+        is_subagent=False, _fallback_index=0,
+    )
+    perform_api_call(
+        agent, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[],
+        _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
+        retry_count=0, api_call_count=1, api_request_id="r",
+        effective_task_id="t", turn_id="turn", interrupted=False,
+    )
+    assert agent._last_api_attempt_duration == 7.5

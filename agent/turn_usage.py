@@ -126,12 +126,14 @@ def record_response_usage(
     )
     # Pass the observed request latency explicitly: latency samples are recorded only for
     # real-usage responses with a caller-provided duration (the no-usage branch above and
-    # codex_runtime's `{}` updates must never re-record a stale duration). Plugin context
-    # engines may wrap update_from_response with the legacy one-arg signature — detect that
-    # from the signature (never a blind except TypeError, which would swallow internal
-    # errors AND call a stateful engine twice). A MagicMock reports (*args, **kwargs) and
-    # would accept the kwarg into its side_effect's TypeError, so also probe the
-    # side_effect's own signature when present.
+    # codex_runtime's `{}` updates must never re-record a stale duration). Prefer the
+    # successful-attempt stamp (``_last_api_attempt_duration``) over ``api_duration``:
+    # the latter is the retry-loop clock and includes 429/overload backoff that
+    # compaction cannot fix. Plugin context engines may wrap update_from_response with
+    # the legacy one-arg signature — detect that from the signature (never a blind
+    # except TypeError, which would swallow internal errors AND call a stateful engine
+    # twice). A MagicMock reports (*args, **kwargs) and would accept the kwarg into its
+    # side_effect's TypeError, so also probe the side_effect's own signature when present.
     _target = getattr(compressor.update_from_response, "side_effect", None) or (
         compressor.update_from_response
     )
@@ -142,8 +144,13 @@ def record_response_usage(
         )
     except (TypeError, ValueError):
         _accepts_latency = False
+    _attempt_duration = getattr(agent, "_last_api_attempt_duration", None)
+    if isinstance(_attempt_duration, (int, float)) and not isinstance(_attempt_duration, bool):
+        _latency_seconds = max(0.0, float(_attempt_duration))
+    else:
+        _latency_seconds = api_duration
     if _accepts_latency:
-        compressor.update_from_response(usage_dict, api_latency_seconds=api_duration)
+        compressor.update_from_response(usage_dict, api_latency_seconds=_latency_seconds)
     else:
         compressor.update_from_response(usage_dict)
     # Usage-anchored accounting: snapshot exact provider usage against the durable

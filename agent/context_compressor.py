@@ -3142,10 +3142,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         triggers a lossy compaction. The rolling window is reaped on read, so a caller
         that skips ``_record_api_latency_sample`` still sees fresh data.
         See ``latency_pressure_min_context_tokens`` for the context floor; the samples
-        carry the REAL prompt counts.
+        carry the REAL prompt counts. Automatic-compaction breakers (anti-thrash,
+        structural no-op backoff, summary-failure cooldown) also suppress this: leftover
+        slowness samples must not keep firing lossy compaction once those guards trip.
         """
         threshold = float(getattr(self, "latency_pressure_threshold_seconds", 0.0) or 0.0)
         if threshold <= 0:
+            return False
+        if self._automatic_compression_blocked():
             return False
         now = time.monotonic()
         window = self.LATENCY_SAMPLE_WINDOW_SECONDS

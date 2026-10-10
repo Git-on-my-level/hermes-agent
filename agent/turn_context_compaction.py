@@ -311,10 +311,21 @@ def _preflight_compression(
         # recent calls crawled (median over a rolling window, opt-in
         # ``compression.latency_pressure_threshold_seconds``) asks for compaction — huge
         # serving-side contexts can be slow long before the catalog window is "full".
+        # Honor the same automatic-compaction breakers as the token trigger: anti-thrash
+        # and structural no-op backoff exist to stop compact-forever loops, and leftover
+        # slowness samples must not override them.
+        _auto_blocked_fn = getattr(_compressor, "_automatic_compression_blocked", None)
+        _auto_blocked = False
+        if callable(_auto_blocked_fn):
+            try:
+                _auto_blocked = _auto_blocked_fn() is True
+            except Exception:
+                _auto_blocked = False
         if (
             not _should_compress_now
             and not _compression_cooldown
             and not _preflight_deferred
+            and not _auto_blocked
             and callable(getattr(_compressor, "latency_pressure", None))
         ):
             try:
