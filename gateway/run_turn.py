@@ -1937,7 +1937,9 @@ class GatewayTurnMixin:
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
-            logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            # Per-wake delivery decision on internal watcher turns — DEBUG to keep it out of the
+            # default log when an autonomous lane emits [SILENT] once per completion wake.
+            logger.debug("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
         adapter = self._delivery_adapter_for(source)
@@ -3671,6 +3673,16 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            # Coalesce an all-internal backlog into ONE follow-up turn: background-process watchers
+            # and other internal wakes enqueue one FIFO event each, and a long-running turn (multi-minute
+            # API calls on a big context) can finish with a dozen of them pending. Running each as its
+            # own turn re-sends the full context per event just for the model to answer another silence
+            # marker. Every event still runs — nothing is dropped or reordered — but the model sees
+            # them as a single numbered batch and answers once.
+            if pending_event is not None and bool(getattr(pending_event, "internal", False)):
+                pending_event = self._coalesce_internal_followups(
+                    session_key, adapter, pending_event
+                )
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -3763,6 +3775,46 @@ class GatewayTurnMixin:
             pending = None
         return pending_event, pending
 
+    def _coalesce_internal_followups(
+        self, session_key: str, adapter: Any, head: Any
+    ) -> Any:
+        """Merge the queued all-internal follow-up backlog into ``head`` for one combined turn.
+
+        ``head`` is already dequeued and internal; drain further internal-only events from the FIFO
+        overflow (and the pending slot once the overflow is exhausted) and fold their texts into
+        ``head``. A non-internal (human / plugin / external) event anywhere in the queue stops the
+        coalescing — it keeps its own turn, in arrival order.
+
+        FIFO order note: after ``_promote_queued_event`` the pending slot holds the event that
+        would have run as the NEXT turn (promoted out of the overflow head), so the merge order
+        is head → slot → overflow; draining the overflow before the slot would emit events out
+        of order.
+        """
+        overflow = self._overflow_queue(session_key)
+        merged: list[str] = []
+        if adapter is not None and hasattr(adapter, "_pending_messages"):
+            slot = adapter._pending_messages.get(session_key)
+            if slot is not None and bool(getattr(slot, "internal", False)):
+                adapter._pending_messages.pop(session_key, None)
+                merged.append(slot.text or "")
+        if overflow:
+            while overflow:
+                nxt = overflow[0]
+                if not bool(getattr(nxt, "internal", False)):
+                    break
+                merged.append(overflow.pop(0).text or "")
+        if not merged:
+            return head
+        head_text = (head.text or "").rstrip()
+        parts = [head_text] if head_text else []
+        parts.extend(text.rstrip() for text in merged if (text or "").strip())
+        head.text = "\n\n".join(parts)
+        logger.info(
+            "Coalesced %d queued internal follow-up(s) into one turn for session %s",
+            len(merged), session_key or "?",
+        )
+        return head
+
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> None:
@@ -3792,7 +3844,7 @@ class GatewayTurnMixin:
                         session_key or "unknown",
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                         session_key or "?",
                     )
@@ -3866,8 +3918,12 @@ class GatewayTurnMixin:
             _active[session_key].clear()
 
         # Cap recursion depth (user keeps sending while the agent keeps failing).
-        # (#816)
-        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+        # (#816) Internal completion drains are not interrupts — a busy-window with a dozen
+        # background-completion follow-ups must still drain, so exempt them from the cap
+        # (their volume is bounded by the drain's internal coalescing instead).
+        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH and not bool(
+            getattr(pending_event, "internal", False)
+        ):
             logger.warning(
                 "Interrupt recursion depth %d reached for session %s — "
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
@@ -3975,7 +4031,15 @@ class GatewayTurnMixin:
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
-                run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                run_generation=run_generation,
+                # The interrupt cap (#816) bounds how many TIMES a runaway interrupt cycle re-enters
+                # _run_agent. A queued internal follow-up is not a new interrupt: it is this turn's
+                # own completion drain. Charging it to the cap let a long turn with a dozen watcher
+                # completions hit depth 3 and strand the rest of the queue one wake per busy-window.
+                _interrupt_depth=(
+                    _interrupt_depth if bool(getattr(pending_event, "internal", False))
+                    else _interrupt_depth + 1
+                ),
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,

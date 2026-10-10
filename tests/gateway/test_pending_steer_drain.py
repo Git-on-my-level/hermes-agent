@@ -73,12 +73,20 @@ async def test_accepted_steer_and_events_drain_once_in_order(kind):
         if event is not None:
             delivered_events.append(event)
         result = {"final_response": "done"}
-    assert delivered == expected
-    if events:
-        assert delivered_events == events
-        for original, actual in zip(events, delivered_events):
-            assert original is actual
-            assert actual.channel_prompt == "pinned"
+    if kind == "internal":
+        # Internal completion wakes coalesce into ONE follow-up turn (in FIFO order) — a
+        # busy-window with a dozen watcher completions must not re-send the full context
+        # once per wake just for the model to answer another silence marker.
+        expected = ["accepted correction", "event 0\n\nevent 1\n\nevent 2"]
+        assert delivered == expected
+        assert len(delivered_events) == 1 and delivered_events[0] is events[0]
+    else:
+        assert delivered == expected
+        if events:
+            assert delivered_events == events
+            for original, actual in zip(events, delivered_events):
+                assert original is actual
+                assert actual.channel_prompt == "pinned"
     assert runner._queue_depth(key, adapter=adapter) == 0
 
 
