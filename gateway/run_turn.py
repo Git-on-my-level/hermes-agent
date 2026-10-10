@@ -3677,8 +3677,8 @@ class GatewayTurnMixin:
             # and other internal wakes enqueue one FIFO event each, and a long-running turn (multi-minute
             # API calls on a big context) can finish with a dozen of them pending. Running each as its
             # own turn re-sends the full context per event just for the model to answer another silence
-            # marker. Every event still runs — nothing is dropped or reordered — but the model sees
-            # them as a single numbered batch and answers once.
+            # marker. Every event still runs — nothing is dropped or reordered — but compatible events
+            # merge into one batch the model answers once.
             if pending_event is not None and bool(getattr(pending_event, "internal", False)):
                 pending_event = self._coalesce_internal_followups(
                     session_key, adapter, pending_event
@@ -3775,34 +3775,52 @@ class GatewayTurnMixin:
             pending = None
         return pending_event, pending
 
+    # Internal-drain chain bound: coalescing bounds an EXISTING backlog, but a lane that
+    # starts a new watcher per turn (or receives internal injections continuously) would
+    # otherwise chain internal turns at unchanged interrupt depth forever, pinning every
+    # suspended caller. Each batch may recurse up to this many times before the next
+    # internal event is left queued for the normal post-turn promotion path.
+    _MAX_INTERNAL_DRAIN_DEPTH = 8
+
     def _coalesce_internal_followups(
-        self, session_key: str, adapter: Any, head: Any
+        self, session_key: str, adapter: Any, head: Any, _drain_depth: int = 0
     ) -> Any:
-        """Merge the queued all-internal follow-up backlog into ``head`` for one combined turn.
+        """Merge compatible internal follow-ups into ``head`` for one combined turn.
 
-        ``head`` is already dequeued and internal; drain further internal-only events from the FIFO
-        overflow (and the pending slot once the overflow is exhausted) and fold their texts into
-        ``head``. A non-internal (human / plugin / external) event anywhere in the queue stops the
-        coalescing — it keeps its own turn, in arrival order.
+        ``head`` is already dequeued and internal. The merge is FIFO-ordered (head → slot →
+        overflow; after ``_promote_queued_event`` the slot holds the NEXT event) and stops at
+        the first incompatible item:
 
-        FIFO order note: after ``_promote_queued_event`` the pending slot holds the event that
-        would have run as the NEXT turn (promoted out of the overflow head), so the merge order
-        is head → slot → overflow; draining the overflow before the slot would emit events out
-        of order.
+        - a non-internal event (human / plugin / external) keeps its own turn;
+        - an event with different delivery policy — ``plugin_injected``, or a different
+          diagnostic/notification muting category — is never absorbed (text-only merging
+          would drop the muting flags and could silence a visible completion or un-hold a
+          plugin's streaming contract).
+
+        When the slot is consumed and overflow remains, the overflow head is re-staged into
+        the slot (promotion parity, #28503) so later arrivals cannot jump the remaining
+        overflow while this turn runs.
         """
         overflow = self._overflow_queue(session_key)
         merged: list[str] = []
         if adapter is not None and hasattr(adapter, "_pending_messages"):
             slot = adapter._pending_messages.get(session_key)
-            if slot is not None and bool(getattr(slot, "internal", False)):
+            if slot is not None:
+                if not self._internal_events_batchable(head, slot):
+                    return head
                 adapter._pending_messages.pop(session_key, None)
                 merged.append(slot.text or "")
         if overflow:
             while overflow:
                 nxt = overflow[0]
-                if not bool(getattr(nxt, "internal", False)):
+                if not self._internal_events_batchable(head, nxt):
                     break
                 merged.append(overflow.pop(0).text or "")
+            # Slot must not stay empty while overflow remains: an arrival during this
+            # turn's delivery/preparation awaits would land in the slot and run ahead of
+            # the overflow (FIFO jump).
+            if overflow and adapter is not None and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages[session_key] = overflow.pop(0)
         if not merged:
             return head
         head_text = (head.text or "").rstrip()
@@ -3814,6 +3832,25 @@ class GatewayTurnMixin:
             len(merged), session_key or "?",
         )
         return head
+
+    @staticmethod
+    def _internal_events_batchable(head: Any, candidate: Any) -> bool:
+        """True when ``candidate`` (already internal) may merge into ``head``'s turn.
+
+        Delivery policy must match: plugin-injected turns hold streaming until silence
+        detection, and diagnostic muting rides ``metadata['notification_category']`` —
+        text-only merging would drop whichever flag differs. Also rejects non-internal
+        candidates so callers can use it as the single gate.
+        """
+        if not bool(getattr(candidate, "internal", False)):
+            return False
+        if bool(getattr(candidate, "plugin_injected", False)) != bool(
+            getattr(head, "plugin_injected", False)
+        ):
+            return False
+        head_meta = getattr(head, "metadata", None) or {}
+        cand_meta = getattr(candidate, "metadata", None) or {}
+        return head_meta.get("notification_category") == cand_meta.get("notification_category")
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
@@ -3919,11 +3956,31 @@ class GatewayTurnMixin:
 
         # Cap recursion depth (user keeps sending while the agent keeps failing).
         # (#816) Internal completion drains are not interrupts — a busy-window with a dozen
-        # background-completion follow-ups must still drain, so exempt them from the cap
-        # (their volume is bounded by the drain's internal coalescing instead).
-        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH and not bool(
-            getattr(pending_event, "internal", False)
-        ):
+        # background-completion follow-ups must still drain, so exempt them from the cap.
+        # Their chain is bounded separately (_MAX_INTERNAL_DRAIN_DEPTH below): coalescing
+        # bounds an existing backlog, this bounds continuous arrivals.
+        _is_internal_followup = bool(getattr(pending_event, "internal", False))
+        if _is_internal_followup:
+            _internal_drain_depth = int(getattr(turn_ctx, "_internal_drain_depth", 0) or 0)
+            if _internal_drain_depth >= self._MAX_INTERNAL_DRAIN_DEPTH:
+                logger.warning(
+                    "Internal drain depth %d reached for session %s — leaving the queued "
+                    "internal follow-up for the post-turn promotion path.",
+                    _internal_drain_depth, session_key,
+                )
+                # Re-queue the event (front of the FIFO) so nothing is dropped; the
+                # in-flight chain unwinds and the normal promotion path owns the rest.
+                if adapter is not None and hasattr(adapter, "_pending_messages"):
+                    pending_overflow = self._overflow_queue(session_key)
+                    if pending_overflow is not None:
+                        pending_overflow.insert(0, pending_event)
+                    else:
+                        adapter._pending_messages[session_key] = pending_event
+                return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+            _internal_drain_depth += 1
+        else:
+            _internal_drain_depth = 0
+        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH and not _is_internal_followup:
             logger.warning(
                 "Interrupt recursion depth %d reached for session %s — "
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
@@ -4040,6 +4097,7 @@ class GatewayTurnMixin:
                     _interrupt_depth if bool(getattr(pending_event, "internal", False))
                     else _interrupt_depth + 1
                 ),
+                _internal_drain_depth=_internal_drain_depth,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
@@ -4370,6 +4428,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
+        _internal_drain_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
@@ -4411,6 +4470,7 @@ class GatewayTurnMixin:
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
+            _internal_drain_depth=_internal_drain_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
