@@ -321,31 +321,40 @@ def _preflight_compression(
                 _auto_blocked = _auto_blocked_fn() is True
             except Exception:
                 _auto_blocked = False
+        # Gate 1 — the guard must be the REAL implementation: a MagicMock (test double) or
+        # a plugin engine stub without the method returns a truthy Mock, which would
+        # spuriously fire the trigger. isinstance is checked lazily to avoid a module-level
+        # import cycle.
         if (
             not _should_compress_now
             and not _compression_cooldown
             and not _preflight_deferred
             and not _auto_blocked
-            and callable(getattr(_compressor, "latency_pressure", None))
         ):
-            try:
-                _latency_pressed = bool(_compressor.latency_pressure())
-            except Exception:
-                _latency_pressed = False
-            if _latency_pressed:
-                _should_compress_now = True
-                _latency_threshold = float(
-                    getattr(_compressor, "latency_pressure_threshold_seconds", 0.0) or 0.0
-                )
-                _trigger_reason = (
-                    f"latency pressure: median recent-call latency >= {_latency_threshold:.0f}s"
-                )
-                logger.info(
-                    "Preflight compression: latency pressure on ~%s tokens below the %s token "
-                    "threshold (median recent-call latency >= %.0fs; model %s, ctx %s)",
-                    f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
-                    _latency_threshold, agent.model, f"{_compressor.context_length:,}",
-                )
+            _latency_fn = getattr(_compressor, "latency_pressure", None)
+            _is_builtin = False
+            if callable(_latency_fn):
+                from agent.context_compressor import ContextCompressor as _CC
+                _is_builtin = isinstance(_compressor, _CC)
+            if _is_builtin:
+                try:
+                    _latency_pressed = bool(_latency_fn())
+                except Exception:
+                    _latency_pressed = False
+                if _latency_pressed:
+                    _should_compress_now = True
+                    _latency_threshold = float(
+                        getattr(_compressor, "latency_pressure_threshold_seconds", 0.0) or 0.0
+                    )
+                    _trigger_reason = (
+                        f"latency pressure: median recent-call latency >= {_latency_threshold:.0f}s"
+                    )
+                    logger.info(
+                        "Preflight compression: latency pressure on ~%s tokens below the %s token "
+                        "threshold (median recent-call latency >= %.0fs; model %s, ctx %s)",
+                        f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
+                        _latency_threshold, agent.model, f"{_compressor.context_length:,}",
+                    )
     if _should_compress_now:
         # Managed local runtime: growing the window beats compressing (ladder order;
         # same seam as _maybe_grow_local_window in the loop).
