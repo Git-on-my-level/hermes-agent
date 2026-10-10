@@ -11,6 +11,7 @@ model/provider. Logger name stays ``agent.conversation_loop`` for caplog parity.
 from __future__ import annotations
 
 import logging
+import inspect
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -126,10 +127,24 @@ def record_response_usage(
     # Pass the observed request latency explicitly: latency samples are recorded only for
     # real-usage responses with a caller-provided duration (the no-usage branch above and
     # codex_runtime's `{}` updates must never re-record a stale duration). Plugin context
-    # engines may wrap update_from_response with the legacy one-arg signature — fall back.
+    # engines may wrap update_from_response with the legacy one-arg signature — detect that
+    # from the signature (never a blind except TypeError, which would swallow internal
+    # errors AND call a stateful engine twice). A MagicMock reports (*args, **kwargs) and
+    # would accept the kwarg into its side_effect's TypeError, so also probe the
+    # side_effect's own signature when present.
+    _target = getattr(compressor.update_from_response, "side_effect", None) or (
+        compressor.update_from_response
+    )
     try:
+        _sig = inspect.signature(_target)
+        _accepts_latency = "api_latency_seconds" in _sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        _accepts_latency = False
+    if _accepts_latency:
         compressor.update_from_response(usage_dict, api_latency_seconds=api_duration)
-    except TypeError:
+    else:
         compressor.update_from_response(usage_dict)
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter

@@ -198,22 +198,45 @@ def test_explicit_latency_required_for_sampling():
 
 
 def test_even_count_median_uses_true_middle_average():
+    """Thresholds sit BETWEEN the true median and the upper-middle so an
+    upper-middle (buggy) implementation flips both assertions."""
     c = _compressor(latency_pressure_threshold_seconds=120)
-    # 4 samples: sorted [60, 240, 240, 300] -> median (240+240)/2 = 240 >= 120 fires.
-    _feed(c, [(60.0, 400_000), (300.0, 450_000), (240.0, 500_000), (240.0, 500_000)])
+    # sorted [60, 100, 200, 300]: true median (100+200)/2 = 150 >= 120 fires;
+    # upper-middle would say 200 — also fires, so this pins the fire side weakly...
+    # the discriminating case is below.
+    _feed(c, [(300.0, 400_000), (60.0, 450_000), (100.0, 500_000), (200.0, 500_000)])
     assert c.latency_pressure() is True
-    # sorted [10, 20, 100, 110] -> median 60 < 120 does not.
-    _feed(c, [(10.0, 400_000), (100.0, 450_000), (20.0, 500_000), (110.0, 500_000)])
+    # sorted [10, 100, 130, 140]: true median (100+130)/2 = 115 < 120 must NOT fire,
+    # but an upper-middle implementation returns 130 >= 120 and would.
+    _feed(c, [(10.0, 400_000), (140.0, 450_000), (100.0, 500_000), (130.0, 500_000)])
     assert c.latency_pressure() is False
 
 
 def test_committed_compaction_resets_the_latency_epoch():
+    """Going through a real compress() COMMIT clears the evidence; a FAILED attempt
+    (summary failure with abort_on_summary_failure) preserves it."""
     c = _compressor(latency_pressure_threshold_seconds=120)
+    c._session_id = ""  # no durable session state in unit scope
     _feed(c, [(300.0, 400_000), (300.0, 450_000), (240.0, 500_000)])
     assert c.latency_pressure() is True
-    # A committed compaction (compression_count bump site) clears the evidence:
-    c.api_latency_samples = []
+    msgs = [{"role": "user", "content": f"msg {i}"} for i in range(10)]
+    c._summarize_window = lambda *a, **k: "summary of the older turns."
+    out = c.compress(msgs, current_tokens=500_000)
+    assert c.compression_count == 1 and out is not msgs
+    assert c.api_latency_samples == []
     assert c.latency_pressure() is False
+
+    # A failed attempt does NOT clear: summary failure + abort keeps the evidence.
+    c2 = _compressor(latency_pressure_threshold_seconds=120, abort_on_summary_failure=True)
+    c2._session_id = ""
+    _feed(c2, [(300.0, 400_000), (300.0, 450_000), (240.0, 500_000)])
+    c2._summarize_window = lambda *a, **k: None  # summary failure
+    before = list(c2.api_latency_samples)
+    try:
+        c2.compress(msgs, current_tokens=500_000)
+    except Exception:
+        pass
+    assert c2.api_latency_samples == before
 
 
 def test_session_reset_clears_samples():

@@ -5684,11 +5684,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         spared = _pending_tool_round(compressed) if spare_pending_images else range(0)
         compressed = self._reappend_inflight_user_task(compressed, self._find_inflight_user_task(messages))
         self.compression_count += 1
-        # A committed compaction resets the latency-pressure epoch: the next trigger needs
-        # fresh post-compaction samples, so a recovered context cannot re-compact off the
-        # pre-compaction slowness evidence (the window's stale samples would otherwise keep
-        # the median above threshold).
-        self.api_latency_samples = []
         # Replace historical image payloads with placeholders; multi-MB base64 blobs otherwise
         # exceed body limits.
         # Replace image parts in all compressed messages before the newest image-bearing user turn with a
@@ -5733,6 +5728,12 @@ Write only the summary body. Do not include any preamble or prefix."""
         # supersede/defrag content it lacks; the next micro pass rehydrates from the batch marker.
         self._reset_micro_compact_cursor_state()
         self._reset_proactive_prune_rearm()
+        # A COMMITTED compaction resets the latency-pressure epoch: the next trigger needs
+        # fresh post-compaction samples, so a recovered context cannot re-compact off the
+        # pre-compaction slowness evidence. Placed at finalize-return — after every abort /
+        # feasibility-skip / summary-failure early return above — so a cancelled or failed
+        # attempt preserves the evidence.
+        self.api_latency_samples = []
         return compressed
 
     def compress(
