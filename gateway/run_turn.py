@@ -3783,7 +3783,7 @@ class GatewayTurnMixin:
     _MAX_INTERNAL_DRAIN_DEPTH = 8
 
     def _coalesce_internal_followups(
-        self, session_key: str, adapter: Any, head: Any, _drain_depth: int = 0
+        self, session_key: str, adapter: Any, head: Any
     ) -> Any:
         """Merge compatible internal follow-ups into ``head`` for one combined turn.
 
@@ -3968,14 +3968,27 @@ class GatewayTurnMixin:
                     "internal follow-up for the post-turn promotion path.",
                     _internal_drain_depth, session_key,
                 )
-                # Re-queue the event (front of the FIFO) so nothing is dropped; the
-                # in-flight chain unwinds and the normal promotion path owns the rest.
+                # Re-queue so nothing is dropped: the bounded event goes back to the SLOT
+                # (it is the oldest — it must run before anything staged after it), and a
+                # successor already staged in the slot moves to the overflow HEAD, ahead
+                # of its remaining siblings. The in-flight chain unwinds; the idle-session
+                # inbound path (orphan rescue / promotion) owns the rest.
                 if adapter is not None and hasattr(adapter, "_pending_messages"):
-                    pending_overflow = self._overflow_queue(session_key)
-                    if pending_overflow is not None:
-                        pending_overflow.insert(0, pending_event)
-                    else:
-                        adapter._pending_messages[session_key] = pending_event
+                    _slot = adapter._pending_messages
+                    _staged = _slot.get(session_key)
+                    if _staged is not None:
+                        _overflow_q = self._overflow_queue(session_key)
+                        if _overflow_q is not None:
+                            _overflow_q.insert(0, _staged)
+                        else:
+                            # Degenerate (no session state): cannot stage the successor
+                            # behind the restored event — keep it with a loud warning.
+                            logger.warning(
+                                "Internal drain bound for session %s: no overflow storage; "
+                                "the staged successor %s may run out of order or be dropped.",
+                                session_key, getattr(_staged, "message_id", "?"),
+                            )
+                    _slot[session_key] = pending_event
                 return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
             _internal_drain_depth += 1
         else:

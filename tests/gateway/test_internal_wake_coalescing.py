@@ -301,12 +301,14 @@ async def test_empty_queue_leaves_head_untouched():
 # ---------------------------------------------------------------------------
 
 
-def _followup_runner(depth: int, drain_depth: int = 0):
+def _followup_runner(depth: int, drain_depth: int = 0, overflow: list = None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
     runner._MAX_INTERRUPT_DEPTH = 3
     runner._MAX_INTERNAL_DRAIN_DEPTH = 8
+    if overflow is not None:
+        runner._overflow_queue = lambda session_key: overflow
     runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": []})
     runner._run_agent_deliver_first_response = AsyncMock()
     runner._is_goal_continuation_event = MagicMock(return_value=False)
@@ -355,17 +357,33 @@ async def test_human_followup_still_advances_interrupt_depth_and_resets_drain():
 
 
 @pytest.mark.asyncio
-async def test_internal_drain_chain_bound_requeues_and_stops():
-    """Review finding 4: continuous internal arrivals must not recurse unboundedly."""
-    runner, turn_ctx = _followup_runner(depth=0, drain_depth=8)  # at the chain bound
+async def test_internal_drain_chain_bound_restores_slot_order_and_stops():
+    """Review finding 4 + recheck finding 1: continuous internal arrivals must not recurse
+    unboundedly, and the bound handoff must preserve FIFO order for later resumption."""
     q = _Queue()
+    runner, turn_ctx = _followup_runner(depth=0, drain_depth=8, overflow=q.overflow)
     adapter = MagicMock()
-    adapter._pending_messages = q.slot
-    event = _event("another wake", internal=True, mid="m10")
+    adapter._pending_messages = q.slot  # the real overflow list stays connected
+    event = _event("older wake", internal=True, mid="m10")     # the bounded event
+    successor = _event("newer wake", internal=True, mid="m11")  # staged in the slot meanwhile
+    q.slot["agent:main:telegram:group:-1001:5"] = successor
 
     await _run_followup(runner, turn_ctx, event, adapter=adapter)
 
-    # No recursion: the chain bound hit. The event was re-queued (overflow head first), not dropped.
+    # No recursion: the chain bound hit.
     runner._run_agent.assert_not_awaited()
     key = "agent:main:telegram:group:-1001:5"
-    assert q.overflow == [event] or q.slot.get(key) is event
+    # The OLDER event is restored to the SLOT (it runs first on resumption); the staged
+    # successor moved to the overflow HEAD, ahead of any remaining siblings.
+    assert q.slot.get(key) is event
+    assert q.overflow[0] is successor
+
+    # Empty-slot variant: the event lands in the slot, nothing is lost to a detached list.
+    q2 = _Queue()
+    runner2, turn_ctx2 = _followup_runner(depth=0, drain_depth=8, overflow=q2.overflow)
+    adapter2 = MagicMock()
+    adapter2._pending_messages = q2.slot
+    lone = _event("only wake", internal=True, mid="m12")
+    await _run_followup(runner2, turn_ctx2, lone, adapter=adapter2)
+    runner2._run_agent.assert_not_awaited()
+    assert q2.slot.get(key) is lone and q2.overflow == []
