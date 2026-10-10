@@ -2782,6 +2782,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
             # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
             self._aux_context_ceiling = None
+            # Latency samples were observed on the previous runtime — a different endpoint's
+            # speed says nothing about this one's.
+            self.api_latency_samples = []
         self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
             model, context_length, provider)
         self._apply_threshold_tokens_cap()
@@ -2903,6 +2906,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
+        latency_pressure_threshold_seconds: float = 0.0,
+        latency_pressure_min_context_tokens: int = 0,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2980,6 +2985,18 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._context_probed = False  # True after a step-down from context error
         self.last_prompt_tokens = self.last_completion_tokens = 0
         self._reset_real_usage_pairing()
+        # Latency-pressure record (rolling window over completed real-usage API calls):
+        # (monotonic_ts, duration_seconds, prompt_tokens). Feeds the opt-in
+        # latency_pressure guard — a provider whose calls crawl long before the token
+        # threshold (huge serving-side contexts on oversized catalog windows) can ask
+        # for compaction on observed slowness alone.
+        self.api_latency_samples: List[Tuple[float, float, int]] = []
+        self.latency_pressure_threshold_seconds: float = 0.0
+        # Config: minimum REAL prompt tokens a sample must carry to count toward latency
+        # pressure (0 = no floor).
+        self.latency_pressure_min_context_tokens: int = int(latency_pressure_min_context_tokens or 0)
+        # Config: opt-in trigger. 0/negative = disabled.
+        self.latency_pressure_threshold_seconds = max(0.0, float(latency_pressure_threshold_seconds or 0.0))
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
         self._session_id: str = ""
@@ -2995,6 +3012,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         self._apply_real_prompt_verdict()
+        self._record_api_latency_sample()
         # Consume the flag once real usage arrives even without prompt_tokens, so it can't stay armed.
         self._verify_compaction_cleared_threshold = self.awaiting_real_usage_after_compression = False
 
@@ -3084,6 +3102,50 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         if self.last_real_prompt_tokens >= self.threshold_tokens:
             return False
         return not self._provider_omits_usage
+
+    # Latency-pressure rolling window: only recent completed real-usage calls count.
+    LATENCY_SAMPLE_WINDOW_SECONDS = 600.0
+    LATENCY_SAMPLE_MIN_COUNT = 3
+
+    def _record_api_latency_sample(self) -> None:
+        """Record this response's latency against its real prompt count (rolling window)."""
+        now = time.monotonic()
+        window = self.LATENCY_SAMPLE_WINDOW_SECONDS
+        self.api_latency_samples = [
+            s for s in getattr(self, "api_latency_samples", []) if now - s[0] <= window
+        ]
+        self.api_latency_samples.append(
+            (now, float(getattr(self, "last_api_latency_seconds", 0.0) or 0.0),
+             int(self.last_prompt_tokens or 0))
+        )
+
+    def latency_pressure(self) -> bool:
+        """True when the recent completed calls crawled (opt-in guard).
+
+        Fires only with a configured threshold, enough samples to be signal, and a median
+        latency at/over it — so one slow request (a provider hiccup, a cold cache) never
+        triggers a lossy compaction. The rolling window is reaped on read, so a caller
+        that skips ``_record_api_latency_sample`` still sees fresh data.
+        See ``latency_pressure_min_context_tokens`` for the context floor; the samples
+        carry the REAL prompt counts.
+        """
+        threshold = float(getattr(self, "latency_pressure_threshold_seconds", 0.0) or 0.0)
+        if threshold <= 0:
+            return False
+        now = time.monotonic()
+        window = self.LATENCY_SAMPLE_WINDOW_SECONDS
+        min_tokens = int(getattr(self, "latency_pressure_min_context_tokens", 0) or 0)
+        samples = [
+            s for s in getattr(self, "api_latency_samples", [])
+            if now - s[0] <= window and (not min_tokens or s[2] >= min_tokens)
+        ]
+        self.api_latency_samples = samples
+        if len(samples) < self.LATENCY_SAMPLE_MIN_COUNT:
+            return False
+        durations = sorted(s[1] for s in samples)
+        mid = len(durations) // 2
+        median = durations[mid] if len(durations) % 2 else (durations[mid - 1] + durations[mid]) / 2
+        return median >= threshold
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """True when compression should run now (anti-thrash included; see :meth:`should_compress_info` for the reason)."""

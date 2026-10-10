@@ -306,6 +306,30 @@ def _preflight_compression(
         _should_compress_now = _compressor.should_compress(_preflight_tokens)
         if not _should_compress_now:
             _compress_block_reason = _blocked_compress_reason(_compressor, _preflight_tokens)
+        # Opt-in latency-pressure trigger: even below the token threshold, a provider whose
+        # recent calls crawled (median over a rolling window, opt-in
+        # ``compression.latency_pressure_threshold_seconds``) asks for compaction — huge
+        # serving-side contexts can be slow long before the catalog window is "full".
+        if (
+            not _should_compress_now
+            and not _compression_cooldown
+            and not _preflight_deferred
+            and callable(getattr(_compressor, "latency_pressure", None))
+        ):
+            try:
+                _latency_pressed = bool(_compressor.latency_pressure())
+            except Exception:
+                _latency_pressed = False
+            if _latency_pressed:
+                _should_compress_now = True
+                logger.info(
+                    "Preflight compression: latency pressure (median recent-call latency "
+                    ">= %.1fs threshold) on ~%s tokens below the %s token threshold "
+                    "(model %s, ctx %s)",
+                    float(getattr(_compressor, "latency_pressure_threshold_seconds", 0.0) or 0.0),
+                    f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
+                    agent.model, f"{_compressor.context_length:,}",
+                )
     if _should_compress_now:
         # Managed local runtime: growing the window beats compressing (ladder order;
         # same seam as _maybe_grow_local_window in the loop).

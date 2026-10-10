@@ -123,6 +123,12 @@ def record_response_usage(
     _completed_compaction_pending = bool(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
+    # Stamp the observed request latency before update_from_response() records the sample
+    # (the opt-in latency-pressure guard reads it against this response's real prompt count).
+    try:
+        compressor.last_api_latency_seconds = max(0.0, float(api_duration or 0.0))
+    except (TypeError, ValueError):
+        compressor.last_api_latency_seconds = 0.0
     compressor.update_from_response(usage_dict)
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
