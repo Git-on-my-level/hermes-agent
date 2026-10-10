@@ -2392,6 +2392,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._last_summary_fallback_used = self._last_feasibility_skip = False
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        # Latency-pressure evidence is per-session: fresh compaction requires fresh samples.
+        self.api_latency_samples = []
         # Wall-clock probe deadline; 0.0 = unarmed (durable copy re-read via _load_anti_thrash_recovery_deadline).
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
         # Observability only; never feeds the strike latch or the fallback streak.
@@ -2995,8 +2997,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Config: minimum REAL prompt tokens a sample must carry to count toward latency
         # pressure (0 = no floor).
         self.latency_pressure_min_context_tokens: int = int(latency_pressure_min_context_tokens or 0)
-        # Config: opt-in trigger. 0/negative = disabled.
-        self.latency_pressure_threshold_seconds = max(0.0, float(latency_pressure_threshold_seconds or 0.0))
+        # Config: opt-in trigger. 0/negative/disabled = off. A YAML bool is a config error,
+        # not 1.0 seconds: reject it explicitly (float(True) would silently arm a 1s trigger).
+        _lp_threshold = latency_pressure_threshold_seconds
+        if isinstance(_lp_threshold, bool):
+            _lp_threshold = 0.0
+        self.latency_pressure_threshold_seconds = max(0.0, float(_lp_threshold or 0.0))
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
         self._session_id: str = ""
@@ -3006,13 +3012,22 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
         self._clear_terminal_summary_failures()
 
-    def update_from_response(self, usage: Dict[str, Any]):
-        """Update tracked token usage from API response."""
+    def update_from_response(self, usage: Dict[str, Any], *, api_latency_seconds: Optional[float] = None):
+        """Update tracked token usage from API response.
+
+        ``api_latency_seconds``: the completed request's wall duration. Latency samples are
+        recorded ONLY for responses with real prompt usage AND an explicitly passed
+        latency — the no-usage paths (``update_from_response({})`` from codex_runtime /
+        turn_usage) must never re-record a previous request's duration against a zero
+        prompt count.
+        """
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         self._apply_real_prompt_verdict()
-        self._record_api_latency_sample()
+        if api_latency_seconds is not None and self.last_prompt_tokens > 0:
+            self.last_api_latency_seconds = max(0.0, float(api_latency_seconds))
+            self._record_api_latency_sample()
         # Consume the flag once real usage arrives even without prompt_tokens, so it can't stay armed.
         self._verify_compaction_cleared_threshold = self.awaiting_real_usage_after_compression = False
 
@@ -5669,6 +5684,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         spared = _pending_tool_round(compressed) if spare_pending_images else range(0)
         compressed = self._reappend_inflight_user_task(compressed, self._find_inflight_user_task(messages))
         self.compression_count += 1
+        # A committed compaction resets the latency-pressure epoch: the next trigger needs
+        # fresh post-compaction samples, so a recovered context cannot re-compact off the
+        # pre-compaction slowness evidence (the window's stale samples would otherwise keep
+        # the median above threshold).
+        self.api_latency_samples = []
         # Replace historical image payloads with placeholders; multi-MB base64 blobs otherwise
         # exceed body limits.
         # Replace image parts in all compressed messages before the newest image-bearing user turn with a

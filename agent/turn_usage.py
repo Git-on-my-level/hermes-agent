@@ -123,13 +123,14 @@ def record_response_usage(
     _completed_compaction_pending = bool(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
-    # Stamp the observed request latency before update_from_response() records the sample
-    # (the opt-in latency-pressure guard reads it against this response's real prompt count).
+    # Pass the observed request latency explicitly: latency samples are recorded only for
+    # real-usage responses with a caller-provided duration (the no-usage branch above and
+    # codex_runtime's `{}` updates must never re-record a stale duration). Plugin context
+    # engines may wrap update_from_response with the legacy one-arg signature — fall back.
     try:
-        compressor.last_api_latency_seconds = max(0.0, float(api_duration or 0.0))
-    except (TypeError, ValueError):
-        compressor.last_api_latency_seconds = 0.0
-    compressor.update_from_response(usage_dict)
+        compressor.update_from_response(usage_dict, api_latency_seconds=api_duration)
+    except TypeError:
+        compressor.update_from_response(usage_dict)
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
     # anchors on the turn's FIRST response: later same-turn responses inflate
