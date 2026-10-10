@@ -296,6 +296,34 @@ async def test_empty_queue_leaves_head_untouched():
     assert pending == "proc A done"
 
 
+@pytest.mark.asyncio
+async def test_draining_discards_only_the_dequeued_head_not_the_backlog():
+    """Drain discard must not drop wakes absorbed by coalescing.
+
+    `_coalesce_internal_followups` folds slot + overflow onto the dequeued head
+    before the `_draining` guard. If that runs first, restart/shutdown throws
+    the whole batch away instead of leaving later internals for queue-mode persist.
+    """
+    head = _event("proc A done", internal=True, mid="m1")
+    follower_b = _event("proc B done", internal=True, mid="m2")
+    follower_c = _event("proc C done", internal=True, mid="m3")
+    q = _Queue()
+    runner = _runner(q, head=head)
+    runner._draining = True
+    _enqueue(runner, follower_b)
+    _enqueue(runner, follower_c)
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        _result(), runner._adapter, _source(), "sess"
+    )
+
+    assert pending_event is None and pending is None
+    # Head discarded as the one event that would recurse; promotion staged B
+    # into the slot and C stays in overflow for persist.
+    assert q.slot.get("sess") is follower_b
+    assert q.overflow == [follower_c]
+
+
 # ---------------------------------------------------------------------------
 # Interrupt depth + internal drain chain bound
 # ---------------------------------------------------------------------------

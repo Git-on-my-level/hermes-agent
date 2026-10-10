@@ -3679,7 +3679,15 @@ class GatewayTurnMixin:
             # own turn re-sends the full context per event just for the model to answer another silence
             # marker. Every event still runs — nothing is dropped or reordered — but compatible events
             # merge into one batch the model answers once.
-            if pending_event is not None and bool(getattr(pending_event, "internal", False)):
+            # Skip while draining (restart/shutdown): coalescing pops every compatible slot/overflow
+            # item onto the dequeued head, and the discard below would then drop the whole batch.
+            # Pre-coalesce, only the one event that would recurse was discarded so queue-mode persist
+            # could keep the rest.
+            if (
+                pending_event is not None
+                and bool(getattr(pending_event, "internal", False))
+                and not self._draining
+            ):
                 pending_event = self._coalesce_internal_followups(
                     session_key, adapter, pending_event
                 )
