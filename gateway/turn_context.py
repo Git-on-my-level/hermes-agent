@@ -56,6 +56,11 @@ class TurnContext:
     process_task_id: str = ""
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
+    # Consecutive internal completion-drain turns (coalesced batches count as one). Not an
+    # interrupt: exempt from _MAX_INTERRUPT_DEPTH, but separately bounded by
+    # _MAX_INTERNAL_DRAIN_DEPTH so a lane with continuous internal arrivals cannot recurse
+    # unboundedly (each suspended caller stays pinned until the chain unwinds).
+    _internal_drain_depth: int = 0
     event_message_id: Optional[str] = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
