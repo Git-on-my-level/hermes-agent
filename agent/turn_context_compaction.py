@@ -278,6 +278,7 @@ def _preflight_compression(
 
     _should_compress_now = False
     _compress_block_reason = None
+    _trigger_reason: Optional[str] = None
     if _preflight_deferred:
         logger.info(
             "Skipping preflight compression: rough estimate ~%s >= %s is not anchored on "
@@ -306,6 +307,54 @@ def _preflight_compression(
         _should_compress_now = _compressor.should_compress(_preflight_tokens)
         if not _should_compress_now:
             _compress_block_reason = _blocked_compress_reason(_compressor, _preflight_tokens)
+        # Opt-in latency-pressure trigger: even below the token threshold, a provider whose
+        # recent calls crawled (median over a rolling window, opt-in
+        # ``compression.latency_pressure_threshold_seconds``) asks for compaction — huge
+        # serving-side contexts can be slow long before the catalog window is "full".
+        # Honor the same automatic-compaction breakers as the token trigger: anti-thrash
+        # and structural no-op backoff exist to stop compact-forever loops, and leftover
+        # slowness samples must not override them.
+        _auto_blocked_fn = getattr(_compressor, "_automatic_compression_blocked", None)
+        _auto_blocked = False
+        if callable(_auto_blocked_fn):
+            try:
+                _auto_blocked = _auto_blocked_fn() is True
+            except Exception:
+                _auto_blocked = False
+        # Gate 1 — the guard must be the REAL implementation: a MagicMock (test double) or
+        # a plugin engine stub without the method returns a truthy Mock, which would
+        # spuriously fire the trigger. isinstance is checked lazily to avoid a module-level
+        # import cycle.
+        if (
+            not _should_compress_now
+            and not _compression_cooldown
+            and not _preflight_deferred
+            and not _auto_blocked
+        ):
+            _latency_fn = getattr(_compressor, "latency_pressure", None)
+            _is_builtin = False
+            if callable(_latency_fn):
+                from agent.context_compressor import ContextCompressor as _CC
+                _is_builtin = isinstance(_compressor, _CC)
+            if _is_builtin:
+                try:
+                    _latency_pressed = bool(_latency_fn())
+                except Exception:
+                    _latency_pressed = False
+                if _latency_pressed:
+                    _should_compress_now = True
+                    _latency_threshold = float(
+                        getattr(_compressor, "latency_pressure_threshold_seconds", 0.0) or 0.0
+                    )
+                    _trigger_reason = (
+                        f"latency pressure: median recent-call latency >= {_latency_threshold:.0f}s"
+                    )
+                    logger.info(
+                        "Preflight compression: latency pressure on ~%s tokens below the %s token "
+                        "threshold (median recent-call latency >= %.0fs; model %s, ctx %s)",
+                        f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
+                        _latency_threshold, agent.model, f"{_compressor.context_length:,}",
+                    )
     if _should_compress_now:
         # Managed local runtime: growing the window beats compressing (ladder order;
         # same seam as _maybe_grow_local_window in the loop).
@@ -320,7 +369,8 @@ def _preflight_compression(
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
     if _should_compress_now:
         _run_preflight_passes(
-            agent, out, _compressor, _preflight_tokens, system_message, effective_task_id
+            agent, out, _compressor, _preflight_tokens, system_message, effective_task_id,
+            trigger_reason=_trigger_reason,
         )
     elif _compress_block_reason:
         # Over threshold but compression blocked: surface a deduped warning so the
@@ -346,10 +396,12 @@ def _preflight_compression(
 
 def _run_preflight_passes(
     agent: Any, out: CompactionOutcome, _compressor: Any, _preflight_tokens: int,
-    system_message: Optional[str], effective_task_id: str,
+    system_message: Optional[str], effective_task_id: str, trigger_reason: Optional[str] = None,
 ) -> None:
     """Threshold-triggered preflight passes (honor ``compression.max_attempts`` like
-    the loop's sites, default 3)."""
+    the loop's sites, default 3). ``trigger_reason``: a short human phrase for a
+    non-threshold trigger (e.g. latency pressure) — reflected in the log and the
+    user status instead of the default token-threshold wording."""
     from agent import turn_context as _tc
 
     out.compressed = True
@@ -357,16 +409,29 @@ def _run_preflight_passes(
     # warn again.
     _clear_overflow_warn(agent)
     logger.info(
-        "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-        f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}", agent.model,
+        "Preflight compression: ~%s tokens%s (model %s, ctx %s)",
+        f"{_preflight_tokens:,}",
+        (
+            f" — {trigger_reason}"
+            if trigger_reason
+            else f" >= {_compressor.threshold_tokens:,} threshold"
+        ),
+        agent.model,
         f"{_compressor.context_length:,}",
+    )
+    _default_status = (
+        (
+            "📦 Preflight compression: ~{tokens:,} tokens — {reason}. This may take a moment."
+        ).format(tokens=_preflight_tokens, reason=trigger_reason)
+        if trigger_reason
+        else PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
+            tokens=_preflight_tokens, threshold=_compressor.threshold_tokens
+        )
     )
     _preflight_status = automatic_compaction_status_message(
         _compressor,
         phase="preflight",
-        default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-            tokens=_preflight_tokens, threshold=_compressor.threshold_tokens
-        ),
+        default_message=_default_status,
         approx_tokens=_preflight_tokens,
         threshold_tokens=_compressor.threshold_tokens,
         context_length=_compressor.context_length,

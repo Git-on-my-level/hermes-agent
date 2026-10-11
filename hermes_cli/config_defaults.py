@@ -615,6 +615,16 @@ DEFAULT_CONFIG = {
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
         # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
         "proactive_prune_tokens": 0,
+        # latency_pressure_threshold_seconds: opt-in compaction trigger on OBSERVED SLOWNESS.
+        # Some serving setups crawl long before the token threshold fires (huge effective
+        # contexts behind an oversized catalog window); when set (e.g. 120) and the median
+        # latency of the last ~10 minutes of completed real-usage calls (minimum 3) reaches
+        # this many seconds, the next turn-start preflight compacts even below `threshold`.
+        # 0 = off (default). Context floor below.
+        "latency_pressure_threshold_seconds": 0,
+        # latency_pressure_min_context_tokens: only samples from calls with at least this
+        # many real prompt tokens count toward latency pressure (0 = no floor).
+        "latency_pressure_min_context_tokens": 0,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,

@@ -129,6 +129,7 @@ def perform_api_call(
     with _bracket:
         if _model_request_active is not None:
             _model_request_active.set()
+    _attempt_start = time.time()
     try:
         response = run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
@@ -138,6 +139,10 @@ def perform_api_call(
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
     finally:
+        # Successful-attempt wall time only. The retry-loop clock includes 429/overload
+        # backoff; latency-pressure samples must not, or rate-limit waits trigger
+        # lossy compaction that cannot fix those waits.
+        agent._last_api_attempt_duration = max(0.0, time.time() - _attempt_start)
         with _bracket:
             if _model_request_active is not None:
                 _model_request_active.clear()
