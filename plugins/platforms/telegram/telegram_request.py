@@ -1,32 +1,27 @@
 """Keep PTB client and Telegram fallback transport lifetimes aligned."""
 
-from collections.abc import Iterable
-
 import httpx
-from telegram.request import HTTPXRequest
-
-from .telegram_network import TelegramFallbackTransport
 
 
-class TelegramFallbackRequest(HTTPXRequest):
-    """A fresh transport belongs to each client, including orphan replacements.
+def build_fallback_request(request_type, *, transport_factory, **kwargs):
+    """Build from the adapter's SDK binding, preserving lightweight doubles.
 
-    PTB keeps constructor kwargs across shutdown/initialize and calls
-    ``_build_client`` again. Supplying a transport instance in those kwargs
-    reuses it after close; an abandoned old client's late close can also
-    poison its replacement. Build the transport at the same boundary as
-    the client instead. This PTB-private hook is shared by normal rebuilds
-    and the adapter's bounded abandoned-close recovery.
+    Real PTB keeps client kwargs across shutdown/initialize. Each client must
+    own a fresh transport, including abandoned-close replacements; a late
+    old-client close then cannot poison its replacement. Only subclass an
+    actual request type with PTB's client-building hook. Optional-SDK mocks
+    and request doubles keep their normal constructor/transport contract.
     """
 
-    __slots__ = ("_fallback_ips", "_transport_kwargs")
+    if not isinstance(request_type, type) or not callable(getattr(request_type, "_build_client", None)):
+        return request_type(**kwargs, httpx_kwargs={"transport": transport_factory()})
 
-    def __init__(self, fallback_ips: Iterable[str], *, transport_kwargs: dict, **kwargs):
-        self._fallback_ips = tuple(fallback_ips)
-        self._transport_kwargs = dict(transport_kwargs)
-        super().__init__(**kwargs)
+    class FreshTransportRequest(request_type):
+        __slots__ = ()
 
-    def _build_client(self) -> httpx.AsyncClient:
-        kwargs = dict(self._client_kwargs)
-        kwargs["transport"] = TelegramFallbackTransport(self._fallback_ips, **self._transport_kwargs)
-        return httpx.AsyncClient(**kwargs)
+        def _build_client(self) -> httpx.AsyncClient:
+            client_kwargs = dict(self._client_kwargs)
+            client_kwargs["transport"] = transport_factory()
+            return httpx.AsyncClient(**client_kwargs)
+
+    return FreshTransportRequest(**kwargs)

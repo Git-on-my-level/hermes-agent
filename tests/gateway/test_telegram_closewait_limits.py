@@ -82,13 +82,6 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
 
     if fallback_ips is not None:
         monkeypatch.setattr(adapter, "_fallback_ips", lambda: list(fallback_ips))
-        from plugins.platforms.telegram import telegram_request
-
-        def record_fallback(ips, *, transport_kwargs, **kwargs):
-            return _RecordingHTTPXRequest(
-                **kwargs, httpx_kwargs={"transport": TelegramFallbackTransport(ips, **transport_kwargs)})
-
-        monkeypatch.setattr(telegram_request, "TelegramFallbackRequest", record_fallback)
 
     # builder.request(...).get_updates_request(...).build() must be harmless;
     # make build() raise our sentinel so connect() stops right after the

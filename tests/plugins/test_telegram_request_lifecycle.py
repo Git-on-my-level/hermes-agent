@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+pytest.importorskip("telegram", reason="real python-telegram-bot required for client lifecycle tests")
+
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram import telegram_network as tnet
@@ -39,6 +41,14 @@ def adapter(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(tnet, "_build_inner_transport", lambda _kwargs: _WireTransport())
+    for name, value in {
+        "HERMES_TELEGRAM_HTTP_POOL_SIZE": "17",
+        "HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT": "11",
+        "HERMES_TELEGRAM_HTTP_READ_TIMEOUT": "23",
+        "HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT": "27",
+        "HERMES_TELEGRAM_HTTP_POOL_TIMEOUT": "9",
+    }.items():
+        monkeypatch.setenv(name, value)
     instance = tg_adapter.TelegramAdapter(PlatformConfig(enabled=True, token="123456:fixture"))
     monkeypatch.setattr(instance, "_fallback_ips", lambda: ["149.154.166.110"])
     return instance
@@ -50,6 +60,16 @@ async def _request(request, method="getUpdates"):
     assert request.parse_json_payload(payload)["ok"] is True
 
 
+def _assert_pool_contract(general, polling):
+    assert general._client._transport is not polling._client._transport
+    for request in (general, polling):
+        timeout = request._client.timeout
+        assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (11, 23, 27, 9)
+        assert request._client._transport._transport_kwargs["limits"].max_connections == 17
+    assert general._client._transport._transport_kwargs["limits"].max_keepalive_connections >= 1
+    assert polling._client._transport._transport_kwargs["limits"].max_keepalive_connections == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pool", ["general", "polling"])
 async def test_reconnect_builds_fresh_transport_for_each_client(adapter, pool):
@@ -58,6 +78,7 @@ async def test_reconnect_builds_fresh_transport_for_each_client(adapter, pool):
     request = general if pool == "general" else polling
     sibling = polling if pool == "general" else general
     try:
+        _assert_pool_contract(general, polling)
         await _request(request)
         await _request(sibling)
         old_client = request._client
@@ -71,6 +92,7 @@ async def test_reconnect_builds_fresh_transport_for_each_client(adapter, pool):
                 await request.initialize()
             # Do real I/O before identity checks: the unfixed code fails here.
             await _request(request)
+            _assert_pool_contract(general, polling)
             assert request._client._transport is not old_transport
             assert request._client is not old_client
             assert sibling._client is sibling_client
@@ -118,6 +140,7 @@ async def test_abandoned_close_cannot_close_replacement_or_interrupt_send(adapte
         await asyncio.wait_for(close_started.wait(), 5)
         await asyncio.wait_for(drain, 5)
         assert polling._client is not old_client
+        _assert_pool_contract(general, polling)
         assert general._client is general_client
         assert not send.done()
         await _request(polling)
@@ -127,6 +150,7 @@ async def test_abandoned_close_cannot_close_replacement_or_interrupt_send(adapte
         # The late close must touch only the old client's transport.
         await _request(polling)
         assert old_transport._primary_closed
+        _assert_pool_contract(general, polling)
         assert polling._client._transport is not old_transport
         send_wire.release_send.set()
         await asyncio.wait_for(send, 5)
