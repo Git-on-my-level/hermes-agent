@@ -34,6 +34,7 @@ import httpx
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.telegram_network import TelegramFallbackTransport
 
 
 class _StopConnect(Exception):
@@ -81,6 +82,13 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
 
     if fallback_ips is not None:
         monkeypatch.setattr(adapter, "_fallback_ips", lambda: list(fallback_ips))
+        from plugins.platforms.telegram import telegram_request
+
+        def record_fallback(ips, *, transport_kwargs, **kwargs):
+            return _RecordingHTTPXRequest(
+                **kwargs, httpx_kwargs={"transport": TelegramFallbackTransport(ips, **transport_kwargs)})
+
+        monkeypatch.setattr(telegram_request, "TelegramFallbackRequest", record_fallback)
 
     # builder.request(...).get_updates_request(...).build() must be harmless;
     # make build() raise our sentinel so connect() stops right after the
@@ -165,7 +173,7 @@ def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
     assert len(instances) >= 2
     for index, instance in enumerate(instances):
         transport = instance.kwargs["httpx_kwargs"]["transport"]
-        assert isinstance(transport, tg_adapter.TelegramFallbackTransport)
+        assert isinstance(transport, TelegramFallbackTransport)
         limits = transport._transport_kwargs["limits"]
         assert isinstance(limits, httpx.Limits)
         assert limits.keepalive_expiry is not None
