@@ -149,6 +149,31 @@ def test_pin_age_resets_on_new_pin(tmp_path):
     assert reset == 0.0
 
 
+def test_pin_age_channel_fallback_key_accumulates(tmp_path):
+    assert pin_age_seconds("channel", home=tmp_path, now=1000.0) == 0.0
+    assert pin_age_seconds("channel", home=tmp_path, now=1600.0) == 600.0
+
+
+def test_channel_mode_sla_clock_keyed_by_tip(tmp_path, monkeypatch):
+    from hermes_cli import update_converge as uc
+
+    monkeypatch.setattr(uc, "_state_path", lambda home=None: tmp_path / "converge_state.json")
+    tips = iter([PIN, PIN, PIN2])
+    clock = iter([1000.0, 1000.0 + 7200.0, 1000.0 + 7300.0])
+    monkeypatch.setattr(uc, "channel_tip_sha", lambda *a, **k: next(tips))
+    monkeypatch.setattr(uc.time, "time", lambda: next(clock))
+    monkeypatch.setattr(uc, "checkout_sha", lambda root: SHORT[:7] + "0" * 33)
+    monkeypatch.setattr(uc, "live_code_sha", lambda: "")
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda root: False)
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: True)
+    settings = _s(pin="", busy_sla=3600)
+    assert uc.decide_from_live(tmp_path, settings).reason == "busy"
+    # Same tip still busy after the SLA: converge proceeds instead of skipping forever.
+    assert uc.decide_from_live(tmp_path, settings).reason != "busy"
+    # A new tip restarts the grace period.
+    assert uc.decide_from_live(tmp_path, settings).reason == "busy"
+
+
 def test_linux_timer_unit_text():
     from hermes_cli.update_converge import generate_converge_systemd_timer
 
