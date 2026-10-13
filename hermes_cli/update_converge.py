@@ -171,7 +171,10 @@ def pin_age_seconds(pin: str, home: Optional[Path] = None, *, now: Optional[floa
         body = {}
     seen = str(body.get("pin") or "")
     first = body.get("first_seen")
-    if not prefixes_match(seen, pin) or not isinstance(first, (int, float)):
+    # Non-SHA keys (the "channel" fallback) never prefix-match, which used to
+    # restart the busy-SLA clock on every tick so a busy host never converged.
+    same = seen == pin or prefixes_match(seen, pin)
+    if not same or not isinstance(first, (int, float)):
         body = {"pin": pin, "first_seen": now}
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,8 +278,12 @@ def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") ->
 def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = None) -> ConvergeDecision:
     settings = settings or load_converge_settings()
     pin = settings.pin
-    age = pin_age_seconds(pin or "channel") if settings.enabled else 0.0
     target = "" if pin else channel_tip_sha(project_root, settings.remote, settings.branch)
+    # Channel mode keys the SLA clock by the tip it is converging to, so a new
+    # tip starts a fresh grace period and an old one eventually expires.
+    # "channel-unresolved" (not legacy "channel") so a stale pre-fix record can
+    # never count as an expired SLA and restart a busy gateway immediately.
+    age = pin_age_seconds(pin or target or "channel-unresolved") if settings.enabled else 0.0
     return decide_converge(
         settings=settings,
         checkout_sha=checkout_sha(project_root),
