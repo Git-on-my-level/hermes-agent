@@ -174,6 +174,26 @@ def test_channel_mode_sla_clock_keyed_by_tip(tmp_path, monkeypatch):
     assert uc.decide_from_live(tmp_path, settings).reason == "busy"
 
 
+def test_legacy_channel_record_does_not_expire_busy_sla(tmp_path, monkeypatch):
+    import json
+    from hermes_cli import update_converge as uc
+
+    state = tmp_path / "converge_state.json"
+    state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}))
+    monkeypatch.setattr(uc, "_state_path", lambda home=None: state)
+    monkeypatch.setattr(uc.time, "time", lambda: 100000.0)
+    monkeypatch.setattr(uc, "checkout_sha", lambda root: PIN)
+    monkeypatch.setattr(uc, "live_code_sha", lambda: "")
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda root: False)
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: True)
+    settings = _s(pin="", busy_sla=3600)
+    for tip in ("", PIN2):
+        state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}))
+        monkeypatch.setattr(uc, "channel_tip_sha", lambda *a, _t=tip, **k: _t)
+        decision = uc.decide_from_live(tmp_path, settings)
+        assert (decision.action, decision.reason) == ("skip", "busy")
+
+
 def test_linux_timer_unit_text():
     from hermes_cli.update_converge import generate_converge_systemd_timer
 

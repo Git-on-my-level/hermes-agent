@@ -281,7 +281,9 @@ def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = 
     target = "" if pin else channel_tip_sha(project_root, settings.remote, settings.branch)
     # Channel mode keys the SLA clock by the tip it is converging to, so a new
     # tip starts a fresh grace period and an old one eventually expires.
-    age = pin_age_seconds(pin or target or "channel") if settings.enabled else 0.0
+    # "channel-unresolved" (not legacy "channel") so a stale pre-fix record can
+    # never count as an expired SLA and restart a busy gateway immediately.
+    age = pin_age_seconds(pin or target or "channel-unresolved") if settings.enabled else 0.0
     return decide_converge(
         settings=settings,
         checkout_sha=checkout_sha(project_root),
