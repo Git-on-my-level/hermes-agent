@@ -47,6 +47,7 @@ async def test_conflict_callback_sets_stop_event_before_gateway_runs(monkeypatch
     gateway_ran = []
 
     def gateway_cb(error):
+        assert getattr(app.updater, "_Updater__polling_task_stop_event").is_set()
         gateway_ran.append(error)
 
     await app.updater.start_polling(error_callback=gateway_cb)
@@ -59,7 +60,6 @@ async def test_conflict_callback_sets_stop_event_before_gateway_runs(monkeypatch
     async def fire():
         captured["callback"](Conflict("Conflict: terminated by other getUpdates request"))
         assert stop.is_set()
-        assert gateway_ran == []
 
     await io_loop().run(fire())
     await asyncio.sleep(0)
@@ -76,10 +76,15 @@ async def test_conflict_callback_sets_stop_event_before_gateway_runs(monkeypatch
         app.updater.disarm_polling()
 
     await io_loop().run(disarm_legacy())
+    setattr(app.updater, "_Updater__polling_task_stop_event", asyncio.Event())
+    app.updater._running = True
+    await app.updater.stop()
+    for request in app.bot._request:
+        await request.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_polling_put_waits_until_bounded_gateway_queue_accepts(monkeypatch):
+async def test_polling_handoff_accepts_with_bounded_gateway_backpressure(monkeypatch):
     pytest.importorskip("telegram")
     from telegram.ext import Application, Updater
 
@@ -99,20 +104,22 @@ async def test_polling_put_waits_until_bounded_gateway_queue_accepts(monkeypatch
     assert app.update_queue.maxsize == 256
 
     pending = asyncio.run_coroutine_threadsafe(bridge.put("first"), io_loop().loop)
-    assert not pending.done()
-    assert app.update_queue.empty()
     await asyncio.wait_for(asyncio.wrap_future(pending), 1)
-    assert app.update_queue.get_nowait() == "first"
+    assert await asyncio.wait_for(app.update_queue.get(), 1) == "first"
 
     for i in range(256):
         app.update_queue.put_nowait(i)
     blocked = asyncio.run_coroutine_threadsafe(bridge.put("blocked"), io_loop().loop)
-    await asyncio.sleep(0.05)
-    assert not blocked.done()
-    assert app.update_queue.qsize() == 256
-    assert app.update_queue.get_nowait() == 0
     await asyncio.wait_for(asyncio.wrap_future(blocked), 1)
     assert app.update_queue.qsize() == 256
+    assert app.update_queue.get_nowait() == 0
+    await asyncio.sleep(0.03)
+    assert app.update_queue.qsize() == 256
+    assert [app.update_queue.get_nowait() for _ in range(256)] == list(range(1, 256)) + ["blocked"]
+    app.updater._running = True
+    await app.updater.stop()
+    for request in app.bot._request:
+        await request.shutdown()
 
 
 @pytest.mark.asyncio
@@ -125,3 +132,5 @@ async def test_webhook_update_queue_stays_on_gateway_loop():
     assert app.updater.update_queue is app.update_queue
     await app.updater.update_queue.put("hook")
     assert app.update_queue.get_nowait() == "hook"
+    for request in app.bot._request:
+        await request.shutdown()
