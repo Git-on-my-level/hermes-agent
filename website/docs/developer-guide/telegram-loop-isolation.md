@@ -2,12 +2,16 @@
 
 Telegram HTTP requests and PTB's `Updater` polling run on one dedicated
 `telegram-io` thread and asyncio loop. Application handlers and agent turns stay
-on the gateway loop. The bridge buffers at most 256 updates waiting for gateway
-admission; at capacity it pauses polling instead of dropping updates. HTTPX
-returns fully read response bytes across the request boundary, never a live
-response stream. Error and progress callbacks re-enter the gateway loop, and
-polling stop/disarm runs on the transport loop. Webhook serving remains on the
-gateway loop.
+on the gateway loop. A thread-safe handoff queue accepts each update before
+PTB advances its offset and buffers at most 256 updates. The gateway pump pauses
+transfer when the SDK queue has 256 queued items; stop drains accepted handoff
+items before Application teardown. The SDK retains its update-processor
+concurrency policy. HTTPX returns fully read response bytes across the request
+boundary. Error and progress callbacks re-enter the gateway loop, with conflict
+retry disarmed synchronously on the polling loop before deferring recovery.
+Polling stop/disarm and orphan client close run on the transport loop. Webhook
+serving retains its original gateway queue.
+
 
 The transport loop has a separate two-worker executor for TLS pool construction.
 It survives individual request shutdown/reinitialize cycles because PTB's

@@ -68,6 +68,7 @@ async def test_real_poll_and_send_continue_while_gateway_waits_on_rlock(bot_api)
     worker = threading.Thread(target=holder)
     worker.start()
     await asyncio.to_thread(held.wait)
+    before = len([c for c in calls if c[0] == 'getUpdates'])
     # Schedule the send directly on the transport loop before reproducing the
     # synchronous agent-lock stall. The fake server proves network progress.
     sent = asyncio.run_coroutine_threadsafe(app.bot.send_message(1, 'fake'), io_loop().loop)
@@ -77,6 +78,7 @@ async def test_real_poll_and_send_continue_while_gateway_waits_on_rlock(bot_api)
     elapsed = time.monotonic() - started
     assert elapsed > 0.3  # unfixed on-loop lock reproduction
     assert sent.done()
+    assert len([c for c in calls if c[0] == 'getUpdates']) > before + 3
     send_time = next(t for method, t in calls if method == 'sendMessage')
     assert send_time - started < 0.3
     await app.updater.stop()
@@ -312,3 +314,162 @@ async def test_agent_diagnostic_lock_does_not_block_transport_loop(monkeypatch):
     with pytest.raises(httpx.ConnectTimeout):
         await request
     await io_loop().run(transport.aclose())
+
+
+@pytest.mark.asyncio
+async def test_conflict_disarms_retry_before_gateway_callback(monkeypatch):
+    from telegram.ext import Updater
+    from telegram.error import Conflict
+    owner = threading.get_ident()
+    seen = []
+    async def start(self, **kwargs):
+        self._running = True
+        event = getattr(self, '_Updater__polling_task_stop_event')
+        kwargs['error_callback'](Conflict('fake conflict'))
+        assert event.is_set()
+    async def stop(self):
+        self._running = False
+    monkeypatch.setattr(Updater, 'start_polling', start)
+    monkeypatch.setattr(Updater, 'stop', stop)
+    app = Application.builder().token('123:fake').build()
+    isolate_updater(app)
+    try:
+        await app.updater.start_polling(error_callback=lambda _: seen.append(threading.get_ident()))
+        await asyncio.sleep(0)
+        assert seen == [owner]
+        await app.updater.stop()
+    finally:
+        for request in app.bot._request:
+            await request.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_webhook_keeps_gateway_owned_queue(monkeypatch):
+    from telegram.ext import Updater
+    owner = threading.get_ident()
+    app = Application.builder().token('123:fake').build()
+    async def start(self, **kwargs):
+        assert threading.get_ident() == owner
+        assert self.update_queue is original
+        await self.update_queue.put('webhook')
+    monkeypatch.setattr(Updater, 'start_webhook', start)
+    isolate_updater(app)
+    original = app.update_queue
+    try:
+        await app.updater.start_webhook()
+        assert await original.get() == 'webhook'
+    finally:
+        for request in app.bot._request:
+            await request.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handoff_is_bounded_accepts_before_ack_and_drains_on_stop(monkeypatch):
+    from telegram.ext import Updater
+    async def start(self, **kwargs):
+        self._running = True
+    async def stop(self):
+        self._running = False
+    monkeypatch.setattr(Updater, 'start_polling', start)
+    monkeypatch.setattr(Updater, 'stop', stop)
+    app = Application.builder().token('123:fake').build()
+    isolate_updater(app)
+    try:
+        await app.updater.start_polling()
+        bridge = app.updater.update_queue
+        with pytest.raises(RuntimeError):
+            await app.updater.start_polling()
+        assert app.updater.running
+        with pytest.raises(RuntimeError):
+            await app.updater.start_webhook()
+        assert app.updater.update_queue is bridge
+        async def produce():
+            for item in range(300):
+                await bridge.put(item)
+        producer = asyncio.run_coroutine_threadsafe(produce(), io_loop().loop)
+        time.sleep(0.1)  # The gateway cannot accept callbacks during this window.
+        assert bridge.pending.qsize() == 256
+        assert not producer.done()
+        assert app.update_queue.empty()
+        await asyncio.wait_for(asyncio.wrap_future(producer), 1)
+        assert app.update_queue.qsize() <= 256
+        async def consume():
+            return [await app.update_queue.get() for _ in range(300)]
+        consumer = asyncio.create_task(consume())
+        await app.updater.stop()
+        assert await consumer == list(range(300))
+    finally:
+        for request in app.bot._request:
+            await request.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_gateway_waiter_cancels_io_task():
+    started, cancelled = threading.Event(), threading.Event()
+    async def request():
+        started.set()
+        try:
+            await asyncio.sleep(100)
+        finally:
+            cancelled.set()
+    waiting = asyncio.create_task(io_loop().run(request()))
+    assert await asyncio.to_thread(started.wait, 1)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert await asyncio.to_thread(cancelled.wait, 1)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_poll_client_rebuild_and_close_use_owner_loop(monkeypatch, tmp_path):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake'))
+    request = isolate_request(HTTPXRequest())
+    await request.shutdown()
+    owner = threading.get_ident()
+    closed = []
+    built = []
+    class Client:
+        is_closed = False
+        async def aclose(self):
+            closed.append(threading.get_ident())
+            self.is_closed = True
+    old = Client()
+    request._client = old
+    def build(_):
+        built.append(threading.get_ident())
+        return Client()
+    monkeypatch.setattr(type(request), '_build_client', build)
+    await adapter._orphan_and_rebuild_polling_client(request)
+    assert request._client is not old
+    await asyncio.gather(*tuple(adapter._background_tasks))
+    assert old.is_closed
+    assert closed == [io_loop().thread.ident]
+    assert built and built[0] != owner
+    await request.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_orphan_rebuilds_do_not_accumulate_real_tcp_sockets(bot_api, monkeypatch, tmp_path):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    import psutil
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake'))
+    request = isolate_request(HTTPXRequest())
+    url, _ = bot_api
+    port = int(url.split(':')[2].split('/')[0])
+    process = psutil.Process()
+    try:
+        for _ in range(10):
+            status, _ = await request.do_request(url + '123:fake/getMe', 'POST')
+            assert status == 200
+            old = request._client
+            await adapter._orphan_and_rebuild_polling_client(request)
+            await asyncio.gather(*tuple(adapter._background_tasks))
+            assert old.is_closed
+            assert not [c for c in process.net_connections(kind='tcp') if c.raddr and c.raddr.port == port]
+    finally:
+        await request.shutdown()

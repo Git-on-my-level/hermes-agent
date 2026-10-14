@@ -7,6 +7,7 @@ agent locks, but cannot isolate the process GIL or OS scheduler starvation.
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import queue
 
 
 class TelegramIOLoop:
@@ -27,25 +28,13 @@ class TelegramIOLoop:
     async def run(self, awaitable):
         if asyncio.get_running_loop() is self.loop:
             return await awaitable
-        task_holder = []
-
-        async def tracked():
-            task_holder.append(asyncio.current_task())
-            return await awaitable
-
-        future = asyncio.run_coroutine_threadsafe(tracked(), self.loop)
+        future = asyncio.run_coroutine_threadsafe(awaitable, self.loop)
         try:
             return await asyncio.wrap_future(future)
-        finally:
-            # wrap_future cancel cannot stop a running concurrent future; cancel the
-            # I/O task on its own loop so a timed-out send cannot still deliver.
-            if not future.done():
-                def cancel_io():
-                    for task in task_holder:
-                        if task is not None and not task.done():
-                            task.cancel()
-                self.loop.call_soon_threadsafe(cancel_io)
-                future.cancel()
+        except asyncio.CancelledError:
+            # wrap_future chains cancellation; keep the ownership explicit.
+            future.cancel()
+            raise
 
 
 # Created only by gateway-loop setup, never from an agent turn.
@@ -77,16 +66,25 @@ def isolate_request(request):
         async def shutdown(self):
             return await io.run(super().shutdown())
 
+        async def rebuild_client(self):
+            async def replace():
+                old = self._client
+                self._client = await asyncio.to_thread(self._build_client)
+                return old
+            return await io.run(replace())
+
+        async def close_client(self, client):
+            return await io.run(client.aclose())
+
     request.__class__ = IsolatedRequest
     return request
 
 
 def _is_polling_conflict(error):
-    text = str(error).lower()
     return (
         error.__class__.__name__.lower() == 'conflict'
-        or 'terminated by other getupdates request' in text
-        or 'another bot instance is running' in text
+        or 'terminated by other getupdates request' in str(error).lower()
+        or 'another bot instance is running' in str(error).lower()
     )
 
 
@@ -100,64 +98,87 @@ def isolate_updater(app):
     gateway_loop = asyncio.get_running_loop()
     io = io_loop()
     original_queue = app.update_queue
-    if original_queue.maxsize == 0:
-        # Pause polling/webhook intake at 256 updates waiting for dispatch.
+    if original_queue.maxsize == 0 and original_queue.empty():
         original_queue = asyncio.Queue(maxsize=256)
         app.update_queue = original_queue
 
     class QueueBridge:
+        def __init__(self):
+            # Acceptance is synchronous into a real bounded queue, before PTB
+            # advances its offset. No update exists only as a scheduled callback.
+            self.pending = queue.Queue(maxsize=256)
+            self.task = None
+            self.closing = False
+
         async def put(self, item):
-            # Do not return to PTB (which would ack getUpdates) until the gateway
-            # queue holds the item. A bounded queue pauses polling at capacity.
-            done = asyncio.get_running_loop().create_future()
+            while True:
+                try:
+                    self.pending.put_nowait(item)
+                    return
+                except queue.Full:
+                    await asyncio.sleep(0.01)
 
-            def finish(task):
-                cancelled = task.cancelled()
-                exc = None if cancelled else task.exception()
+        async def pump(self):
+            while not self.closing or not self.pending.empty():
+                # Keep gateway admission bounded as well. Application retains
+                # its existing update-processor concurrency policy.
+                if not self.closing and original_queue.qsize() >= 256:
+                    await asyncio.sleep(0.01)
+                    continue
+                try:
+                    item = self.pending.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+                    continue
+                await original_queue.put(item)
+                self.pending.task_done()
 
-                def settle():
-                    if done.done():
-                        return
-                    if cancelled:
-                        done.cancel()
-                    elif exc is not None:
-                        done.set_exception(exc)
-                    else:
-                        done.set_result(None)
-                io.loop.call_soon_threadsafe(settle)
+        def start(self):
+            self.closing = False
+            self.task = gateway_loop.create_task(self.pump())
 
-            def deliver():
-                task = gateway_loop.create_task(original_queue.put(item))
-                task.add_done_callback(finish)
+        async def finish(self):
+            self.closing = True
+            if self.task is not None:
+                await self.task
+                self.task = None
 
-            gateway_loop.call_soon_threadsafe(deliver)
-            await done
+    bridge = QueueBridge()
 
     class IsolatedUpdater(Updater):
         async def start_polling(self, *args, **kwargs):
+            if self.running or bridge.task is not None:
+                raise RuntimeError("Telegram polling is already starting or running")
             callback = kwargs.get('error_callback')
             if callback:
-                def wrapped(error):
-                    # PTB retries unless the stop event is set before this returns.
+                def on_error(error):
+                    # PTB checks this synchronously after its callback returns.
+                    # Stop a conflicting retry before deferring gateway recovery.
                     if _is_polling_conflict(error):
                         self.disarm_polling()
                     gateway_loop.call_soon_threadsafe(callback, error)
-                kwargs['error_callback'] = wrapped
-            self.update_queue = QueueBridge()
+                kwargs['error_callback'] = on_error
+            self.update_queue = bridge
+            bridge.start()
             try:
                 await io.run(super().start_polling(*args, **kwargs))
-                return original_queue
             except BaseException:
-                self.update_queue = original_queue
+                if self.running:
+                    await io.run(super().stop())
+                await bridge.finish()
                 raise
+            return original_queue
+
+        async def start_webhook(self, *args, **kwargs):
+            if self.running or bridge.task is not None:
+                raise RuntimeError("This Updater is already running")
+            self.update_queue = original_queue
+            return await super().start_webhook(*args, **kwargs)
 
         def disarm_polling(self):
-            event = None
-            for attr in ('_Updater__polling_task_stop_event', '_polling_task_stop_event'):
-                candidate = getattr(self, attr, None)
-                if isinstance(candidate, asyncio.Event):
-                    event = candidate
-                    break
+            event = next((value for name in (
+                '_Updater__polling_task_stop_event', '_polling_task_stop_event'
+            ) if isinstance(value := getattr(self, name, None), asyncio.Event)), None)
             if event is None or event.is_set():
                 return
             try:
@@ -170,11 +191,11 @@ def isolate_updater(app):
                 io.loop.call_soon_threadsafe(event.set)
 
         async def stop(self):
+            if self._httpd is not None:
+                return await super().stop()
             try:
-                if self._httpd is not None:
-                    return await super().stop()
                 return await io.run(super().stop())
             finally:
-                self.update_queue = original_queue
+                await bridge.finish()
 
     app.updater = IsolatedUpdater(app.bot, original_queue)

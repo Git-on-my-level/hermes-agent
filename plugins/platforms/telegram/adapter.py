@@ -1735,40 +1735,30 @@ class TelegramAdapter(BasePlatformAdapter):
         ``is_closed``. If ``shutdown()`` was abandoned on a CLOSE-WAIT socket, that flag stays false and the
         next ``start_polling()`` reuses the dead getUpdates connection (#87057).
         """
-        from .telegram_io import io_loop
-        io = io_loop()
-
-        async def _rebuild():
-            old = getattr(polling_req, "_client", None)
-            build = getattr(polling_req, "_build_client", None)
-            if old is None or not callable(build) or getattr(old, "is_closed", True):
-                return None
-            try:
-                polling_req._client = build()  # noqa: SLF001
-            except Exception:
-                logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
-                return None
-            logger.warning("[%s] Replaced wedged getUpdates HTTP client after drain timeout (likely CLOSE-WAIT socket)", self.name)
-            return old
-
+        old = getattr(polling_req, "_client", None)
+        build = getattr(polling_req, "_build_client", None)
+        if old is None or not callable(build) or getattr(old, "is_closed", True):
+            return
         try:
-            old = await io.run(_rebuild())
+            rebuild = getattr(type(polling_req), 'rebuild_client', None)
+            if callable(rebuild):
+                old = await rebuild(polling_req)
+            else:
+                polling_req._client = await asyncio.to_thread(build)  # noqa: SLF001
         except Exception:
             logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
             return
-        if old is None:
-            return
-
-        async def _close_old() -> None:
-            aclose = getattr(old, "aclose", None)
-            if not callable(aclose):
-                return
-            # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
-            await _await_with_thread_deadline(aclose(), timeout=_DRAIN_TIMEOUT)
+        logger.warning("[%s] Replaced wedged getUpdates HTTP client after drain timeout (likely CLOSE-WAIT socket)", self.name)
 
         async def _orphan_aclose() -> None:
             try:
-                await io.run(_close_old())
+                aclose = getattr(old, "aclose", None)
+                if not callable(aclose):
+                    return
+                # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
+                close_on_owner = getattr(type(polling_req), 'close_client', None)
+                closing = close_on_owner(polling_req, old) if callable(close_on_owner) else aclose()
+                await _await_with_thread_deadline(closing, timeout=_DRAIN_TIMEOUT)
             except Exception:
                 logger.debug("[%s] Orphan polling client aclose failed (non-fatal)", self.name, exc_info=True)
 
