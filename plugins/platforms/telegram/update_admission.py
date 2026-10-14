@@ -190,11 +190,12 @@ def build_update_processor(extra, name: str) -> PerChatUpdateProcessor:
 
 
 class TelegramApplication(Application):
-    __slots__ = ("adapter", "_current_claim")
+    __slots__ = ("adapter", "_current_claim", "_claim_tasks")
 
     def __init__(self, *, adapter, **kwargs):
         super().__init__(**kwargs)
         self.adapter = adapter
+        self._claim_tasks = {}
         if adapter._update_admission is None:
             adapter._update_admission = ContextVar[_Claim | None]("telegram_update_claim", default=None)
         self._current_claim: ContextVar[_Claim | None] = adapter._update_admission
@@ -259,14 +260,36 @@ class TelegramApplication(Application):
             # Pin scheduled work before callback entry, including cancellation before entry.
             claim.owners += 1
 
-            def finished(done):
-                # PTB's task wrapper may never start, leaving its callback unawaited.
-                if done.cancelled() and asyncio.iscoroutine(coroutine):
-                    coroutine.close()
-                self._release_claim(claim, done)
-
-            task.add_done_callback(finished)
+            self._claim_tasks[task] = (claim, coroutine)
+            # PTB does not track tasks created while stopped. Keep a fallback
+            # for that case; settlement is idempotent when PTB also invokes it.
+            task.add_done_callback(self._settle_task_claim)
         return task
+
+    def _settle_task_claim(self, task):
+        owned = self._claim_tasks.pop(task, None)
+        if owned is None:
+            return
+        claim, coroutine = owned
+        try:
+            # Cancellation before PTB's wrapper starts leaves this unawaited.
+            if task.cancelled() and asyncio.iscoroutine(coroutine):
+                coroutine.close()
+        finally:
+            self._release_claim(claim, task)
+
+    async def stop(self):
+        try:
+            await super().stop()
+        finally:
+            # Python's gather can return immediately for already-done tasks
+            # while their done callbacks are still queued. PTB stop() therefore
+            # does not guarantee our ownership callbacks have run. Settle every
+            # finished claim before returning, including cancelled-before-entry
+            # callbacks; leave genuinely running owners pinned for safe replay.
+            for task in tuple(self._claim_tasks):
+                if task.done():
+                    self._settle_task_claim(task)
 
     def _release_claim(self, claim, task=None):
         if task is not None and task.cancelled():
