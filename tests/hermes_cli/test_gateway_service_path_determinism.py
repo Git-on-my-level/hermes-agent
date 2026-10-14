@@ -665,10 +665,13 @@ class TestSystemdUnitPath:
         env_line = next(l for l in unit.splitlines() if l.startswith('Environment="PATH='))
         raw = env_line[len('Environment="PATH='):].rstrip('"')
         entries = raw.split(":")
+        system_dirs = gateway_cli._service_system_dirs()
         assert "/usr/bin/" not in entries
-        assert entries.index(str(custom)) < entries.index("/usr/bin")
-        assert entries.count("/usr/bin") == 1
-        assert entries[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        # custom precedes every canonical system dir (they appear only in the tail).
+        assert entries.index(str(custom)) < entries.index(system_dirs[-1]) or str(custom) not in entries
+        for system_dir in system_dirs:
+            assert entries.count(system_dir) == 1
+        assert entries[-len(system_dirs):] == system_dirs
 
     def test_system_unit_reads_target_users_config_extras(self, gateway_cli, tmp_path, monkeypatch):
         """A system unit's service_path_extra must come from the TARGET user's hermes-home
