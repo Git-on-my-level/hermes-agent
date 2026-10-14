@@ -399,16 +399,20 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
     # Read through the facade so tests and the CLI flag share one seam (see AGENTS.md).
     reset_service_path = bool(getattr(_gw(), "_reset_service_path", False))
     system_dirs = _gw()._service_system_dirs()
+    normalize, strip_system = _gw()._normalize_service_path_entry, _gw()._strip_canonical_system_dirs
 
     segments: list[str] = list(priority_dirs)
 
     def _add_existing(entries: list[str]) -> None:
+        seen = {normalize(e) for e in segments}
         for entry in entries:
-            if entry in segments:
+            norm = normalize(entry)
+            if norm in seen:
                 continue
             try:
                 if os.path.isdir(entry):
                     segments.append(entry)
+                    seen.add(norm)
             except OSError:
                 continue
 
@@ -421,22 +425,36 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
         return str(Path(_gw()._stable_service_working_dir()) / entry)
 
     # Canonical system dirs never sit in mid-PATH segments — not in the tool/config head either
-    # (an operator CAN list /usr/bin in service_path_extra): the tail below appends them exactly
-    # once, in canonical order, so executable precedence is stable across regenerations.
-    segments = [d for d in segments if d not in system_dirs]
+    # (an operator CAN list /usr/bin in service_path_extra), in any spelling (/usr/bin/ counts):
+    # strip them, dedupe lexically, and append the tail once, last, so executable precedence is
+    # stable across regenerations.
+    segments = strip_system(segments, system_dirs)
+    seen_norm: set[str] = set()
+    deduped_segments: list[str] = []
+    for entry in segments:
+        norm = normalize(entry)
+        if norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        deduped_segments.append(entry)
+    segments = deduped_segments
 
     caller_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
     carried: list[str] = []
+    system_set = {normalize(d) for d in system_dirs}
     if plist_path.exists():
-        carried = [_resolve_entry(e) for e in _installed_plist_path_dirs(plist_path)]
+        carried = [normalize(_resolve_entry(e)) for e in _installed_plist_path_dirs(plist_path)]
         if not reset_service_path:
             for entry in carried:
-                if entry not in system_dirs:
+                if normalize(entry) not in system_set:
                     _add_existing([entry])
-        caller_lacking_carried = [
-            entry for entry in carried
-            if entry not in caller_entries and entry in segments and entry not in system_dirs
-        ]
+        caller_set = {normalize(e) for e in caller_entries}
+        segments_set = {normalize(e) for e in segments}
+        caller_lacking_carried = sorted(
+            e for e in carried
+            if normalize(e) not in caller_set and normalize(e) in segments_set
+            and normalize(e) not in system_set
+        )
         if caller_lacking_carried:
             # The task-spec warning: the caller env lacks an entry the installed plist has.
             logging.getLogger(__name__).warning(
@@ -444,21 +462,23 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
                 "the installed plist: %s", ", ".join(caller_lacking_carried),
             )
         if reset_service_path:
-            intentionally_dropped = [
-                e for e in carried if e not in segments and e not in system_dirs
-            ]
+            intentionally_dropped = sorted(
+                e for e in carried
+                if normalize(e) not in segments_set and normalize(e) not in system_set
+            )
             if intentionally_dropped:
                 logging.getLogger(__name__).warning(
                     "--reset-service-path: dropped installed service PATH entries not derived "
                     "from this environment: %s", ", ".join(intentionally_dropped),
                 )
 
-    segments.extend(d for d in system_dirs if d not in segments)
+    segments.extend(d for d in system_dirs if normalize(d) not in {normalize(e) for e in segments})
 
     if carried and not reset_service_path:
         # Warnings are computed against the FINAL PATH: carried system dirs land in the tail
         # above, so anything still listed here is truly absent from the service PATH.
-        dead = [e for e in carried if e not in segments]
+        final_set = {normalize(e) for e in segments}
+        dead = sorted({e for e in carried if normalize(e) not in final_set})
         if dead:
             logging.getLogger(__name__).warning(
                 "Dropping dead service PATH entries no longer present on disk: %s",

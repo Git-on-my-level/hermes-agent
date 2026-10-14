@@ -251,6 +251,50 @@ class TestLaunchdServicePath:
         assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         assert sane.count("/usr/bin") == 1
 
+    def test_equivalent_system_dir_spellings_bubble_to_tail(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """/usr/bin/ (trailing slash) is the same dir as /usr/bin: it must be stripped from
+        the head and the canonical spelling appended in the tail exactly once."""
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        sane = launchd._launchd_service_path(
+            ["/usr/bin/", str(custom)], tmp_path / "absent.plist",
+        ).split(":")
+        assert "/usr/bin/" not in sane
+        assert sane.index(custom) < sane.index("/usr/bin")
+        assert sane.count("/usr/bin") == 1
+        assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+    def test_relative_config_extra_anchors_and_stabilizes(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """A relative service_path_extra entry is anchored to the service working dir at
+        generation time, so the installed absolute spelling round-trips WITHOUT duplicating
+        (regeneration from the installed PATH yields the identical PATH)."""
+        import plistlib as _pl
+        import hermes_cli.config as config_mod
+
+        workdir = tmp_path / "service-home"
+        workdir.mkdir()
+        (workdir / "bin").mkdir()
+        monkeypatch.setattr(gateway_cli, "_stable_service_working_dir", lambda: str(workdir))
+        monkeypatch.setattr(
+            config_mod, "load_config_readonly",
+            lambda: {"gateway": {"service_path_extra": ["bin"]}},
+        )
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+        first = gateway_cli.generate_launchd_plist()
+        first_path = _pl.loads(first.encode("utf-8"))["EnvironmentVariables"]["PATH"]
+        assert str(workdir / "bin") in first_path.split(":")
+        assert "bin" != first_path.split(":")[0]
+
+        # Regenerate as if `first` were installed: identical PATH, no duplicated entry.
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        installed.write_text(first, encoding="utf-8")
+        second = gateway_cli.generate_launchd_plist()
+        assert second == first
+
     def test_relative_carry_forward_anchors_to_service_workdir(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
     ):
@@ -488,6 +532,23 @@ class TestSystemdUnitPath:
         # Round-trips through the same unquoting systemd's parsers use (see _unit_environment_value).
         unescaped = escaped.replace('\\"', '"').replace("\\\\", "\\").replace("%%", "%")
         assert unescaped.split(":")[0] == hostile or hostile in unescaped.split(":")
+
+    def test_unit_config_system_dir_bubbles_to_tail(self, gateway_cli, tmp_path, monkeypatch):
+        """The systemd unit honors the same tail contract as the plist: a canonical system dir
+        in service_path_extra (any spelling) must not precede custom dirs."""
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        monkeypatch.setattr(
+            gateway_cli, "_service_path_extra_dirs", lambda: ["/usr/bin/", str(custom)],
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        env_line = next(l for l in unit.splitlines() if l.startswith('Environment="PATH='))
+        raw = env_line[len('Environment="PATH='):].rstrip('"')
+        entries = raw.split(":")
+        assert "/usr/bin/" not in entries
+        assert entries.index(str(custom)) < entries.index("/usr/bin")
+        assert entries.count("/usr/bin") == 1
+        assert entries[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
 
 @pytest.mark.platforms("macos")

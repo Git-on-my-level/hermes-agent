@@ -3109,7 +3109,10 @@ _reset_service_path: bool = False
 def _service_path_extra_dirs() -> list[str]:
     """``gateway.service_path_extra`` — host-configured extra service PATH dirs, so hosts don't
     hand-edit plists. Entries are kept verbatim (after ``~`` expansion) even when they don't
-    exist yet: the operator knows the host. Malformed values fail open as no extra dirs."""
+    exist yet: the operator knows the host. Malformed values fail open as no extra dirs.
+    Relative entries are anchored to the service's stable working directory — the same rule
+    carry-forward applies — and every entry is lexically normalized, so generation and later
+    regeneration (which reads back the anchored absolute path) agree."""
     try:
         from hermes_cli.config import load_config_readonly
         gateway_cfg = (load_config_readonly() or {}).get("gateway", {}) or {}
@@ -3120,7 +3123,16 @@ def _service_path_extra_dirs() -> list[str]:
         raw = [raw]
     if not isinstance(raw, (list, tuple)):
         return []
-    return [os.path.expanduser(str(entry).strip()) for entry in raw if str(entry).strip()]
+    out = []
+    for entry in raw:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(entry)
+        if not os.path.isabs(expanded):
+            expanded = str(Path(_stable_service_working_dir()) / expanded)
+        out.append(os.path.normpath(expanded))
+    return out
 
 
 def _service_tool_dirs() -> list[str]:
@@ -3152,6 +3164,27 @@ def _service_system_dirs() -> list[str]:
     if sys.platform == "darwin":
         return ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     return ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+
+
+def _normalize_service_path_entry(entry: str) -> str:
+    """Lexically normalize one service PATH entry so equivalent spellings deduplicate against
+    the canonical system-dir lists: trailing slashes, ``.``/``..`` components, duplicate
+    slashes. Purely lexical (no filesystem access, no symlink resolution)."""
+    return os.path.normpath(entry) if entry else entry
+
+
+def _strip_canonical_system_dirs(entries: list[str], system_dirs: list[str]) -> list[str]:
+    """Drop canonical system dirs from *entries* (normalized comparison) — the caller appends
+    the canonical tail once, last, so a system dir can never shadow custom tools from a
+    mid-PATH position."""
+    canonical = {_normalize_service_path_entry(d) for d in system_dirs}
+    out = []
+    for entry in entries:
+        norm = _normalize_service_path_entry(entry)
+        if norm in canonical:
+            continue
+        out.append(entry)
+    return out
 
 
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
@@ -3361,11 +3394,23 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         systemd_type, systemd_watchdog_directives = "notify", f"NotifyAccess=main\nWatchdogSec={watchdog_seconds}s\n"
     path_entries.extend(_build_user_local_paths(user_home, path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
-    path_entries.extend([d for d in _service_system_dirs() if d not in path_entries])
+    # Canonical system dirs live ONLY in the tail: strip equivalents (normalized spellings
+    # included) from the assembled head, dedupe, then append the tail once, last.
+    system_dirs = _service_system_dirs()
+    path_entries = _strip_canonical_system_dirs(path_entries, system_dirs)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for entry in path_entries:
+        norm = _normalize_service_path_entry(entry)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(entry)
+    deduped.extend(d for d in system_dirs if _normalize_service_path_entry(d) not in seen)
     # _systemd_env_line escapes backslashes/quotes and doubles % specifiers; a raw f-string
     # here would let a hostile dir name (service_path_extra, carried entries) corrupt or break
     # the Environment= assignment.
-    sane_path_line = _systemd_env_line("PATH", ":".join(path_entries)).strip()
+    sane_path_line = _systemd_env_line("PATH", ":".join(deduped)).strip()
     start = installation_command(project_root, [*shlex.split(profile_arg), "gateway", "run"],
                             python=python_path, home=hermes_home)
     cleanup = installation_command(project_root, module="gateway.cgroup_cleanup",
