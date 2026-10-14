@@ -1447,7 +1447,7 @@ class TestSystemUnitHermesHome:
             lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
         )
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_hermes)
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda project_root=None, home=None: [])
 
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/root/bin/node")
         root_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
@@ -1468,7 +1468,7 @@ class TestSystemUnitHermesHome:
             gateway_cli, "_system_service_identity",
             lambda run_as_user=None: ("alice", "alice", str(tmp_path), 1001),
         )
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda project_root=None, home=None: [])
 
         system_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
         user_unit = gateway_cli.generate_systemd_unit(system=False)
@@ -1501,7 +1501,7 @@ class TestSystemUnitHermesHome:
             gateway_cli, "_system_service_identity",
             lambda run_as_user=None: ("alice", "alice", "/home/alice", 1001),
         )
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda project_root=None, home=None: [])
         monkeypatch.setenv("LD_LIBRARY_PATH", "/root/cuda/lib:/opt/cuda/lib64")
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
@@ -2439,6 +2439,8 @@ class TestServiceWorkingDirIsStable:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         plist = gateway_cli.generate_launchd_plist()
         m = re.search(r"<key>WorkingDirectory</key>\s*<string>(.*?)</string>", plist)
         assert m, "plist has no WorkingDirectory entry"
@@ -2464,6 +2466,8 @@ class TestServiceTakeoverGovernance:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         plist = gateway_cli.generate_launchd_plist()
         # The whole bug class: no --replace anywhere in the supervised argv.
         assert "--replace" not in plist
@@ -2485,6 +2489,8 @@ class TestServiceTakeoverGovernance:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         parsed = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
         assert parsed["KeepAlive"] == {"SuccessfulExit": False}
         assert parsed["RunAtLoad"] is True

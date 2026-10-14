@@ -287,6 +287,26 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "guarded branch deletion for the retention apply pass",
     ),
     (
+        "hermes_cli/gateway_launchd.py",
+        "def _launchd_service_path(",
+        "deterministic launchd service PATH (converge can no longer drop Homebrew)",
+    ),
+    (
+        "hermes_cli/gateway_launchd.py",
+        "def _installed_plist_path_dirs(",
+        "carry-forward of installed service PATH entries (regeneration never shrinks PATH)",
+    ),
+    (
+        "hermes_cli/gateway.py",
+        "def _service_tool_dirs(",
+        "deterministic host tool dirs for service PATH (Homebrew, ~/.local/bin)",
+    ),
+    (
+        "hermes_cli/gateway.py",
+        "def _service_path_extra_dirs(",
+        "gateway.service_path_extra config key (no hand-edited plists)",
+    ),
+    (
         "AGENTS.md",
         "FORK.md",
         "AGENTS.md points at the fork maintenance rules",
@@ -404,6 +424,7 @@ TEST_FILES = [
     "tests/agent/test_reset_ui_delivery_after_compaction.py",
     "tests/gateway/test_rearm_typing_after_compaction.py",
     "tests/hermes_cli/test_update_converge.py",
+    "tests/hermes_cli/test_gateway_service_path_determinism.py",
 ]
 
 

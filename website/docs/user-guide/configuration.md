@@ -1142,6 +1142,35 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 5-second
 default.
 
+## Gateway Service PATH
+
+The launchd plist (macOS) and systemd unit (Linux) are generated with a
+deterministic service `PATH`: `~/.local/bin`, the package-manager dirs that
+exist on the host (`/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`,
+`/usr/local/sbin` on macOS), any configured extras, managed Node dirs, and the
+system dirs last. The invoking shell's `PATH` is deliberately ignored, so
+regenerating a service definition from a cron job, SSH shell, or the
+`ai.hermes.converge` updater produces the same `PATH` every time.
+
+On macOS, entries present in the installed plist's `PATH` that still exist on
+disk are carried forward when regenerating, so an update can never shrink the
+service `PATH` (the systemd unit never carried caller `PATH`, so its
+regeneration is already stable without carry-forward).
+
+To add a non-standard directory, set `gateway.service_path_extra` instead of
+hand-editing the plist or unit:
+
+```yaml
+gateway:
+  service_path_extra:
+    - /opt/my-tools/bin
+    - ~/bin
+```
+
+`gateway install --reset-service-path` reinstalls the macOS service with a
+`PATH` derived purely from the current host state, dropping carried-forward
+entries.
+
 ## Session Stall Watchdog
 
 The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, default `300` seconds, `0` = disabled). When a busy session has a **pending inbound follow-up** and the agent's shared activity clock has been idle for at least this long, the gateway logs a WARNING and sends the user a one-shot notification:
