@@ -1118,7 +1118,9 @@ class GatewayStartupMixin:
     async def _start_recover_previous_run(self) -> None:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
         from gateway.run import _hermes_home
-        await asyncio.to_thread(self._start_register_plugins_relay_hooks)
+        from hermes_cli.plugins_loader import background_platform_loads
+        with background_platform_loads():
+            await asyncio.to_thread(self._start_register_plugins_relay_hooks)
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager
@@ -1177,8 +1179,10 @@ class GatewayStartupMixin:
         # Materialize independent deferred plugins concurrently. Each lookup is
         # bounded and retains late registration; one slow import must not put
         # every healthy transport behind its load threshold.
-        await asyncio.gather(*(asyncio.to_thread(platform_registry.get, p.value)
-                               for p, cfg in self.config.platforms.items() if cfg.enabled))
+        from hermes_cli.plugins_loader import background_platform_loads
+        with background_platform_loads():
+            await asyncio.gather(*(asyncio.to_thread(platform_registry.get, p.value)
+                                   for p, cfg in self.config.platforms.items() if cfg.enabled))
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects

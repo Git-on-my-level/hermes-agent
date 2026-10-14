@@ -18,7 +18,7 @@ BOOT_FILES = (
     "pm/environments.py", "pm/filesystem.py", "pm/paths.py", "hermes_cli/runtime_state.py",
     "hermes_cli/_early_recovery.py", "hermes_cli/_parser.py", "hermes_cli/profile_argv.py",
     "hermes_cli/venv_sync.py", "hermes_cli/steward.py",
-    "hermes_cli/stderr_timestamp.py",
+    "hermes_cli/stderr_timestamp.py", "hermes_cli/serving_generation.py",
     "scripts/hermes-gateway",
 )
 
@@ -49,6 +49,9 @@ def fixture_tree(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    # Service PATH resolution must not inspect bins from the developer's live
+    # install. This launcher fixture uses its recorded absolute Python paths.
+    monkeypatch.setenv("PATH", os.defpath)
     store = home / "tools"
     store.mkdir(parents=True)
     interpreter = Path(sys._base_executable).resolve()
@@ -307,6 +310,8 @@ def _command_survives_generation_collection(tmp_path, monkeypatch, surface):
                 if surface == "launchd":
                     import plistlib
                     from tests.hermes_cli.test_gateway_service import _osascript_exec_argv
+                    monkeypatch.setattr(gateway, "get_launchd_plist_path",
+                                        lambda: tmp_path / "fixture-launch-agent.plist")
                     unit = gateway.generate_launchd_plist()
                     # The job runs through osascript (#71206); exec the child it would spawn, minus the
                     # `>> log 2>> log` tail that only means something to the shell.

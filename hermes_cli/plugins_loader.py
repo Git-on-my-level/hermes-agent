@@ -33,6 +33,23 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger("hermes_cli.plugins")
 
+_BACKGROUND_PLATFORM_LOADS = contextvars.ContextVar('hermes_background_platform_loads', default=False)
+
+
+def platform_loads_are_background() -> bool:
+    return _BACKGROUND_PLATFORM_LOADS.get()
+
+
+@contextmanager
+def background_platform_loads():
+    """Gateway transport startup may continue with late registration; metadata readers wait."""
+    token = _BACKGROUND_PLATFORM_LOADS.set(True)
+    try:
+        yield
+    finally:
+        _BACKGROUND_PLATFORM_LOADS.reset(token)
+
+
 _NS_PARENT = "hermes_plugins"
 _MODULE_NAMESPACE_LOCK = threading.RLock()
 _BARE_MODULE_SCOPE: Dict[str, str] = {}  # bare module name -> owning scope_key
@@ -308,6 +325,7 @@ class PluginLoaderMixin:
                     if platform_registry.is_deferred_load_cancelled(platform_name, scope=scope):
                         return
                     self._load_plugin_scoped(_manifest)
+                self._wait_for_platform_metadata(lookup_key)
 
             previous = platform_registry.snapshot_registration(platform_name, scope=scope)
             platform_registry.register_deferred(platform_name, _loader, scope=scope)
@@ -324,6 +342,17 @@ class PluginLoaderMixin:
                 "Deferred platform registration failed for '%s'; eager-loading", lookup_key, exc_info=True)
             return False
         return True
+
+    def _wait_for_platform_metadata(self, lookup_key: str) -> None:
+        # Only synchronous metadata/config/status readers wait, always outside
+        # discovery lock. Gateway factories explicitly select background loads.
+        if _BACKGROUND_PLATFORM_LOADS.get():
+            return
+        ctx = getattr(self, '_pending_platform_contexts', {}).get(lookup_key)
+        worker = getattr(ctx, '_platform_load_worker', None)
+        if worker is not None:
+            with _plugin_home_scope(getattr(self, "home_path", None)):
+                worker.join(_resolve_plugin_load_timeout() or _LOAD_TIMEOUT_SECS)
 
     def _register_deferred_platform_tools(self, manifest: PluginManifest, loaded: LoadedPlugin) -> None:
         """Register a deferred platform's *client* tools without its adapter. Deferring the plugin would
@@ -464,6 +493,8 @@ class PluginLoaderMixin:
         from hermes_cli.plugins import LoadedPlugin, PluginContext, _PLUGINS_DEBUG
         loaded = LoadedPlugin(manifest=manifest)
         plugin_key = manifest_key(manifest)
+        if plugin_key in getattr(self, '_pending_platform_contexts', {}):
+            return  # Do not start another importer while registration is pending.
         logger.debug(
             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
             plugin_key, manifest.source, manifest.kind, manifest.path,
@@ -534,6 +565,7 @@ class PluginLoaderMixin:
             contexts = getattr(self, '_pending_platform_contexts', None)
             if contexts is None:
                 contexts = self._pending_platform_contexts = {}
+            setattr(ctx, "_platform_load_worker", pending.worker)
             contexts[plugin_key] = ctx
 
             def finish(pending=pending):

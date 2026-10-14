@@ -57,7 +57,7 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
             env[key] = os.environ[key]
 
     def run(argv, *, cwd=tmp_path, expected=0):
-        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=180, encoding='utf-8')
         assert result.returncode == expected, result.stdout + result.stderr
         return result
 
@@ -79,7 +79,7 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
     wheels = source / "wheels"
     wheels.mkdir()
     _wheel(wheels, "installer_probe", "1.0")
-    recipe = tomllib.loads((source / "pm/pyproject.toml").read_text())
+    recipe = tomllib.loads((source / "pm/pyproject.toml").read_text(encoding='utf-8-sig'))
     yaml_dep = next(d for d in recipe["project"]["dependencies"] if d.startswith("ruamel.yaml"))
     (source / "pyproject.toml").write_text(
         '[project]\nname="installer-fixture"\nversion="1"\nrequires-python=">=3.14"\n'
@@ -88,6 +88,13 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
         '[tool.uv]\npackage=false\n'
         '[tool.uv.sources]\ninstaller-probe={path="wheels/installer_probe-1.0-py3-none-any.whl"}\n',
         encoding="utf-8")
+    # Completion must produce a validated serving archive, even in this tiny
+    # application fixture; retained source resources are part of that contract.
+    shutil.copytree(ROOT / "scripts/bundles", source / "scripts/bundles")
+    (source / "skills/fixture").mkdir(parents=True)
+    (source / "skills/fixture/SKILL.md").write_text("Fixture serving skill\n", encoding="utf-8")
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8-sig")
+    (source / ".gitignore").write_text(ignored, encoding="utf-8")
     run([uv, "lock", "--python", str(python)], cwd=source)
     # Only the application is a fixture; the shell, PM, bootstrap and writer run unchanged.
     # Completion still imports the CLI's checkout root during post-install maintenance.
@@ -132,13 +139,13 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
         assert not (install / ".hermes-bootstrap-complete").exists()
         assert not (home / ".local/bin/hermes").exists()
         for facts in (home / ".hermes/installs").glob("*/facts.json"):
-            assert "venv" not in json.loads(facts.read_text())["packages"]
+            assert "venv" not in json.loads(facts.read_text(encoding='utf-8-sig'))["packages"]
         assert '"stage":"python-deps"' in result.stdout
         return
     assert '"stage":"python-deps"' in result.stdout
-    assert json.loads((install / ".hermes-bootstrap-complete").read_text())["pinnedCommit"] == commit
+    assert json.loads((install / ".hermes-bootstrap-complete").read_text(encoding='utf-8-sig'))["pinnedCommit"] == commit
     facts = next((home / ".hermes/installs").glob("*/facts.json"))
-    selection = json.loads(facts.read_text())["packages"]["venv"]
+    selection = json.loads(facts.read_text(encoding='utf-8-sig'))["packages"]["venv"]
     launcher = home / ".local/bin/hermes"
     child = json.loads(run([str(launcher), "from elsewhere"]).stdout)
     assert child["argv"] == ["from elsewhere"]

@@ -42,6 +42,11 @@ Optional plugin loads default to a 120-second deadline. Critical platform loads
 return a live pending registration after at most 100ms of waiting, leaving their
 import/register worker and a daemon completion observer outside the discovery lock.
 The configured threshold still emits ERROR if registration has not completed.
+Synchronous metadata/config/status readers wait for deferred registration up to
+that threshold outside the discovery lock, so YAML/auth bridges and platform rows
+are complete when their lookup returns. Gateway transport startup explicitly
+selects background loading; other adapters can proceed while a slow worker remains
+pending. Repeated lookups reuse that worker instead of starting duplicate imports.
 Other platforms materialize independently, late registration becomes eligible for
 the existing reconnect watcher, and unloading a pending context cancels its late
 registrations. Missing configured adapters retain needs-attention status. Gateway
@@ -58,7 +63,7 @@ removes input; Telegram's server-side retention remains a recovery limit.
 
 ## First deployment on m5 after review and merge
 
-Merge #83 first, then #84 into fork `prod`. Keep the current gateway running while
+#83 is already merged into fork `prod`. After #84 is reviewed and merged, keep the current gateway running while
 updating the original maintained checkout, not a scratch worktree or a serving
 archive. On m5 that checkout is `~/.hermes/hermes-agent`. Use the reviewed merge
 SHA on fork `prod`; stop if the update returns non-zero:

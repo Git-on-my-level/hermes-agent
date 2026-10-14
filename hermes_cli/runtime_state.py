@@ -193,8 +193,10 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             return removed  # maintenance: another process owns the install, skip rather than queue
         recover_publication(project)
         selected = selected_venv(project).parent.resolve()
-        from hermes_cli.serving_generation import read_generation
-        serving = read_generation(project)
+        serving = None
+        if (root / "serving-generation.json").is_file():
+            from hermes_cli.serving_generation import read_generation
+            serving = read_generation(project)
         pinned = Path(serving["generation"]).resolve() if serving else None
         generations = root / "environments"
         if not generations.is_dir():

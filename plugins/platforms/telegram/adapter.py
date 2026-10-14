@@ -3338,9 +3338,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect via long polling, or a webhook server if ``TELEGRAM_WEBHOOK_URL`` is set.
 
-        ``is_reconnect``: False = cold boot (drop the Bot API queue unless
-        ``extra.drop_pending_on_cold_boot`` is false); True = watcher reconnect (preserve
-        queued updates, else every message sent during the outage is lost). Webhook env:
+        ``is_reconnect``: False = cold boot; True = watcher reconnect. Both preserve
+        queued user input, including when the legacy drop option is enabled. Webhook env:
         TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_PORT (8443), TELEGRAM_WEBHOOK_HOST,
         TELEGRAM_WEBHOOK_SECRET."""
         # Explicit connect() is the only operation allowed to reopen polling after a completed teardown.

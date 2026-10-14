@@ -161,3 +161,64 @@ def test_unloading_pending_platform_cancels_late_registration(tmp_path, monkeypa
     finally:
         release.set()
         manager.unload()
+
+
+def test_metadata_lookup_completes_without_blocking_transport_or_discovery(tmp_path, monkeypatch):
+    import contextvars
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+    from gateway.platform_registry import platform_registry
+
+    release, entered, returned, handed_off = (threading.Event() for _ in range(4))
+    monkeypatch.setitem(sys.modules, '_metadata_load_signals', SimpleNamespace(release=release, entered=entered))
+    path = tmp_path / 'metadata-platform'
+    path.mkdir()
+    (path / '__init__.py').write_text(
+        "from _metadata_load_signals import release, entered\n"
+        "def register(ctx):\n"
+        "    entered.set()\n"
+        "    assert release.wait(10)\n"
+        "    ctx.register_platform('metadata', 'Metadata', lambda cfg: cfg, lambda: True,\n"
+        "                          required_env=['METADATA_TEST_TOKEN'])\n", encoding='utf-8')
+    manager = PluginManager()
+    manifest = PluginManifest(name='metadata-platform', kind='platform', source='user', path=str(path))
+    manager._register_deferred_platform(manifest)
+    wait_metadata = manager._wait_for_platform_metadata
+
+    def metadata_wait(key):
+        handed_off.set()
+        return wait_metadata(key)
+
+    monkeypatch.setattr(manager, '_wait_for_platform_metadata', metadata_wait)
+    result = {}
+
+    def lookup():
+        try:
+            result['entry'] = platform_registry.get('metadata')
+        except BaseException as exc:
+            result['error'] = exc
+        finally:
+            returned.set()
+
+    caller = threading.Thread(target=contextvars.copy_context().run, args=(lookup,))
+    caller.start()
+    try:
+        assert entered.wait(5)
+        assert handed_off.wait(5)
+        assert not returned.is_set()
+        # The worker is held by an event, so a factory must return without
+        # waiting for this metadata caller. No wall-clock race is asserted.
+        assert platform_registry.create_adapter('metadata', object()) is None
+        assert not release.is_set()
+        assert manager._discovery_lock.acquire(blocking=False)
+        manager._discovery_lock.release()
+        release.set()
+        caller.join(5)
+        assert returned.is_set() and 'error' not in result
+        assert result['entry'].required_env == ['METADATA_TEST_TOKEN']
+    finally:
+        release.set()
+        caller.join(5)
+        manager.unload()

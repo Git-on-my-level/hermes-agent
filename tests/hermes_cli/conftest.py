@@ -111,12 +111,27 @@ def isolated_source_completion(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.source_build.build_update_products", lambda *a, **kw: None)
     monkeypatch.setattr("hermes_cli.venv_sync.publish_launchers", lambda *a: None)
+    # This unit seam does not build a PM generation or resource archive. Model
+    # their successful publication; real completion/publication is covered in
+    # process tests, including non-zero results on rejected serving pairs.
+    monkeypatch.setattr("hermes_cli.source_stamp.write_source_stamp",
+                        lambda root: {"commit": "prepared-unit-fixture", "dirty": False})
 
     def complete(request):
         # Production prints the banner in ``_finish`` only after the terminal
         # receipt is durable. An explicit completion message (already up to
         # date) keeps the parent receipt open so later skips still land on it.
-        update_completion._complete_selected(request)
+        try:
+            update_completion._complete_selected(request)
+        except SystemExit as exc:
+            # The real child owner resumes paused gateways and finalizes its
+            # failure receipt even when completion refuses before restart.
+            token = request["windows_resume"]
+            if isinstance(token, dict) and token.get("resume_needed"):
+                update_cmd._m()._resume_windows_gateways_after_update(token)
+            from hermes_cli import update_receipt
+            update_receipt.finalize_pending_update_receipt(int(exc.code or 1), "source completion refused")
+            raise
         receipt = update_completion._read_terminal_receipt(request)
         if not request.get("completion_message"):
             payload = request.get("receipt") if isinstance(request, dict) else None

@@ -111,3 +111,19 @@ async def test_legacy_drop_option_cannot_discard_input(caplog):
         cold = await _capture_drop_pending(adapter, is_reconnect=False)
     assert cold["drop_pending_updates"] is False
     assert "Ignoring drop_pending_on_cold_boot=true" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_default_gateway_config_preserves_offline_updates_for_polling_and_webhook(tmp_path, monkeypatch):
+    """An operator who omitted the knob must retain downtime input on both transports."""
+    from gateway.config import load_gateway_config, Platform
+    monkeypatch.setenv('TELEGRAM_BOT_TOKEN', '111:offline-test')
+    monkeypatch.setenv('TELEGRAM_ALLOW_ALL_USERS', 'true')
+    config_file = tmp_path / 'config.yaml'
+    config_file.write_text('platforms:\n  telegram:\n    enabled: true\n', encoding='utf-8')
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = load_gateway_config()
+    adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
+    assert adapter._drop_pending_on_cold_boot is False
+    assert (await _capture_drop_pending(adapter, is_reconnect=False))['drop_pending_updates'] is False
+    assert (await _capture_webhook_drop_pending(adapter, monkeypatch, is_reconnect=False))['drop_pending_updates'] is False

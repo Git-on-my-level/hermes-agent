@@ -113,7 +113,7 @@ def _complete_locked(
         if write_source_stamp(root) is None:
             raise ValueError("completed source identity could not be read; update remains unfinished")
     except (OSError, ValueError) as exc:
-        print(f"⚠ Source update maintenance finished, but completion could not be published: {exc}",
+        print(f"⚠ Source update maintenance finished, but the install stamp could not be written or the serving generation could not be published: {exc}",
               file=sys.stderr)
         return False
     # Success is the stamp, not the product build that preceded maintenance.
