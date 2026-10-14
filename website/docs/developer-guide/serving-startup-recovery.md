@@ -10,22 +10,34 @@ bridge scripts, locales, catalog manifests and bundled skills. Boot selects that
 Both directories are leased for the process lifetime; GC keeps the selected pair
 and collects older unleased snapshots after the existing age floor.
 
-Until the first completed update publishes a pair, a legacy serving launch skips
-update work and uses its committed interpreter with a warning. It cannot provide
-an immutable old-code guarantee. Install this change through a completed `hermes
-update` before relying on recovery. Developer and packaged installs keep their
-existing ownership contracts. Repairs run through the original install's CLI,
-not the immutable gateway snapshot. A pending completion remains owed to an
-explicit update or the next idle converge window. Failed/partial converge receipts
-produce ERROR and stderr alerts even on subsequent busy skips; nonzero update
-exits alert and clear the planned drain.
+Serving validates the source stamp, dependency declarations, and skills/locales/scripts
+before selecting a pair. The bootstrap fences core imports to that source tree,
+including modules preloaded by editable finders during Python site processing.
+Thus `__file__`, package resources and `install_root()` agree. Unknown/failed Git
+status is treated as dirty and cannot publish a clean completed pair.
 
-Optional plugin loads default to a 120-second deadline. A platform plugin uses
-that value as an ERROR warning threshold, then keeps waiting for registration;
-it is never abandoned for being slow. Gateway discovery and deferred platform imports
-run off the serving loop; adapter factories retain loop affinity. Missing configured adapters also log ERROR and retain
-the existing fatal/retrying, needs-attention status. Startup git identity probes allow 120 seconds; failure to identify a
-completed source tree leaves completion owed. Network timeouts are unchanged.
+Until a completed update publishes a validated pair, managed serving refuses to
+boot with a loud error instead of trusting a mutable checkout or adopting an
+unfinished dependency build. Complete `hermes update` from the original owning
+install before restart. Developer and packaged installs keep their ownership
+contracts. Serving never acquires the update lock or finishes the update itself.
+
+Failed/partial converge receipts alert once per receipt ID, including busy skips.
+An owed completion on an already-current checkout reserves its retry before drain,
+backs off for at least one hour (doubling on each attempt), and stops automatic
+completion repair after three attempts. A marker that remains set alerts once for
+that obligation. Clearing the marker resets the retry budget; changing the target
+starts a new obligation. Explicit `hermes update` remains the operator repair path.
+
+Optional plugin loads default to a 120-second deadline. Critical platform loads
+return a live pending registration after at most 100ms of waiting, leaving their
+import/register worker and a daemon completion observer outside the discovery lock.
+The configured threshold still emits ERROR if registration has not completed.
+Other platforms materialize independently, late registration becomes eligible for
+the existing reconnect watcher, and unloading a pending context cancels its late
+registrations. Missing configured adapters retain needs-attention status. Gateway
+discovery runs off the serving loop; adapter factories retain loop affinity.
+Startup Git identity probes allow 120 seconds. Network timeouts are unchanged.
 A completed PM worker result no longer fails because interpreter shutdown takes
 more than five seconds; exceptional cleanup escalates terminate to kill.
 

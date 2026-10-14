@@ -224,12 +224,12 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
             status_command,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
-            timeout=3,
+            timeout=120,
             cwd=str(repo_dir),
         )
-        dirty = dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
+        dirty = dirty_result.returncode != 0 or bool((dirty_result.stdout or "").strip())
     except (OSError, subprocess.SubprocessError):
-        dirty = False
+        dirty = True  # Unknown is never evidence of a completed clean build.
 
     tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
     releases = [

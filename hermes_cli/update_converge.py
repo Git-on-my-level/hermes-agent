@@ -304,6 +304,72 @@ def _mark_planned_drain() -> None:
         logger.debug("drain marker write failed: %s", e)
 
 
+def _recovery_state(root: Path) -> tuple[Path, dict]:
+    from pm.environments import install_state_dir
+    path = install_state_dir(root) / 'converge-recovery.json'
+    try:
+        value = json.loads(path.read_text(encoding='utf-8-sig'))
+        return path, value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return path, {}
+
+
+def _save_recovery_state(path: Path, state: dict) -> None:
+    from utils import atomic_json_write
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, state)  # Failure refuses drain/update; never retry without recording it.
+
+
+def _alert_once(root: Path, key: str, message: str) -> None:
+    path, state = _recovery_state(root)
+    seen = state.get('alerts', [])
+    if not isinstance(seen, list):
+        seen = []
+    if key in seen:
+        return
+    state['alerts'] = [*seen[-255:], key]
+    _save_recovery_state(path, state)
+    logger.error(message)
+    _log_tick('ALERT ' + message)
+    print(message, file=sys.stderr, flush=True)
+
+
+def _alert_receipt(root: Path, receipt: dict | None) -> None:
+    if not receipt or receipt.get('outcome') not in {'failed', 'partial'}:
+        return
+    import hashlib
+    identity = str(receipt.get('update_id') or receipt.get('correlation_id') or
+                   hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
+    _alert_once(root, 'receipt:' + identity,
+                'Converge has an unfinished failed update; serving the completed generation; '
+                'repair will retry when idle. Inspect converge.log and the latest update receipt, or run `hermes update`.')
+
+
+def _reserve_completion_retry(root: Path, pin: str, interval: int) -> bool:
+    path, state = _recovery_state(root)
+    key = pin or checkout_sha(root)
+    debt: dict[str, Any] = state.get('completion_debt', {})
+    if not isinstance(debt, dict):
+        _alert_once(root, 'completion-state-invalid', 'Converge retry state is invalid; automatic repair refused; run `hermes update`.')
+        return False
+    if debt.get('key') != key:
+        debt = {'key': key, 'attempts': 0, 'next_retry': 0}
+    now = time.time()
+    try:
+        attempts = max(0, int(debt.get('attempts') or 0))
+        next_retry = float(debt.get('next_retry') or 0)
+    except (ValueError, TypeError):
+        _alert_once(root, 'completion-state-invalid', 'Converge retry state is invalid; automatic repair refused; run `hermes update`.')
+        return False
+    if attempts >= 3 or now < next_retry:
+        return False
+    debt['attempts'] = attempts + 1
+    debt['next_retry'] = now + max(3600, interval * 2) * (2 ** attempts)
+    state['completion_debt'] = debt
+    _save_recovery_state(path, state)  # Reserve before mutation, including crashes.
+    return True
+
+
 def cmd_converge_tick(args: Any) -> None:
     """Entry for ``hermes update --converge`` / ``hermes converge run``. Quiet on skip."""
     from hermes_cli.main import PROJECT_ROOT, cmd_update
@@ -312,13 +378,7 @@ def cmd_converge_tick(args: Any) -> None:
     if settings.enabled and not settings.pin:
         fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
     from hermes_cli.update_receipt import read_latest_receipt
-    previous = read_latest_receipt()
-    if previous and previous.get("outcome") in {"failed", "partial"}:
-        message = ("Converge has an unfinished failed update; serving the completed generation; "
-                   "repair will retry when idle. Inspect converge.log and the latest update receipt, or run `hermes update`.")
-        logger.error(message)
-        _log_tick("ALERT " + message)
-        print(message, file=sys.stderr, flush=True)
+    _alert_receipt(PROJECT_ROOT, read_latest_receipt())
     decision = decide_from_live(PROJECT_ROOT, settings)
     # A checkout/runtime can already name the pin while its product tail is
     # still owed. Do not let already_current permanently suppress repair.
@@ -331,7 +391,16 @@ def cmd_converge_tick(args: Any) -> None:
             and not _tree_matches_completed_stamp(PROJECT_ROOT)
             and not gateway_is_busy()
             and not checkout_is_dirty(PROJECT_ROOT)):
-        decision = ConvergeDecision("update", "unfinished_completion", decision.pin)
+        if _reserve_completion_retry(PROJECT_ROOT, decision.pin, settings.interval):
+            decision = ConvergeDecision('update', 'unfinished_completion', decision.pin)
+        else:
+            decision = ConvergeDecision('skip', 'completion_backoff_or_exhausted', decision.pin)
+    if not completion_pending_path(PROJECT_ROOT).is_file():
+        path, state = _recovery_state(PROJECT_ROOT)
+        debt = state.pop('completion_debt', None)
+        if debt is not None:
+            state['alerts'] = [key for key in state.get('alerts', []) if not key.startswith('completion:')]
+            _save_recovery_state(path, state)
     _log_tick(f"action={decision.action} reason={decision.reason} pin={decision.pin[:12]}")
     if decision.action == "skip":
         return
@@ -359,18 +428,20 @@ def cmd_converge_tick(args: Any) -> None:
             _restart_gateway_fleet_after_update(None, gateway_mode=False)
             return
         cmd_update(args)
-        receipt = read_latest_receipt()
-        if receipt and receipt.get("outcome") in {"failed", "partial"}:
-            message = "Converge update failed; previous serving generation retained; operator attention required"
-            logger.error(message)
-            _log_tick("ALERT " + message)
-            print(message, file=sys.stderr, flush=True)
+        _alert_receipt(PROJECT_ROOT, read_latest_receipt())
     except BaseException as exc:
         if not isinstance(exc, SystemExit) or exc.code not in (0, None):
             logger.error("Converge update failed: %s; previous serving generation retained", exc)
             _log_tick("ALERT converge update failed; operator attention required")
         raise
     finally:
+        try:
+            if decision.reason == 'unfinished_completion' and completion_pending_path(PROJECT_ROOT).is_file():
+                _alert_once(PROJECT_ROOT, 'completion:' + (decision.pin or checkout_sha(PROJECT_ROOT)),
+                            'Converge completion marker remains unfinished; retries are backed off and capped at three; '
+                            'operator attention required. Run `hermes update` explicitly to repair.')
+        except OSError:
+            logger.error('Could not persist completion alert; operator attention required', exc_info=True)
         try:
             from gateway.drain_control import clear_update_converge_drain
 

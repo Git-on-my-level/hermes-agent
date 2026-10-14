@@ -179,7 +179,7 @@ def test_legacy_channel_record_does_not_expire_busy_sla(tmp_path, monkeypatch):
     from hermes_cli import update_converge as uc
 
     state = tmp_path / "converge_state.json"
-    state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}))
+    state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}), encoding='utf-8')
     monkeypatch.setattr(uc, "_state_path", lambda home=None: state)
     monkeypatch.setattr(uc.time, "time", lambda: 100000.0)
     monkeypatch.setattr(uc, "checkout_sha", lambda root: PIN)
@@ -188,7 +188,7 @@ def test_legacy_channel_record_does_not_expire_busy_sla(tmp_path, monkeypatch):
     monkeypatch.setattr(uc, "gateway_is_busy", lambda: True)
     settings = _s(pin="", busy_sla=3600)
     for tip in ("", PIN2):
-        state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}))
+        state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}), encoding='utf-8')
         monkeypatch.setattr(uc, "channel_tip_sha", lambda *a, _t=tip, **k: _t)
         decision = uc.decide_from_live(tmp_path, settings)
         assert (decision.action, decision.reason) == ("skip", "busy")
@@ -287,3 +287,36 @@ def test_idle_tick_skips_leftover_pending_when_tree_already_matches_stamp(tmp_pa
     monkeypatch.setattr(venv_sync, "_tree_matches_completed_stamp", lambda r: True)
     uc.cmd_converge_tick(SimpleNamespace())
     assert called == []
+
+
+def test_sticky_completion_backoff_and_receipt_alert_survive_repeated_ticks(tmp_path, monkeypatch, caplog):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    from gateway import drain_control
+    calls, drains = [], []
+    monkeypatch.setitem(sys.modules,'hermes_cli.main',SimpleNamespace(PROJECT_ROOT=tmp_path,cmd_update=lambda a:calls.append(a)))
+    monkeypatch.setattr(uc,'load_converge_settings',lambda:_s())
+    monkeypatch.setattr(uc,'decide_from_live',lambda *a:uc.ConvergeDecision('skip','already_current',PIN))
+    monkeypatch.setattr(uc,'gateway_is_busy',lambda:False)
+    monkeypatch.setattr(uc,'checkout_is_dirty',lambda r:False)
+    monkeypatch.setattr(uc,'_mark_planned_drain',lambda:drains.append(True))
+    monkeypatch.setattr(drain_control,'clear_update_converge_drain',lambda:None)
+    monkeypatch.setattr(update_receipt,'read_latest_receipt',lambda:{'outcome':'partial','update_id':'same-receipt'})
+    pending = tmp_path/'pending'
+    pending.touch()
+    monkeypatch.setattr(venv_sync,'completion_pending_path',lambda r:pending)
+    monkeypatch.setattr(venv_sync,'_tree_matches_completed_stamp',lambda r:False)
+    clock=[0]
+    monkeypatch.setattr(uc.time,'time',lambda:clock[0])
+    for tick in list(range(0, 20000, 1800)) + [86400, 172800]:
+        clock[0]=tick
+        uc.cmd_converge_tick(SimpleNamespace())
+    assert len(calls)==len(drains)==3
+    assert caplog.text.count('unfinished failed update')==1
+    assert caplog.text.count('completion marker remains unfinished')==1
+    pending.unlink()
+    uc.cmd_converge_tick(SimpleNamespace())
+    pending.touch()
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert len(calls)==4  # A cleared obligation resets the retry budget.

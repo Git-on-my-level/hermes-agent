@@ -1172,6 +1172,13 @@ class GatewayStartupMixin:
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
         _pending_connects = []  # (platform, platform_config, adapter); connected concurrently later
+        if await self._abort_startup_if_shutdown_requested():
+            return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
+        # Materialize independent deferred plugins concurrently. Each lookup is
+        # bounded and retains late registration; one slow import must not put
+        # every healthy transport behind its load threshold.
+        await asyncio.gather(*(asyncio.to_thread(platform_registry.get, p.value)
+                               for p, cfg in self.config.platforms.items() if cfg.enabled))
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
@@ -1194,7 +1201,6 @@ class GatewayStartupMixin:
             enabled_platform_count += 1
             # Import/register may wait on host I/O; factories retain their loop
             # affinity (third-party adapters may create asyncio resources).
-            await asyncio.to_thread(platform_registry.get, platform.value)
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
