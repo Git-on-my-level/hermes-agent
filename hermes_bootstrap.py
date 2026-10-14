@@ -542,6 +542,9 @@ from hermes_cli._parser import command_argv
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
 if not _pm_repair:
+    from hermes_cli.serving_generation import launch_completed_gateway
+
+    launch_completed_gateway(_root)
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:

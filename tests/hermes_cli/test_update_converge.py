@@ -211,3 +211,58 @@ def test_linux_service_runs_converge_flag(tmp_path, monkeypatch):
     assert "update --converge -y" in text
     assert "Type=oneshot" in text
     assert f"HERMES_HOME={tmp_path}" in text
+
+
+def test_failed_converge_is_alerted_even_when_busy(monkeypatch, caplog, capsys):
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt
+    import sys
+    main = SimpleNamespace(PROJECT_ROOT=__import__("pathlib").Path("/tmp/mock-hermes-source"), cmd_update=lambda a: None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "busy"))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "failed"})
+    monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(AssertionError("busy tick updated")))
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert "unfinished failed update" in caplog.text
+    assert "unfinished failed update" in capsys.readouterr().err
+
+
+def test_converge_nonzero_exit_alerts_and_clears_drain(monkeypatch, caplog):
+    import pytest
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt
+    import sys
+    main = SimpleNamespace(PROJECT_ROOT=__import__("pathlib").Path("/tmp/mock-hermes-source"), cmd_update=lambda a: None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
+    from gateway import drain_control
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("update", "behind", PIN))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: None)
+    monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(SystemExit(1)))
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
+    cleared = []
+    monkeypatch.setattr(drain_control, "clear_update_converge_drain", lambda: cleared.append(True))
+    with pytest.raises(SystemExit):
+        uc.cmd_converge_tick(SimpleNamespace())
+    assert cleared == [True]
+    assert "Converge update failed" in caplog.text
+
+
+def test_idle_tick_finishes_pending_tail_even_if_code_already_current(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    called = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "success"})
+    pending = tmp_path / "pending"
+    pending.touch()
+    monkeypatch.setattr(venv_sync, "completion_pending_path", lambda r: pending)
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert len(called) == 1 and called[0].sha == PIN

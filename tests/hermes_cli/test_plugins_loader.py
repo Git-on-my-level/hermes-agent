@@ -58,3 +58,43 @@ def test_registration_after_the_load_deadline_is_ignored(monkeypatch):
     release.set()
     assert finished.wait(2)
     assert late["result"] is None
+
+
+def test_slow_platform_registration_is_retained_and_alerted(monkeypatch, caplog):
+    from types import SimpleNamespace
+    from hermes_cli.plugins import PluginContext
+    import time
+    manifest = SimpleNamespace(name="slow-platform", kind="platform")
+    ctx = PluginContext(manifest, manager=object())
+    monkeypatch.setattr(plugins_loader, "_resolve_plugin_load_timeout", lambda: 0.02)
+    registered = []
+    def register():
+        time.sleep(0.06)
+        registered.append(not ctx._load_abandoned)
+        return "loaded"
+    assert plugins_loader.run_with_load_deadline("slow-platform", ctx, register) == "loaded"
+    assert registered == [True]
+    assert "critical transport" in caplog.text
+
+
+def test_platform_plugin_registers_after_threshold_through_real_loader(tmp_path, monkeypatch, caplog):
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+    from gateway.platform_registry import platform_registry
+    plugin = tmp_path / "slow-platform"
+    plugin.mkdir()
+    (plugin / "__init__.py").write_text(
+        "import time\ndef register(ctx):\n    time.sleep(0.06)\n"
+        "    ctx.register_platform('slow-test', 'Slow Test', lambda cfg: cfg, lambda: True)\n"
+    )
+    manager = PluginManager()
+    manifest = PluginManifest(name="slow-platform", kind="platform", source="user", path=str(plugin))
+    monkeypatch.setattr(plugins_loader, "_resolve_plugin_load_timeout", lambda: 0.02)
+    try:
+        manager._load_plugin(manifest)
+        entry, _ = platform_registry.snapshot_registration("slow-test", scope=manager.scope_key)
+        assert entry is not None and entry.check_fn()
+        assert entry.adapter_factory("config") == "config"
+        assert "critical transport" in caplog.text
+    finally:
+        manager.unload(manifest)

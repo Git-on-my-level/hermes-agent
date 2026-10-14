@@ -193,11 +193,14 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             return removed  # maintenance: another process owns the install, skip rather than queue
         recover_publication(project)
         selected = selected_venv(project).parent.resolve()
+        from hermes_cli.serving_generation import read_generation
+        serving = read_generation(project)
+        pinned = Path(serving["generation"]).resolve() if serving else None
         generations = root / "environments"
         if not generations.is_dir():
             return removed
         for generation in generations.iterdir():
-            if generation.is_symlink() or not generation.is_dir() or generation.resolve() == selected:
+            if generation.is_symlink() or not generation.is_dir() or generation.resolve() in (selected, pinned):
                 continue
             marker = generation / ".lease-managed"
             if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
@@ -205,6 +208,17 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             if not leases_held(generation):
                 shutil.rmtree(generation)
                 removed.append(generation)
+        sources = root / "serving-source"
+        pinned_source = Path(serving["source"]).resolve() if serving else None
+        if sources.is_dir():
+            for source in sources.iterdir():
+                marker = source / ".lease-managed"
+                if (source.is_symlink() or not source.is_dir() or source.resolve() == pinned_source
+                        or not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds):
+                    continue
+                if not leases_held(source):
+                    shutil.rmtree(source)
+                    removed.append(source)
     return removed
 
 

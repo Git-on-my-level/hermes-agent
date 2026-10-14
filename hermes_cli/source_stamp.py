@@ -68,6 +68,9 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     # Every path that publishes a new checkout identity (completion handoff, the PM
     # updater's finish, boot-time adoption) moves the installers' receipt with it.
     refresh_bootstrap_receipt(root, stamp)
+    if not adopted:
+        from hermes_cli.serving_generation import record_completed_generation
+        record_completed_generation(root, stamp)
     return stamp
 
 

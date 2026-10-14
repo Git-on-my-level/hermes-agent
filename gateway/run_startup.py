@@ -1118,7 +1118,7 @@ class GatewayStartupMixin:
     async def _start_recover_previous_run(self) -> None:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
         from gateway.run import _hermes_home
-        self._start_register_plugins_relay_hooks()
+        await asyncio.to_thread(self._start_register_plugins_relay_hooks)
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager
@@ -1167,6 +1167,7 @@ class GatewayStartupMixin:
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
         from gateway.run_adapters import _adapter_unavailable_message
+        from gateway.platform_registry import platform_registry
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
@@ -1191,14 +1192,17 @@ class GatewayStartupMixin:
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
+            # Import/register may wait on host I/O; factories retain their loop
+            # affinity (third-party adapters may create asyncio resources).
+            await asyncio.to_thread(platform_registry.get, platform.value)
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 if platform.value in {m.value for m in Platform.__members__.values()}:
-                    logger.warning("No adapter available for %s", platform.value)
+                    logger.error("Configured messaging platform %s is NOT running: no adapter available", platform.value)
                 else:
-                    logger.warning(
-                        "No adapter for '%s' -- is the plugin installed? "
+                    logger.error(
+                        "Configured messaging platform '%s' is NOT running -- is the plugin installed? "
                         "(platform is enabled in config.yaml but no plugin registered it)", platform.value,
                     )
                 # Only a platform that can heal on its own is queued for the reconnect watcher; either way

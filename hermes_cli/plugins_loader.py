@@ -37,11 +37,11 @@ _NS_PARENT = "hermes_plugins"
 _MODULE_NAMESPACE_LOCK = threading.RLock()
 _BARE_MODULE_SCOPE: Dict[str, str] = {}  # bare module name -> owning scope_key
 
-# Per-plugin deadline on import + register(): ``plugins.load_timeout_seconds`` (default 10s, 0 disables,
-# clamped to the max). A plugin that never returns is skipped with a named reason and loading moves on
+# Per-plugin deadline on import + register(): ``plugins.load_timeout_seconds`` (default 120s, 0 disables,
+# clamped to the max). Optional plugins that never return are skipped with a named reason and loading moves on
 # (#108139). Python cannot kill a thread, so the worker is abandoned as a daemon; the cap bounds how many
 # abandoned loaders one process may accumulate (#98382) — past it, further loads are refused, not run inline.
-_LOAD_TIMEOUT_SECS = 10.0
+_LOAD_TIMEOUT_SECS = 120.0
 _MAX_LOAD_TIMEOUT_SECS = 600.0
 _MAX_ABANDONED_LOADERS = 8
 _ABANDONED_LOADERS: List[threading.Thread] = []
@@ -62,7 +62,7 @@ def in_plugin_load_worker() -> bool:
 
 
 def _resolve_plugin_load_timeout() -> float:
-    """Effective per-plugin load deadline from ``plugins.load_timeout_seconds`` (default 10s; ``0`` runs
+    """Effective per-plugin load deadline from ``plugins.load_timeout_seconds`` (default 120s; ``0`` runs
     loads inline with no deadline; clamped to ``_MAX_LOAD_TIMEOUT_SECS``)."""
     default = _LOAD_TIMEOUT_SECS
     try:
@@ -117,9 +117,13 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
         finally:
             outer_scope.remove(ctx)
     timeout = _resolve_plugin_load_timeout()
+    critical = getattr(getattr(ctx, "manifest", None), "kind", None) == "platform"
+    if critical and timeout <= 0:
+        timeout = _LOAD_TIMEOUT_SECS  # warning threshold, never an abandonment deadline
     if timeout <= 0:
         return fn()
-    _reserve_abandoned_loader_slot()
+    if not critical:
+        _reserve_abandoned_loader_slot()
     outcome: List[Any] = []
     failure: List[BaseException] = []
 
@@ -139,6 +143,13 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     )
     worker.start()
     worker.join(timeout)
+    # A platform is a serving dependency: abandoning its context removes the
+    # only route for user input. Keep its registration alive and diagnose the
+    # slow import instead. Optional plugins retain their bounded-load policy.
+    if worker.is_alive() and critical:
+        logger.error("Platform plugin '%s' is not registered after %gs; gateway startup is waiting "
+                     "for this critical transport (registration remains enabled)", plugin_key, timeout)
+        worker.join()
     if worker.is_alive():
         for loaded_ctx in scope:
             loaded_ctx._abandon_load()

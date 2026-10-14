@@ -693,11 +693,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_indicator_enabled: bool = bool(extra.get("status_indicator", False))
         self._status_online_text: str = str(extra.get("status_online", "Online"))
         self._status_offline_text: str = str(extra.get("status_offline", "Offline"))
-        # Cold-boot queue: drop server-side pending updates on first boot (default True,
-        # preserves historical behaviour). Set extra.drop_pending_on_cold_boot: false to
-        # receive messages sent while the gateway was offline (e.g. nightly-off hosts).
-        # Watcher reconnects always preserve the queue regardless of this setting.
-        self._drop_pending_on_cold_boot: bool = self._coerce_bool_extra("drop_pending_on_cold_boot", True)
+        # Offline messages are user input. Keep the legacy knob only to warn
+        # operators who configured dropping; polling and webhooks preserve all
+        # updates and durable update_id admission prevents duplicate dispatch.
+        self._drop_pending_on_cold_boot: bool = self._coerce_bool_extra("drop_pending_on_cold_boot", False)
         self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
@@ -2596,15 +2595,11 @@ class TelegramAdapter(BasePlatformAdapter):
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
+            # Polling generations are drained above. Preserve queued updates when
+            # replacing the session: conflict recovery must never discard input.
             self._polling_conflict_recovery_generation = expected_generation
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -3273,17 +3268,14 @@ class TelegramAdapter(BasePlatformAdapter):
     def _cold_boot_drop_pending(self, *, is_reconnect: bool) -> bool:
         """Whether THIS connection asks Telegram to discard its queued updates.
 
-        A watcher reconnect always preserves them (#46621); a cold boot follows
-        ``platforms.telegram.extra.drop_pending_on_cold_boot`` (default true). The decision is logged
-        on every cold boot — a command that never ran is otherwise invisible (#71811)."""
-        drop_pending = self._drop_pending_on_cold_boot if not is_reconnect else False
+        Cold boots and reconnects always preserve input. The old destructive
+        option is deprecated and explicitly warned about when still configured."""
         if not is_reconnect:
-            logger.info(
-                "[%s] Cold boot: %s Telegram updates queued while offline "
-                "(platforms.telegram.extra.drop_pending_on_cold_boot: %s)",
-                self.name, "dropping" if drop_pending else "preserving",
-                "true" if self._drop_pending_on_cold_boot else "false")
-        return drop_pending
+            if self._drop_pending_on_cold_boot:
+                logger.warning("[%s] Ignoring drop_pending_on_cold_boot=true: preserving offline user input; "
+                               "duplicate update_ids are filtered by durable admission", self.name)
+            logger.info("[%s] Cold boot: preserving Telegram updates queued while offline", self.name)
+        return False
 
     async def _start_webhook_mode(self, webhook_url: str, *, is_reconnect: bool) -> None:
         """Start PTB's webhook server (Telegram pushes updates; lets cloud platforms auto-wake suspended

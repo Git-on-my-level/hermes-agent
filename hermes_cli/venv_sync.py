@@ -304,6 +304,10 @@ def _is_supervised_serving_gateway(argv: list[str]) -> bool:
     """
     if not _supervised_child():
         return False
+    return _is_serving_gateway(argv)
+
+
+def _is_serving_gateway(argv: list[str]) -> bool:
     from hermes_cli._parser import command_argv
 
     cmd = command_argv(argv)
@@ -389,6 +393,18 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
         stamp = read_install_stamp(root)
     if stamp.get("updateMechanism") != "self":
         return None  # Developer checkouts and packaged runtimes retain their owner.
+
+    # A first boot on a legacy install may not yet have a completed snapshot.
+    # Even then serving must never enter a source update or wait for its lock.
+    if _is_serving_gateway(argv) or Path(sys.argv[0]).resolve() == root / "gateway" / "run.py":
+        from hermes_cli._launchers import resolve_store_python
+        print("hermes: gateway startup defers unfinished update work; run `hermes update` to finish it",
+              file=sys.stderr, flush=True)
+        python = resolve_store_python(root)
+        if python is None:
+            raise RuntimeError("no completed managed runtime available; run `hermes pm install`")
+        same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+        return None if same else python
 
     import pm
     from hermes_cli._launchers import resolve_store_python

@@ -161,7 +161,7 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             if monitor is not None:
                 monitor.join()
             writer.close()
-            if process.wait(timeout=5):
+            if process.wait():
                 raise InstallError("pm", "worker exited unsuccessfully")
             receipt.accept_worker_receipt(response.get("receipt"), update_id)
             if callback_error is not None:
@@ -175,7 +175,11 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
                 monitor.join()
             if process.poll() is None:
                 process.terminate()
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
 
 def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=None, download_progress=None) -> Runner:

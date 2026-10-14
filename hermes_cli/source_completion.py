@@ -110,7 +110,8 @@ def _complete_locked(
     from hermes_cli.source_stamp import write_source_stamp
 
     try:
-        write_source_stamp(root)
+        if write_source_stamp(root) is None:
+            raise ValueError("completed source identity could not be read; update remains unfinished")
     except (OSError, ValueError) as exc:
         print(f"⚠ Source update maintenance finished, but the install stamp could not be written: {exc}",
               file=sys.stderr)

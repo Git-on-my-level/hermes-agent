@@ -311,7 +311,22 @@ def cmd_converge_tick(args: Any) -> None:
     settings = load_converge_settings()
     if settings.enabled and not settings.pin:
         fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
+    from hermes_cli.update_receipt import read_latest_receipt
+    previous = read_latest_receipt()
+    if previous and previous.get("outcome") in {"failed", "partial"}:
+        message = ("Converge has an unfinished failed update; serving the completed generation; "
+                   "repair will retry when idle. Inspect `hermes update status` or run `hermes update`.")
+        logger.error(message)
+        _log_tick("ALERT " + message)
+        print(message, file=sys.stderr, flush=True)
     decision = decide_from_live(PROJECT_ROOT, settings)
+    # A checkout/runtime can already name the pin while its product tail is
+    # still owed. Do not let already_current permanently suppress repair.
+    from hermes_cli.venv_sync import completion_pending_path
+    if (settings.enabled and decision.reason == "already_current"
+            and completion_pending_path(PROJECT_ROOT).is_file() and not gateway_is_busy()
+            and not checkout_is_dirty(PROJECT_ROOT)):
+        decision = ConvergeDecision("update", "unfinished_completion", decision.pin)
     _log_tick(f"action={decision.action} reason={decision.reason} pin={decision.pin[:12]}")
     if decision.action == "skip":
         return
@@ -339,6 +354,17 @@ def cmd_converge_tick(args: Any) -> None:
             _restart_gateway_fleet_after_update(None, gateway_mode=False)
             return
         cmd_update(args)
+        receipt = read_latest_receipt()
+        if receipt and receipt.get("outcome") in {"failed", "partial"}:
+            message = "Converge update failed; previous serving generation retained; operator attention required"
+            logger.error(message)
+            _log_tick("ALERT " + message)
+            print(message, file=sys.stderr, flush=True)
+    except BaseException as exc:
+        if not isinstance(exc, SystemExit) or exc.code not in (0, None):
+            logger.error("Converge update failed: %s; previous serving generation retained", exc)
+            _log_tick("ALERT converge update failed; operator attention required")
+        raise
     finally:
         try:
             from gateway.drain_control import clear_update_converge_drain
