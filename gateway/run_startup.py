@@ -670,6 +670,9 @@ class GatewayStartupMixin:
         if getattr(self, "_loop_floor_timer_handle", None) is None:
             with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
                 self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
+        if getattr(self, "_loop_lag_watchdog", None) is None:
+            from gateway.loop_lag import start_loop_lag_watchdog
+            self._loop_lag_watchdog = start_loop_lag_watchdog(loop)
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
             try:
@@ -693,6 +696,7 @@ class GatewayStartupMixin:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
         for attr, method, what in (
+            ("_loop_lag_watchdog", "set", "stop gateway loop lag watchdog"),
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
             ("_loop_heartbeat_task", "cancel", "cancel gateway loop heartbeat task"),

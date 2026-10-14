@@ -180,6 +180,11 @@ def flush_runtime_status(timeout: float = 2.0) -> bool:
 
 async def flush_runtime_status_async(timeout: float = 2.0) -> bool:
     """Await the current writer generation without blocking the event loop."""
+    from gateway.status_async import flush_pending
+    try:
+        await asyncio.wait_for(flush_pending(), timeout=max(float(timeout), 0.0))
+    except asyncio.TimeoutError:
+        return False
     writer = _runtime_status_writer
     if writer is None:
         return True

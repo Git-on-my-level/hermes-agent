@@ -1854,6 +1854,7 @@ class TelegramAdapter(BasePlatformAdapter):
         (#64482). It only appeared to work on Python 3.12, where those instances still had a ``__dict__``.
         """
         adapter = self
+        owner_loop = asyncio.get_running_loop()
 
         class _InstrumentedPollingRequest(type(request)):
             __slots__ = ()
@@ -1861,7 +1862,10 @@ class TelegramAdapter(BasePlatformAdapter):
             async def do_request(self, *args, **kwargs):
                 generation = _POLLING_GENERATION_CONTEXT.get()
                 result = await super().do_request(*args, **kwargs)
-                adapter._observe_polling_request_result(self, generation, result)
+                if asyncio.get_running_loop() is owner_loop:
+                    adapter._observe_polling_request_result(self, generation, result)
+                else:
+                    owner_loop.call_soon_threadsafe(adapter._observe_polling_request_result, self, generation, result)
                 return result
 
         request.__class__ = _InstrumentedPollingRequest
@@ -2478,6 +2482,10 @@ class TelegramAdapter(BasePlatformAdapter):
         updater = getattr(self._app, "updater", None) if self._app else None
         if updater is None:
             return
+        disarm = getattr(type(updater), "disarm_polling", None)
+        if callable(disarm):
+            disarm(updater)
+            return
         for attr in ("_Updater__polling_task_stop_event", "_polling_task_stop_event"):
             stop_event = getattr(updater, attr, None)
             if isinstance(stop_event, asyncio.Event):
@@ -3033,6 +3041,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
+        from .telegram_io import io_loop
+        io = io_loop()
         # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
         request_kwargs = {
             "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
@@ -3089,11 +3099,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url(
+        proxy_url = await io.build(resolve_proxy_url,
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
+            from .telegram_network import _telegram_ssl_context
+            general_httpx.setdefault("verify", _telegram_ssl_context())
+            updates_httpx.setdefault("verify", _telegram_ssl_context())
             return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
                     HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
 
@@ -3114,20 +3127,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 _updates_transport_kwargs["limits"] = _updates_limits
             from .telegram_request import build_fallback_request
 
-            request = build_fallback_request(
+            request = await io.build(build_fallback_request,
                 HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_transport_kwargs),
                 **request_kwargs)
-            get_updates_request = build_fallback_request(
+            get_updates_request = await io.build(build_fallback_request,
                 HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs),
                 **request_kwargs)
         elif proxy_url:
             logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
         else:
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
-        return request, self._instrument_polling_request(get_updates_request)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits})
+        from .telegram_io import isolate_request
+        return isolate_request(request), self._instrument_polling_request(isolate_request(get_updates_request))
 
     async def _initialize_app_with_retries(self, builder) -> None:
         """``app.initialize()`` with a bounded retry ladder; rebuilds ``self._app``/``self._bot`` from
@@ -3184,6 +3198,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if rebuild_app and _attempt < _max_connect - 1:
                     old_app = self._app
                     self._app = builder.build()
+                    from .telegram_io import isolate_updater
+                    isolate_updater(self._app)
                     self._bot = self._app.bot
                     # Same order as connect(): plugin handlers first (the wired-set is keyed per app, so
                     # the rebuilt app gets them again), then core and the observer in lockstep.
@@ -3307,6 +3323,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # connect-retry rebuild in _initialize_app_with_retries gets it too.
             builder = builder.concurrent_updates(build_update_processor(self.config.extra, self.name))
             self._app = builder.build()
+            from .telegram_io import isolate_updater
+            isolate_updater(self._app)
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
