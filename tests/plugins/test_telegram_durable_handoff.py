@@ -263,3 +263,64 @@ async def test_processed_updates_retire_and_unfinished_updates_survive(monkeypat
         assert await io_loop().build(app.updater.durable_inbox.count) == 1
     finally:
         await close(app)
+
+
+@pytest.mark.asyncio
+async def test_inbox_home_capture_survives_profile_a_b_a(tmp_path, monkeypatch):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    homes = [tmp_path / 'a', tmp_path / 'b', tmp_path / 'a']
+    apps = []
+    try:
+        for home in homes:
+            token = set_hermes_home_override(home)
+            try:
+                apps.append(await make_app(monkeypatch))
+            finally:
+                reset_hermes_home_override(token)
+        await io_loop().run(apps[0].updater.update_queue.put(Update(11)))
+        await io_loop().run(apps[1].updater.update_queue.put(Update(22)))
+        a = await asyncio.wait_for(apps[2].update_queue.get(), 3)
+        b = await asyncio.wait_for(apps[1].update_queue.get(), 3)
+        assert a.update_id == 11 and b.update_id == 22
+        assert apps[0].updater.durable_inbox.path == apps[2].updater.durable_inbox.path
+        assert apps[0].updater.durable_inbox.path != apps[1].updater.durable_inbox.path
+    finally:
+        for app in apps:
+            await close(app)
+
+
+@pytest.mark.asyncio
+async def test_late_commit_from_cancelled_put_wakes_replacement(monkeypatch):
+    import threading
+    app = await make_app(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    replacement = None
+    original_put = app.updater.durable_inbox.put
+    def blocked(item):
+        entered.set()
+        release.wait(10)
+        original_put(item)
+    monkeypatch.setattr(app.updater.durable_inbox, 'put', blocked)
+    sending = asyncio.create_task(io_loop().run(app.updater.update_queue.put(Update(777))))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        sending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        await asyncio.wait_for(app.updater.stop(), 1)
+        replacement = await make_app(monkeypatch)
+        # Let the replacement's initial empty-inbox read settle before the
+        # old cancelled waiter's write commits. No new Telegram update wakes it.
+        assert await io_loop().build(replacement.updater.durable_inbox.count) == 0
+        await asyncio.sleep(0.03)
+        release.set()
+        received = await asyncio.wait_for(replacement.update_queue.get(), 3)
+        assert received.update_id == 777
+        assert await io_loop().build(replacement.updater.durable_inbox.count) == 1
+    finally:
+        release.set()
+        if not sending.done():
+            sending.cancel()
+        await close(app)
+        if replacement is not None:
+            await close(replacement)

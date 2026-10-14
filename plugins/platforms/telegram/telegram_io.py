@@ -8,6 +8,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
+import weakref
 
 
 class TelegramIOLoop:
@@ -35,6 +36,16 @@ class TelegramIOLoop:
             # wrap_future chains cancellation; keep the ownership explicit.
             future.cancel()
             raise
+
+
+# Accessed only on the owning gateway loop. A late committed write from a
+# cancelled old polling action must wake a replacement pump for the same inbox.
+_inbox_readers = {}
+
+
+def _wake_inbox_readers(key):
+    for reader in tuple(_inbox_readers.get(key, ())):
+        reader.wake.set()
 
 
 # Created only by gateway-loop setup, never from an agent turn.
@@ -107,6 +118,7 @@ def isolate_updater(app):
     adapter = getattr(app, 'adapter', None)
     directory = getattr(adapter, '_update_receipt_dir', None) or get_hermes_home()
     inbox = UpdateInbox(directory, app.bot.token.split(':', 1)[0])
+    inbox_key = (gateway_loop, inbox.path)
 
     class QueueBridge:
         def __init__(self):
@@ -121,8 +133,15 @@ def isolate_updater(app):
             # A disk failure propagates: PTB must not advance its offset.
             self.accepting = True
             try:
-                await asyncio.to_thread(inbox.put, item)
-                gateway_loop.call_soon_threadsafe(self.wake.set)
+                def persist():
+                    inbox.put(item)
+                    # Runs even if cancellation abandoned this write's waiter.
+                    # All registry lookup/mutation remains on the gateway loop.
+                    try:
+                        gateway_loop.call_soon_threadsafe(_wake_inbox_readers, inbox_key)
+                    except RuntimeError:
+                        pass  # Process loop ended; committed rows replay on next boot.
+                await asyncio.to_thread(persist)
             finally:
                 self.accepting = False
 
@@ -148,10 +167,16 @@ def isolate_updater(app):
             self.closing = False
             self.cursor = 0  # Replay uncompleted rows on every polling generation.
             self.wake.set()
+            _inbox_readers.setdefault(inbox_key, weakref.WeakSet()).add(self)
             self.task = gateway_loop.create_task(self.pump())
 
         async def finish(self):
             self.closing = True
+            readers = _inbox_readers.get(inbox_key)
+            if readers is not None:
+                readers.discard(self)
+                if not readers:
+                    _inbox_readers.pop(inbox_key, None)
             if self.task is not None:
                 self.task.cancel()
                 try:
