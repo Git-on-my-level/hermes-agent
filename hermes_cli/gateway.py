@@ -3100,8 +3100,68 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)  # Completely custom path (not under ~/.hermes) — keep as-is
 
 
+# Operator escape hatch (gateway install --reset-service-path): when True, the next generated
+# launchd plist derives its PATH purely from this environment instead of carrying forward
+# entries from the installed plist. Reset to False after each install command.
+_reset_service_path: bool = False
+
+
+def _service_path_extra_dirs() -> list[str]:
+    """``gateway.service_path_extra`` — host-configured extra service PATH dirs, so hosts don't
+    hand-edit plists. Entries are kept verbatim (after ``~`` expansion) even when they don't
+    exist yet: the operator knows the host. Malformed values fail open as no extra dirs."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        gateway_cfg = (load_config_readonly() or {}).get("gateway", {}) or {}
+        raw = gateway_cfg.get("service_path_extra", [])
+    except Exception:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [os.path.expanduser(str(entry).strip()) for entry in raw if str(entry).strip()]
+
+
+def _service_tool_dirs() -> list[str]:
+    """Package-manager and user bin dirs a service PATH must start with.
+
+    Deterministic: each dir is included whenever it exists on the host, never inherited from
+    the invoking shell. Which process regenerates a service definition (an interactive shell,
+    ``hermes update``, or the ai.hermes.converge launchd job under launchd's minimal PATH)
+    must not change what the service can exec: a converge-driven regeneration once dropped
+    /opt/homebrew/bin from the plist and blinded the prod monitors for a week. System dirs
+    are appended separately, last (see _service_system_dirs)."""
+    candidates = [str(Path.home() / ".local" / "bin")]
+    if sys.platform == "darwin":
+        candidates += ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"]
+    else:
+        candidates += ["/usr/local/sbin", "/usr/local/bin"]
+    out: list[str] = []
+    for candidate in candidates:
+        try:
+            if Path(candidate).is_dir():
+                out.append(candidate)
+        except OSError:
+            continue
+    return out
+
+
+def _service_system_dirs() -> list[str]:
+    """Trailing system dirs for a service PATH (always last, after tool/carry-forward dirs)."""
+    if sys.platform == "darwin":
+        return ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    return ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
-    """Build PATH directory list for service units, excluding non-existent dirs."""
+    """Deterministic head of the service PATH: host tool dirs, config extras, then project and
+    hermes-home extras — excluding non-existent dirs.
+
+    The invoking shell's PATH must never leak in by accident: whichever process regenerates a
+    service definition (an interactive shell, ``hermes update``, the converge launchd job)
+    must produce the same PATH, so the caller's environment is deliberately not consulted
+    (carry-forward/system segments are handled by the backend generators on top of this list)."""
     if project_root is None:
         project_root = PROJECT_ROOT
 
@@ -3111,7 +3171,8 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
         except OSError:
             return False
 
-    candidates = []
+    candidates = _service_tool_dirs()
+    candidates += _service_path_extra_dirs()
     # Python and dependency executable paths are selected at boot, not persisted.
 
     hermes_home = get_hermes_home()
@@ -3300,7 +3361,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         systemd_type, systemd_watchdog_directives = "notify", f"NotifyAccess=main\nWatchdogSec={watchdog_seconds}s\n"
     path_entries.extend(_build_user_local_paths(user_home, path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
-    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+    path_entries.extend([d for d in _service_system_dirs() if d not in path_entries])
     sane_path = ":".join(path_entries)
     start = installation_command(project_root, [*shlex.split(profile_arg), "gateway", "run"],
                             python=python_path, home=hermes_home)
@@ -3361,13 +3422,12 @@ def _strip_optional_systemd_directives(text: str) -> str:
 
 
 def _normalize_launchd_plist_for_comparison(text: str) -> str:
-    """Normalize plist text for staleness checks, ignoring the PATH payload: the generated PATH is
-    captured from the invoking shell and varies across shells."""
-    import re
-    return re.sub(
-        r"(<key>PATH</key>\s*<string>)(.*?)(</string>)", r"\1__HERMES_PATH__\3",
-        _normalize_service_definition(text), flags=re.S,
-    )
+    """Normalize plist text for staleness checks. The PATH is kept: generation is deterministic
+    by construction (fixed tool/system dirs + config extras + carry-forward), so a PATH change
+    IS a definition change a caller without those dirs must not be able to veto. The carry-forward
+    segment makes regeneration converge, so the comparison stays caller-independent even when the
+    installed PATH carries dirs the invoking shell lacks."""
+    return _normalize_service_definition(text)
 
 
 def systemd_unit_is_current(system: bool = False) -> bool:
@@ -3383,7 +3443,9 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     installed = unit_path.read_text(encoding="utf-8-sig")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
-    # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
+    # The unit's PATH is deterministic (fixed tool/system dirs + config extras; the unit never
+    # carries caller PATH), so the byte-exact comparison is caller-independent. Ignore directives
+    # older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
     norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))  # noqa: E731
     return norm(installed) == norm(expected)
 
@@ -5261,7 +5323,14 @@ def _cmd_install(args):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
-        launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+        # Operator escape hatch: regeneration may otherwise carry forward entries from the
+        # installed plist forever; this one install derives the PATH from this environment.
+        global _reset_service_path
+        _reset_service_path = bool(getattr(args, "reset_service_path", False))
+        try:
+            launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+        finally:
+            _reset_service_path = False
     elif backend == "windows":
         _gw_windows().install(
             force=force,

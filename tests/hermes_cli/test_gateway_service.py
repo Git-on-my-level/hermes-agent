@@ -2439,6 +2439,8 @@ class TestServiceWorkingDirIsStable:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         plist = gateway_cli.generate_launchd_plist()
         m = re.search(r"<key>WorkingDirectory</key>\s*<string>(.*?)</string>", plist)
         assert m, "plist has no WorkingDirectory entry"
@@ -2464,6 +2466,8 @@ class TestServiceTakeoverGovernance:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         plist = gateway_cli.generate_launchd_plist()
         # The whole bug class: no --replace anywhere in the supervised argv.
         assert "--replace" not in plist
@@ -2485,6 +2489,8 @@ class TestServiceTakeoverGovernance:
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        # Carry-forward must never read the real installed plist from the test host.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
         parsed = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
         assert parsed["KeepAlive"] == {"SuccessfulExit": False}
         assert parsed["RunAtLoad"] is True

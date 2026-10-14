@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import contextlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -365,6 +366,74 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+def _installed_plist_path_dirs(plist_path: Path) -> list[str]:
+    """PATH entries baked into the installed plist at *plist_path*; ``[]`` when absent/unreadable."""
+    try:
+        import plistlib
+        with plist_path.open("rb") as fh:
+            installed = plistlib.load(fh)
+        raw = (installed.get("EnvironmentVariables") or {}).get("PATH") or ""
+    except Exception:
+        return []
+    return [entry for entry in raw.split(":") if entry]
+
+
+def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
+    """Assemble the launchd service PATH: a pure function of the host, not of the caller.
+
+    Segments, in order: ``priority_dirs`` (managed node dirs + host tool dirs + config extras),
+    then every entry of the INSTALLED plist's PATH that still exists on disk — regeneration
+    never shrinks the service PATH (a converge-driven regeneration once dropped
+    /opt/homebrew/bin and blinded the prod monitors for a week) — then the system dirs last.
+    The invoking shell's PATH is deliberately NOT consulted: whichever process regenerates the
+    plist (an SSH shell, ``hermes update``, the ai.hermes.converge launchd job under launchd's
+    minimal PATH) must produce the same PATH, and ``launchd_plist_is_current()`` must answer
+    identically for all of them. A caller-supplied entry would make the comparison
+    caller-dependent again and re-introduce this drift class. Hosts needing a non-standard dir
+    set ``gateway.service_path_extra``; ``gateway install --reset-service-path`` re-derives the
+    PATH without carry-forward. Entries missing on disk are dropped in every segment: launchd
+    runs before any per-shell rcfile exists, so a dead dir is pure dead weight."""
+    # Read through the facade so tests and the CLI flag share one seam (see AGENTS.md).
+    reset_service_path = bool(getattr(_gw(), "_reset_service_path", False))
+
+    segments: list[str] = list(priority_dirs)
+
+    def _add_existing(entries: list[str]) -> None:
+        for entry in entries:
+            if entry in segments:
+                continue
+            try:
+                if os.path.isdir(entry):
+                    segments.append(entry)
+            except OSError:
+                continue
+
+    caller_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
+    if plist_path.exists():
+        carried = _installed_plist_path_dirs(plist_path)
+        if not reset_service_path:
+            for entry in carried:
+                _add_existing([entry])
+        caller_lacking_carried = [
+            entry for entry in carried if entry not in caller_entries and entry in segments
+        ]
+        dropped = [entry for entry in carried if entry not in segments]
+        if caller_lacking_carried:
+            # The task-spec warning: the caller env lacks an entry the installed plist has.
+            logging.getLogger(__name__).warning(
+                "Installed service PATH has entries the caller PATH lacks; carried forward from "
+                "the installed plist: %s", ", ".join(caller_lacking_carried),
+            )
+        if dropped:
+            logging.getLogger(__name__).warning(
+                "Dropping dead service PATH entries no longer present on disk: %s",
+                ", ".join(dropped),
+            )
+
+    segments.extend(d for d in _gw()._service_system_dirs() if d not in segments)
+    return ":".join(dict.fromkeys(segments))
+
+
 def generate_launchd_plist() -> str:
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
@@ -374,11 +443,13 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _gw().get_launchd_label()
 
-    # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
-    # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
+    # launchd's default PATH misses Homebrew, nvm, cargo…; the service PATH is assembled
+    # deterministically (node dirs, host tool dirs, config extras, carry-forward from the
+    # installed plist, system dirs last) so regeneration never depends on who ran it
+    # (see _launchd_service_path).
     priority_dirs = _gw()._build_service_path_dirs()
     _gw()._append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
+    sane_path = _launchd_service_path(priority_dirs, _gw().get_launchd_plist_path())
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).

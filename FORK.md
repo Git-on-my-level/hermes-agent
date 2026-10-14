@@ -118,6 +118,12 @@ Fork-original self-drive additions (plugins are new files, opt-in per host throu
 | `tui_gateway/prompt_turn.py` owner steering | A TUI user turn passes the prompt to the goal judge as `owner_message` only when the goal already existed. Goal continuations are not recorded. | `tests/tui_gateway/test_goal_command.py` |
 | `plugins/session-inject/` | `hermes inject <session> "msg"` queues a user turn that the gateway delivers through `ctx.inject_message` (resume a stalled session from a shell, cron, or another agent). | `tests/plugins/test_session_inject_plugin.py` |
 
+Fork-original service-reliability additions (upstream has no equivalent):
+
+| Addition | Carried behavior | Contract tests |
+| --- | --- | --- |
+| `hermes_cli/gateway_launchd.py` `_launchd_service_path` + `hermes_cli/gateway.py` `_service_tool_dirs`/`_service_system_dirs`/`_service_path_extra_dirs` | The launchd plist and systemd unit PATH are a pure function of the host: `~/.local/bin`, existing package-manager dirs (`/opt/homebrew/*`, `/usr/local/*` on macOS), `gateway.service_path_extra` config extras, managed Node dirs, then system dirs last. The invoking shell's PATH is never consulted, so regeneration by `hermes update`/`ai.hermes.converge` under launchd's minimal PATH produces the same PATH as an SSH shell (converge once dropped `/opt/homebrew/bin` from the plist and blinded the prod monitors for a week). Installed-definition PATH entries that still exist are carried forward — regeneration never shrinks PATH — with a WARNING when the caller env lacks them; `gateway install --reset-service-path` re-derives without carry-forward. `launchd_plist_is_current()`/`systemd_unit_is_current()` are therefore caller-independent. | `tests/hermes_cli/test_gateway_service_path_determinism.py` |
+
 ## Branch retention
 
 Every sync added branches and nothing removed them: the fork reached 403
