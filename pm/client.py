@@ -15,6 +15,10 @@ from pm.plugin_inputs import Candidates, Members, PluginInput, Selection
 from pm.runtime import is_runtime, runtime_command, runtime_environment
 from pm.worker_operations import OPERATIONS
 
+# Graceful wait after a worker emits its result, then terminate/kill. An unbounded
+# wait would never reach the escalate path if interpreter shutdown hangs.
+_WORKER_EXIT_WAIT_SECONDS = 60
+
 
 def _missing_or_refuse(name):
     from pm.install import _refuse_lazy, is_installed, lazy_installs_allowed
@@ -161,8 +165,11 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             if monitor is not None:
                 monitor.join()
             writer.close()
-            if process.wait():
-                raise InstallError("pm", "worker exited unsuccessfully")
+            try:
+                if process.wait(timeout=_WORKER_EXIT_WAIT_SECONDS):
+                    raise InstallError("pm", "worker exited unsuccessfully")
+            except subprocess.TimeoutExpired:
+                pass  # finally terminate/kills; the result line is already in hand
             receipt.accept_worker_receipt(response.get("receipt"), update_id)
             if callback_error is not None:
                 raise callback_error
@@ -176,7 +183,7 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             if process.poll() is None:
                 process.terminate()
                 try:
-                    process.wait(timeout=60)
+                    process.wait(timeout=_WORKER_EXIT_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()

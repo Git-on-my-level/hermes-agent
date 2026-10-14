@@ -264,5 +264,26 @@ def test_idle_tick_finishes_pending_tail_even_if_code_already_current(tmp_path, 
     pending = tmp_path / "pending"
     pending.touch()
     monkeypatch.setattr(venv_sync, "completion_pending_path", lambda r: pending)
+    monkeypatch.setattr(venv_sync, "_tree_matches_completed_stamp", lambda r: False)
     uc.cmd_converge_tick(SimpleNamespace())
     assert len(called) == 1 and called[0].sha == PIN
+
+
+def test_idle_tick_skips_leftover_pending_when_tree_already_matches_stamp(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    called = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: (_ for _ in ()).throw(AssertionError("leftover pending drained")))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "success"})
+    pending = tmp_path / "pending"
+    pending.touch()
+    monkeypatch.setattr(venv_sync, "completion_pending_path", lambda r: pending)
+    monkeypatch.setattr(venv_sync, "_tree_matches_completed_stamp", lambda r: True)
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert called == []

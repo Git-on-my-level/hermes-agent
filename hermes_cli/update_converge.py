@@ -322,9 +322,14 @@ def cmd_converge_tick(args: Any) -> None:
     decision = decide_from_live(PROJECT_ROOT, settings)
     # A checkout/runtime can already name the pin while its product tail is
     # still owed. Do not let already_current permanently suppress repair.
-    from hermes_cli.venv_sync import completion_pending_path
+    # A pending marker older than install-stamp.json is leftover debt from a
+    # previous home/install, not an owed tail: rewriting that to update would
+    # drain-restart an idle host already on the pin every tick.
+    from hermes_cli.venv_sync import completion_pending_path, _tree_matches_completed_stamp
     if (settings.enabled and decision.reason == "already_current"
-            and completion_pending_path(PROJECT_ROOT).is_file() and not gateway_is_busy()
+            and completion_pending_path(PROJECT_ROOT).is_file()
+            and not _tree_matches_completed_stamp(PROJECT_ROOT)
+            and not gateway_is_busy()
             and not checkout_is_dirty(PROJECT_ROOT)):
         decision = ConvergeDecision("update", "unfinished_completion", decision.pin)
     _log_tick(f"action={decision.action} reason={decision.reason} pin={decision.pin[:12]}")
