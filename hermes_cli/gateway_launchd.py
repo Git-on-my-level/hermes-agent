@@ -367,15 +367,18 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
 
 
 def _installed_plist_path_dirs(plist_path: Path) -> list[str]:
-    """PATH entries baked into the installed plist at *plist_path*; ``[]`` when absent/unreadable."""
+    """PATH entries baked into the installed plist at *plist_path*; ``[]`` when absent/unreadable
+    or malformed (fail-open: generation must be able to derive a replacement PATH)."""
     try:
         import plistlib
         with plist_path.open("rb") as fh:
             installed = plistlib.load(fh)
         raw = (installed.get("EnvironmentVariables") or {}).get("PATH") or ""
+        if not isinstance(raw, str):
+            return []
+        return [entry for entry in raw.split(":") if entry]
     except Exception:
         return []
-    return [entry for entry in raw.split(":") if entry]
 
 
 def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
@@ -412,8 +415,11 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
     if plist_path.exists():
         carried = _installed_plist_path_dirs(plist_path)
         if not reset_service_path:
+            # System dirs are excluded here: they belong to the canonical tail appended below,
+            # never to a mid-PATH position inherited from the installed definition.
             for entry in carried:
-                _add_existing([entry])
+                if entry not in _gw()._service_system_dirs():
+                    _add_existing([entry])
         caller_lacking_carried = [
             entry for entry in carried if entry not in caller_entries and entry in segments
         ]
@@ -449,7 +455,10 @@ def generate_launchd_plist() -> str:
     # (see _launchd_service_path).
     priority_dirs = _gw()._build_service_path_dirs()
     _gw()._append_node_dir_for_service(priority_dirs)
-    sane_path = _launchd_service_path(priority_dirs, _gw().get_launchd_plist_path())
+    # XML-escape the whole payload: it interpolates into the plist template below, and dir names
+    # are host-controlled (`gateway.service_path_extra`, carried-forward installed entries) — a
+    # literal '&' in a dir name must round-trip as &amp; or launchd rejects the whole plist.
+    sane_path = escape(_launchd_service_path(priority_dirs, _gw().get_launchd_plist_path()))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).

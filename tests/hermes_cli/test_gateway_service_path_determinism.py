@@ -8,7 +8,6 @@ must be a pure function of the host — never of the caller's environment.
 """
 import logging
 import plistlib
-import sys
 from pathlib import Path
 
 import pytest
@@ -48,68 +47,65 @@ def _isolated_host(monkeypatch, tmp_path):
     yield
 
 
-def _fake_these_dirs_exist(monkeypatch, paths):
-    """Make Path.is_dir() report True for exactly *paths* (plus really-existing dirs)."""
+def _fake_only_these_dirs_exist(monkeypatch, paths):
+    """Make Path.is_dir() report True for EXACTLY *paths* — the host's real dirs are invisible,
+    so exact candidate lists are host-independent."""
     real_is_dir = Path.is_dir
     faked = {str(p) for p in paths}
 
     def fake_is_dir(self):
-        if str(self) in faked:
-            return True
-        return real_is_dir(self)
+        return str(self) in faked
 
     monkeypatch.setattr(Path, "is_dir", fake_is_dir)
 
 
 class TestServiceToolDirs:
+    @pytest.mark.platforms("macos")
     def test_minimal_caller_path_still_yields_host_tool_dirs(self, gateway_cli, tmp_path, monkeypatch):
         """Core regression: building the service dirs with PATH=/usr/bin:/bin (launchd minimal
-        env) must include Homebrew and ~/.local/bin whenever they exist on the host."""
+        env) must include Homebrew and ~/.local/bin whenever they exist on the host. Directory
+        existence is fully faked so the exact list is host-independent."""
         from hermes_cli.gateway import _service_tool_dirs
 
-        _fake_these_dirs_exist(
+        _fake_only_these_dirs_exist(
             monkeypatch,
             [tmp_path / ".local" / "bin", Path("/opt/homebrew/bin"),
              Path("/opt/homebrew/sbin"), Path("/usr/local/bin")],
         )
-        with monkeypatch.context() as m:
-            m.setattr(sys, "platform", "darwin")
-            dirs = _service_tool_dirs()
+        dirs = _service_tool_dirs()
         assert dirs == [
             str(tmp_path / ".local" / "bin"),
             "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
         ]
 
+    @pytest.mark.platforms("macos")
     def test_nonexistent_dirs_excluded(self, gateway_cli, monkeypatch):
         from hermes_cli.gateway import _service_tool_dirs
 
-        with monkeypatch.context() as m:
-            m.setattr(sys, "platform", "darwin")
-            dirs = _service_tool_dirs()
-        # Real host, real check: this tmp home has no ~/.local/bin and LinuxCI /opt paths are
-        # only included when they exist.
-        assert str(Path.home() / ".local" / "bin") not in dirs
+        # Nothing fake-exists: every candidate dir is excluded.
+        _fake_only_these_dirs_exist(monkeypatch, [])
+        assert _service_tool_dirs() == []
 
+    @pytest.mark.platforms("linux")
     def test_linux_candidates(self, gateway_cli, monkeypatch):
         from hermes_cli.gateway import _service_tool_dirs
 
-        _fake_these_dirs_exist(monkeypatch, [Path("/usr/local/bin")])
-        with monkeypatch.context() as m:
-            m.setattr(sys, "platform", "linux")
-            dirs = _service_tool_dirs()
-        assert dirs == ["/usr/local/bin"]
+        _fake_only_these_dirs_exist(monkeypatch, [Path("/usr/local/bin")])
+        assert _service_tool_dirs() == ["/usr/local/bin"]
 
-    def test_system_dirs_trail(self, gateway_cli, monkeypatch):
+    @pytest.mark.platforms("macos")
+    def test_system_dirs_trail_macos(self, gateway_cli):
         from hermes_cli.gateway import _service_system_dirs
 
-        with monkeypatch.context() as m:
-            m.setattr(sys, "platform", "darwin")
-            assert _service_system_dirs() == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-        with monkeypatch.context() as m:
-            m.setattr(sys, "platform", "linux")
-            assert _service_system_dirs() == [
-                "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
-            ]
+        assert _service_system_dirs() == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+    @pytest.mark.platforms("linux")
+    def test_system_dirs_trail_linux(self, gateway_cli):
+        from hermes_cli.gateway import _service_system_dirs
+
+        assert _service_system_dirs() == [
+            "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+        ]
 
 
 class TestBuildServicePathDirs:
@@ -180,6 +176,7 @@ class TestServicePathExtraConfig:
         assert gateway_cli._service_path_extra_dirs() == []
 
 
+@pytest.mark.platforms("macos")
 class TestLaunchdServicePath:
     def test_minimal_env_plist_keeps_homebrew_and_local_bin(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
@@ -224,6 +221,24 @@ class TestLaunchdServicePath:
         sane = launchd._launchd_service_path([brew_bin], installed).split(":")
         assert custom in sane
         assert sane.index(brew_bin) < sane.index(custom) < sane.index("/usr/bin")
+
+    def test_installed_system_dirs_move_to_canonical_tail(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """A pre-fix installed PATH like /usr/bin:/bin:<custom> must regenerate with <custom>
+        BEFORE the canonical system tail — system dirs are never carried into mid-PATH
+        positions, and the result is stable under a second regeneration."""
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": f"/usr/bin:/bin:{custom}"},
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        sane = launchd._launchd_service_path([], installed).split(":")
+        assert sane.index(custom) < sane.index("/usr/bin")
+        assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        assert sane.count("/usr/bin") == 1
 
     def test_reset_service_path_drops_carry_forward(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
@@ -274,6 +289,7 @@ class TestLaunchdServicePath:
         assert a == b
 
 
+@pytest.mark.platforms("macos")
 class TestLaunchdPlistIsCurrent:
     def test_same_answer_under_minimal_and_full_caller_env(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
@@ -296,30 +312,76 @@ class TestLaunchdPlistIsCurrent:
         assert gateway_cli.launchd_plist_is_current() is True
 
     def test_detects_drifted_installed_path(self, gateway_cli, launchd, tmp_path, monkeypatch):
-        """An installed plist whose PATH lost Homebrew (pre-fix install) is detected as stale
-        so the refresh path repairs it — the old PATH-blind comparison hid exactly this."""
+        """An installed plist whose PATH payload was swapped for a Homebrew-less one (pre-fix
+        install, converge-regenerated) is detected as stale so the refresh path repairs it —
+        the old PATH-blind comparison answered "current" for exactly this plist. The plist text
+        is the generator's own output with ONLY the PATH value rewritten, so any inequality
+        comes from the PATH alone; with the old PATH-blanking normalizer restored this test
+        fails (it would return True)."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         brew_bin = _make_dir(tmp_path / "hb" / "bin")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda project_root=None: [brew_bin])
 
-        good = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
-        drifted = dict(good)
-        drifted["EnvironmentVariables"] = dict(good["EnvironmentVariables"])
-        drifted["EnvironmentVariables"]["PATH"] = "/usr/bin:/bin"
-        plist_path.write_bytes(plistlib.dumps(drifted))
+        generated = gateway_cli.generate_launchd_plist()
+        import re as _re
+
+        old_path_value = _re.search(
+            r"<key>PATH</key>\s*<string>(.*?)</string>", generated, _re.S,
+        ).group(1)
+        drifted_text = generated.replace(old_path_value, "/usr/bin:/bin")
+        assert drifted_text != generated
+        plist_path.write_text(drifted_text, encoding="utf-8")
 
         assert gateway_cli.launchd_plist_is_current() is False
 
+    def test_unchanged_plist_with_xml_hostile_dir_round_trips(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """A carried-forward dir name containing '&' must survive a generation round-trip:
+        the payload is XML-escaped once, and the escaped text stays byte-stable (no
+        double-escaping on the next regeneration from the installed plist)."""
+        import plistlib as _pl
+
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        custom = _make_dir(tmp_path / "tools&helpers")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda project_root=None: [custom])
+
+        first = gateway_cli.generate_launchd_plist()
+        assert "tools&amp;helpers" in first
+        parsed = _pl.loads(first.encode("utf-8"))
+        assert parsed["EnvironmentVariables"]["PATH"].split(":")[0] == custom
+
+        # Install it, regenerate from the installed plist: the escaped entry is carried
+        # forward decoded ('tools&helpers'), re-escaped once — byte-identical output.
+        plist_path.write_text(first, encoding="utf-8")
+        second = gateway_cli.generate_launchd_plist()
+        assert second == first
+
+    def test_malformed_installed_plist_fails_open(self, gateway_cli, launchd, tmp_path, monkeypatch):
+        """A syntactically valid plist with a non-string PATH must not break generation:
+        carry-forward fails open and the PATH is derived from the host alone."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        brew_bin = _make_dir(tmp_path / "hb" / "bin")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        plist_path.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": 42},
+        }))
+        sane = launchd._launchd_service_path([brew_bin], plist_path).split(":")
+        assert brew_bin in sane
+        assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
 
 class TestSystemdUnitPath:
+    @pytest.mark.platforms("macos")
     def test_unit_path_starts_with_tool_dirs_and_ignores_caller_path(
         self, gateway_cli, tmp_path, monkeypatch,
     ):
         """The systemd unit never carried the caller PATH but also missed Homebrew; the
         deterministic head must now include it (faked) without letting the caller PATH in."""
         brew_bin = "/opt/homebrew/bin"
-        _fake_these_dirs_exist(
+        _fake_only_these_dirs_exist(
             monkeypatch,
             [tmp_path / ".local" / "bin", Path(brew_bin),
              Path("/opt/homebrew/sbin"), Path("/usr/local/bin")],
@@ -350,6 +412,7 @@ class TestSystemdUnitPath:
         assert gateway_cli.systemd_unit_is_current(system=False) is True
 
 
+@pytest.mark.platforms("macos")
 class TestNormalizeLaunchdPlist:
     def test_normalize_keeps_path_payload(self, gateway_cli):
         text = "<key>PATH</key>\n    <string>/usr/bin:/bin</string>"
