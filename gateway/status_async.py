@@ -4,12 +4,12 @@ Status is a snapshot, so a blocked preparer retains only the latest fields per
 platform instead of growing an executor queue on every retry/heartbeat.
 """
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from tools.daemon_pool import DaemonThreadPoolExecutor
 from contextvars import copy_context
 import logging
 
 logger = logging.getLogger(__name__)
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='gateway-status-prepare')
+_executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix='gateway-status-prepare')
 _batches = {}
 
 
