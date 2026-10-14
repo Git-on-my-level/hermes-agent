@@ -1150,9 +1150,12 @@ exist on the host (`/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`,
 `/usr/local/sbin` on macOS), any configured extras, managed Node dirs, and the
 system dirs last. The invoking shell's `PATH` is deliberately ignored, so
 regenerating a service definition from a cron job, SSH shell, or the
-`ai.hermes.converge` updater produces the same `PATH` every time. Entries
-present in the installed definition that still exist on disk are carried
-forward when regenerating, so an update can never shrink the service `PATH`.
+`ai.hermes.converge` updater produces the same `PATH` every time.
+
+On macOS, entries present in the installed plist's `PATH` that still exist on
+disk are carried forward when regenerating, so an update can never shrink the
+service `PATH` (the systemd unit never carried caller `PATH`, so its
+regeneration is already stable without carry-forward).
 
 To add a non-standard directory, set `gateway.service_path_extra` instead of
 hand-editing the plist or unit:
@@ -1164,8 +1167,9 @@ gateway:
     - ~/bin
 ```
 
-`gateway install --reset-service-path` reinstalls the service with a `PATH`
-derived purely from the current host state, dropping carried-forward entries.
+`gateway install --reset-service-path` reinstalls the macOS service with a
+`PATH` derived purely from the current host state, dropping carried-forward
+entries.
 
 ## Session Stall Watchdog
 
