@@ -3106,13 +3106,42 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
 _reset_service_path: bool = False
 
 
-def _service_path_extra_dirs() -> list[str]:
+def _expand_tilde(entry: str, home: Path) -> str:
+    """Expand a leading ``~`` against *home* explicitly (os.path.expanduser reads $HOME, which
+    under sudo is the INSTALLER's home — the target user's must be passed in)."""
+    if entry == "~":
+        return str(home)
+    if entry.startswith("~/"):
+        return str(home / entry[2:])
+    return entry
+
+
+def _resolve_service_path_entry(entry: str, home: Path | None = None) -> str:
+    """Resolve one service PATH entry to an absolute path WITHOUT changing its filesystem
+    meaning: relative entries anchor to *home* (else the service working dir), ``~`` expands
+    against *home*, and ``..`` components are resolved through the filesystem (realpath) —
+    a lexical collapse would rewrite ``link/../bin`` to a sibling that may not exist, because
+    ``link/..`` follows the symlink, not the spelling."""
+    from hermes_cli.gateway import _stable_service_working_dir
+
+    target_home = Path(home) if home is not None else Path.home()
+    expanded = _expand_tilde(entry, target_home)
+    if not os.path.isabs(expanded):
+        expanded = str(Path(_stable_service_working_dir()) / expanded)
+    if ".." in expanded.split("/"):
+        try:
+            expanded = os.path.realpath(expanded)
+        except OSError:
+            pass
+    return expanded
+
+
+def _service_path_extra_dirs(home: Path | None = None) -> list[str]:
     """``gateway.service_path_extra`` — host-configured extra service PATH dirs, so hosts don't
-    hand-edit plists. Entries are kept verbatim (after ``~`` expansion) even when they don't
+    hand-edit plists. Entries are kept verbatim (tilde expanded against *home*, relative
+    anchored to the service working dir, ``..`` filesystem-resolved) even when they don't
     exist yet: the operator knows the host. Malformed values fail open as no extra dirs.
-    Relative entries are anchored to the service's stable working directory — the same rule
-    carry-forward applies — and every entry is lexically normalized, so generation and later
-    regeneration (which reads back the anchored absolute path) agree."""
+    Spellings are preserved so regeneration reads back and deduplicates the same string."""
     try:
         from hermes_cli.config import load_config_readonly
         gateway_cfg = (load_config_readonly() or {}).get("gateway", {}) or {}
@@ -3128,14 +3157,11 @@ def _service_path_extra_dirs() -> list[str]:
         entry = str(entry).strip()
         if not entry:
             continue
-        expanded = os.path.expanduser(entry)
-        if not os.path.isabs(expanded):
-            expanded = str(Path(_stable_service_working_dir()) / expanded)
-        out.append(os.path.normpath(expanded))
+        out.append(_resolve_service_path_entry(entry, home))
     return out
 
 
-def _service_tool_dirs() -> list[str]:
+def _service_tool_dirs(home: Path | None = None) -> list[str]:
     """Package-manager and user bin dirs a service PATH must start with.
 
     Deterministic: each dir is included whenever it exists on the host, never inherited from
@@ -3143,8 +3169,10 @@ def _service_tool_dirs() -> list[str]:
     ``hermes update``, or the ai.hermes.converge launchd job under launchd's minimal PATH)
     must not change what the service can exec: a converge-driven regeneration once dropped
     /opt/homebrew/bin from the plist and blinded the prod monitors for a week. System dirs
-    are appended separately, last (see _service_system_dirs)."""
-    candidates = [str(Path.home() / ".local" / "bin")]
+    are appended separately, last (see _service_system_dirs). *home* is the account whose
+    ~/.local/bin is probed — system units pass the TARGET user's home, never the installer's."""
+    base_home = Path(home) if home is not None else Path.home()
+    candidates = [str(base_home / ".local" / "bin")]
     if sys.platform == "darwin":
         candidates += ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"]
     else:
@@ -3196,14 +3224,16 @@ def _strip_canonical_system_dirs(entries: list[str], system_dirs: list[str]) -> 
     return out
 
 
-def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
+def _build_service_path_dirs(project_root: Path | None = None, home: Path | None = None) -> list[str]:
     """Deterministic head of the service PATH: host tool dirs, config extras, then project and
     hermes-home extras — excluding non-existent dirs.
 
     The invoking shell's PATH must never leak in by accident: whichever process regenerates a
     service definition (an interactive shell, ``hermes update``, the converge launchd job)
     must produce the same PATH, so the caller's environment is deliberately not consulted
-    (carry-forward/system segments are handled by the backend generators on top of this list)."""
+    (carry-forward/system segments are handled by the backend generators on top of this list).
+    *home* scopes user-relative discovery (``~/.local/bin`` probe, config-extra expansion):
+    system units pass the TARGET user's home; everyone else means the invoking account."""
     if project_root is None:
         project_root = PROJECT_ROOT
 
@@ -3213,8 +3243,8 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
         except OSError:
             return False
 
-    candidates = _service_tool_dirs()
-    candidates += _service_path_extra_dirs()
+    candidates = _service_tool_dirs(home)
+    candidates += _service_path_extra_dirs(home)
     # Python and dependency executable paths are selected at boot, not persisted.
 
     hermes_home = get_hermes_home()
@@ -3354,13 +3384,15 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # The service runs as the TARGET user: its head PATH segments (configured extras,
         # tool dirs, hermes-home extras) must come from the TARGET user's hermes home /
         # config, never from the invoking (sudo) caller's — read them under the target-home
-        # override, then restore, exactly like _systemd_watchdog_seconds does.
+        # override, then restore, exactly like _systemd_watchdog_seconds does. The OS home
+        # (~/.local/bin probe, ~ expansion) is passed explicitly: Path.home()/$HOME stay the
+        # INSTALLER's under sudo and the override does not change them.
         username, group_name, home_dir, uid = _system_service_identity(run_as_user)
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         target_hermes_home = _hermes_home_for_target_user(home_dir)
         override_token = set_hermes_home_override(target_hermes_home)
         try:
-            path_entries = _build_service_path_dirs()
+            path_entries = _build_service_path_dirs(home=Path(home_dir))
         finally:
             reset_hermes_home_override(override_token)
     else:

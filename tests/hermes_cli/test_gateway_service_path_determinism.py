@@ -7,6 +7,7 @@ converge-driven regeneration under launchd's minimal PATH silently dropped
 must be a pure function of the host — never of the caller's environment.
 """
 import logging
+import os
 import plistlib
 from pathlib import Path
 
@@ -128,7 +129,7 @@ class TestBuildServicePathDirs:
 
     def test_config_extras_appended_after_tool_dirs(self, gateway_cli, tmp_path, monkeypatch):
         extra = _make_dir(tmp_path / "tools" / "bin")
-        monkeypatch.setattr(gateway_cli, "_service_path_extra_dirs", lambda: [extra])
+        monkeypatch.setattr(gateway_cli, "_service_path_extra_dirs", lambda home=None: [extra])
         dirs = gateway_cli._build_service_path_dirs(project_root=tmp_path)
         assert dirs.index(extra) >= 0
         if len(dirs) > 1:
@@ -369,6 +370,29 @@ class TestLaunchdServicePath:
         assert sane.endswith("/usr/bin:/bin:/usr/sbin:/sbin")
         assert not [r for r in caplog.records if "no longer present on disk" in r.getMessage()]
 
+    def test_dotdot_carry_forward_keeps_symlink_semantics(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """An installed entry '<link>/../bin' with link → actual/vX.Y must keep its filesystem
+        meaning: link/.. lands in actual/, so the entry resolves to actual/bin. A lexical
+        collapse (normpath) rewrites it to the sibling tmp/bin, which does not exist — the
+        old behavior dropped the real executable dir and warned it dead."""
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        version_dir = _make_dir(tmp_path / "actual" / "vX.Y")
+        actual_bin = _make_dir(tmp_path / "actual" / "bin")
+        link = tmp_path / "link"
+        link.symlink_to(Path(version_dir))
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": f"{link}/../bin:/usr/bin:/bin"},
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        sane = launchd._launchd_service_path([], installed).split(":")
+        # realpath also resolves macOS's /var→/private/var alias, so compare through it.
+        resolved = [os.path.realpath(e) for e in sane]
+        assert os.path.realpath(actual_bin) in resolved
+        assert os.path.realpath(str(tmp_path / "bin")) not in resolved
+
     def test_reset_service_path_drops_carry_forward(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
     ):
@@ -545,7 +569,7 @@ class TestSystemdUnitPath:
         Environment= quoting and % specifier expansion (config-load regression)."""
         hostile = _make_dir(tmp_path / 'tools"help\\er%s')
         monkeypatch.setattr(
-            gateway_cli, "_service_path_extra_dirs", lambda: [hostile],
+            gateway_cli, "_service_path_extra_dirs", lambda home=None: [hostile],
         )
 
         unit = gateway_cli.generate_systemd_unit(system=False)
@@ -564,7 +588,7 @@ class TestSystemdUnitPath:
         in service_path_extra (any spelling) must not precede custom dirs."""
         custom = _make_dir(tmp_path / "custom-tool-dir")
         monkeypatch.setattr(
-            gateway_cli, "_service_path_extra_dirs", lambda: ["/usr/bin/", str(custom)],
+            gateway_cli, "_service_path_extra_dirs", lambda home=None: ["/usr/bin/", str(custom)],
         )
 
         unit = gateway_cli.generate_systemd_unit(system=False)
@@ -610,6 +634,37 @@ class TestSystemdUnitPath:
 
         assert installer_extra not in unit
         assert target_extra in unit
+
+    def test_system_unit_probes_target_users_local_bin(self, gateway_cli, tmp_path, monkeypatch):
+        """The ~/.local/bin probe for a system unit must run against the TARGET user's OS
+        home — Path.home()/$HOME stay the installer's under sudo. With the target's
+        .local/bin present and the installer's absent, the target's dir wins its slot."""
+        root_home = tmp_path / "root-home"
+        target_home = tmp_path / "target-home"
+        root_hermes = root_home / ".hermes"
+        root_hermes.mkdir(parents=True)
+
+        real_is_dir = Path.is_dir
+        faked = {target_home / ".local" / "bin"}
+
+        def fake_is_dir(self):
+            if self in faked:
+                return True
+            return real_is_dir(self)
+
+        monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
+        monkeypatch.setenv("HERMES_HOME", str(root_hermes))
+        monkeypatch.setattr(
+            gateway_cli, "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
+        )
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_hermes)
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert str(target_home / ".local" / "bin") in unit
+        assert str(root_home / ".local" / "bin") not in unit
 
 
 @pytest.mark.platforms("macos")

@@ -417,12 +417,11 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
                 continue
 
     def _resolve_entry(entry: str) -> str:
-        # A relative installed entry would resolve against the REGENERATING process's cwd —
-        # exactly the caller-dependence this fix removes. Anchor it to the service's stable
-        # working directory so every regenerator agrees.
-        if os.path.isabs(entry):
-            return entry
-        return str(Path(_gw()._stable_service_working_dir()) / entry)
+        # Shared resolver: relative entries anchor to the service's stable working directory
+        # (never the REGENERATING process's cwd), and ``..`` components resolve through the
+        # filesystem (realpath), because ``link/../bin`` must keep following the symlink —
+        # a lexical collapse would rewrite it to a sibling that may not exist.
+        return _gw()._resolve_service_path_entry(entry)
 
     # Canonical system dirs never sit in mid-PATH segments — not in the tool/config head either
     # (an operator CAN list /usr/bin in service_path_extra), in any spelling (/usr/bin/ counts):
