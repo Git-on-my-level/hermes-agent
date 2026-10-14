@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "request_key": "hermes-gateway-path-determinism-review-01",
+  "request_key": "hermes-gateway-path-determinism-review-02",
   "selector": {
     "family": "sol"
   }

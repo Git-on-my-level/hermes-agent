@@ -3362,7 +3362,10 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     path_entries.extend(_build_user_local_paths(user_home, path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend([d for d in _service_system_dirs() if d not in path_entries])
-    sane_path = ":".join(path_entries)
+    # _systemd_env_line escapes backslashes/quotes and doubles % specifiers; a raw f-string
+    # here would let a hostile dir name (service_path_extra, carried entries) corrupt or break
+    # the Environment= assignment.
+    sane_path_line = _systemd_env_line("PATH", ":".join(path_entries)).strip()
     start = installation_command(project_root, [*shlex.split(profile_arg), "gateway", "run"],
                             python=python_path, home=hermes_home)
     cleanup = installation_command(project_root, module="gateway.cgroup_cleanup",
@@ -3379,7 +3382,7 @@ Wants=network-online.target
 Type={systemd_type}
 {systemd_watchdog_directives}{identity_lines}ExecStart={_systemd_command(start)}
 WorkingDirectory={working_dir}
-{env_lines}Environment="PATH={sane_path}"
+{env_lines}{sane_path_line}
 
 Environment="HERMES_HOME={hermes_home}"
 Environment="HERMES_SUPERVISED_CHILD=1"

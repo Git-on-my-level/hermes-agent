@@ -240,6 +240,65 @@ class TestLaunchdServicePath:
         assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         assert sane.count("/usr/bin") == 1
 
+    def test_config_extra_system_dir_bubbles_to_tail(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """An operator listing a canonical system dir in service_path_extra must not pin it
+        into a mid-PATH position: the tail stays canonical and last."""
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        sane = launchd._launchd_service_path(["/usr/bin", custom], tmp_path / "absent.plist").split(":")
+        assert sane.index(custom) < sane.index("/usr/bin")
+        assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        assert sane.count("/usr/bin") == 1
+
+    def test_relative_carry_forward_anchors_to_service_workdir(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """A relative installed entry must resolve against the service's stable working
+        directory, never against the regenerating process's cwd (caller-dependence)."""
+        import os as _os
+
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": "bin:/usr/bin:/bin"},
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(gateway_cli, "_stable_service_working_dir", lambda: str(tmp_path))
+
+        cwd_a = tmp_path / "caller-a"
+        cwd_a.mkdir()
+
+        for make_workdir_bin in (True, False):
+            workdir_bin = tmp_path / "bin"
+            if make_workdir_bin:
+                workdir_bin.mkdir()
+            try:
+                sane = launchd._launchd_service_path([], installed).split(":")
+            finally:
+                if make_workdir_bin:
+                    workdir_bin.rmdir()
+            expected = str(tmp_path / "bin")
+            if make_workdir_bin:
+                assert sane.index(expected) < sane.index("/usr/bin")
+            else:
+                assert expected not in sane
+        assert cwd_a.exists()  # cwd of the "caller" is irrelevant to the outcome
+
+    def test_healthy_system_tail_not_reported_dead(
+        self, gateway_cli, launchd, tmp_path, monkeypatch, caplog,
+    ):
+        """Regenerating a canonical installed PATH must not warn that /usr/bin etc. are dead —
+        they land in the tail; warnings fire only for entries truly absent from the result."""
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": "/usr/bin:/bin"},
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.gateway_launchd"):
+            sane = launchd._launchd_service_path([], installed)
+        assert sane.endswith("/usr/bin:/bin:/usr/sbin:/sbin")
+        assert not [r for r in caplog.records if "no longer present on disk" in r.getMessage()]
+
     def test_reset_service_path_drops_carry_forward(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
     ):
@@ -410,6 +469,25 @@ class TestSystemdUnitPath:
         assert gateway_cli.systemd_unit_is_current(system=False) is True
         monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/homebrew/bin")
         assert gateway_cli.systemd_unit_is_current(system=False) is True
+
+    def test_unit_path_escapes_hostile_dir_names(self, gateway_cli, tmp_path, monkeypatch):
+        """A service_path_extra dir with quotes/backslashes/% must survive systemd's
+        Environment= quoting and % specifier expansion (config-load regression)."""
+        hostile = _make_dir(tmp_path / 'tools"help\\er%s')
+        monkeypatch.setattr(
+            gateway_cli, "_service_path_extra_dirs", lambda: [hostile],
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        import re as _re
+        m = _re.search(r'Environment="PATH=(.*?)"\n', unit)
+        assert m, "unit has no PATH Environment line"
+        escaped = m.group(1)
+        assert escaped.count('%"') == 0  # no raw quote leaked from the dir name
+        assert "\\%" in escaped or "%%" in escaped.replace("\\%", "")  # % specifier doubled
+        # Round-trips through the same unquoting systemd's parsers use (see _unit_environment_value).
+        unescaped = escaped.replace('\\"', '"').replace("\\\\", "\\").replace("%%", "%")
+        assert unescaped.split(":")[0] == hostile or hostile in unescaped.split(":")
 
 
 @pytest.mark.platforms("macos")

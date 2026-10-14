@@ -398,6 +398,7 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
     runs before any per-shell rcfile exists, so a dead dir is pure dead weight."""
     # Read through the facade so tests and the CLI flag share one seam (see AGENTS.md).
     reset_service_path = bool(getattr(_gw(), "_reset_service_path", False))
+    system_dirs = _gw()._service_system_dirs()
 
     segments: list[str] = list(priority_dirs)
 
@@ -411,32 +412,59 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
             except OSError:
                 continue
 
+    def _resolve_entry(entry: str) -> str:
+        # A relative installed entry would resolve against the REGENERATING process's cwd —
+        # exactly the caller-dependence this fix removes. Anchor it to the service's stable
+        # working directory so every regenerator agrees.
+        if os.path.isabs(entry):
+            return entry
+        return str(Path(_gw()._stable_service_working_dir()) / entry)
+
+    # Canonical system dirs never sit in mid-PATH segments — not in the tool/config head either
+    # (an operator CAN list /usr/bin in service_path_extra): the tail below appends them exactly
+    # once, in canonical order, so executable precedence is stable across regenerations.
+    segments = [d for d in segments if d not in system_dirs]
+
     caller_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
+    carried: list[str] = []
     if plist_path.exists():
-        carried = _installed_plist_path_dirs(plist_path)
+        carried = [_resolve_entry(e) for e in _installed_plist_path_dirs(plist_path)]
         if not reset_service_path:
-            # System dirs are excluded here: they belong to the canonical tail appended below,
-            # never to a mid-PATH position inherited from the installed definition.
             for entry in carried:
-                if entry not in _gw()._service_system_dirs():
+                if entry not in system_dirs:
                     _add_existing([entry])
         caller_lacking_carried = [
-            entry for entry in carried if entry not in caller_entries and entry in segments
+            entry for entry in carried
+            if entry not in caller_entries and entry in segments and entry not in system_dirs
         ]
-        dropped = [entry for entry in carried if entry not in segments]
         if caller_lacking_carried:
             # The task-spec warning: the caller env lacks an entry the installed plist has.
             logging.getLogger(__name__).warning(
                 "Installed service PATH has entries the caller PATH lacks; carried forward from "
                 "the installed plist: %s", ", ".join(caller_lacking_carried),
             )
-        if dropped:
+        if reset_service_path:
+            intentionally_dropped = [
+                e for e in carried if e not in segments and e not in system_dirs
+            ]
+            if intentionally_dropped:
+                logging.getLogger(__name__).warning(
+                    "--reset-service-path: dropped installed service PATH entries not derived "
+                    "from this environment: %s", ", ".join(intentionally_dropped),
+                )
+
+    segments.extend(d for d in system_dirs if d not in segments)
+
+    if carried and not reset_service_path:
+        # Warnings are computed against the FINAL PATH: carried system dirs land in the tail
+        # above, so anything still listed here is truly absent from the service PATH.
+        dead = [e for e in carried if e not in segments]
+        if dead:
             logging.getLogger(__name__).warning(
                 "Dropping dead service PATH entries no longer present on disk: %s",
-                ", ".join(dropped),
+                ", ".join(dead),
             )
 
-    segments.extend(d for d in _gw()._service_system_dirs() if d not in segments)
     return ":".join(dict.fromkeys(segments))
 
 
