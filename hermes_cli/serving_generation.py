@@ -64,6 +64,95 @@ def _dependency_inputs_match(workspace: Path, source: Path) -> bool:
         return False
 
 
+class ServingGenerationPublishError(ValueError):
+    """An update must not announce completion without a recoverable serving pair."""
+
+
+class GatewayServingRefused(RuntimeError):
+    """Fatal bootstrap gate, never a recoverable CLI dependency warning."""
+
+
+def publish_completed_generation(root: Path, stamp: dict) -> None:
+    """Strict publication seam for update and consistent first-deploy startup."""
+    from pm.environments import committed_venv
+    from hermes_cli.version_info import _git_version_info
+    reason = None
+    if stamp.get('dirty') is not False or stamp.get('adoptedAt') or not stamp.get('commit'):
+        reason = 'install stamp is dirty, unknown or adopted rather than completed'
+    else:
+        info = _git_version_info(root, include_untracked=True)
+        if info.dirty or info.commit != stamp['commit']:
+            reason = 'Git identity is dirty/unknown or HEAD differs from the install stamp'
+    environment = committed_venv(root)
+    if reason is None and environment is None:
+        reason = 'no committed dependency environment'
+    if reason is None and environment is not None:
+        if not _dependency_inputs_match(environment.parent / 'workspace', root):
+            reason = 'dependency declarations differ from the committed environment'
+        elif any(not (root / name).is_dir() for name in ('skills', 'locales', 'scripts')):
+            reason = 'source is missing required skills/locales/scripts resources'
+        else:
+            from pm.install import venv_is_current
+            if not venv_is_current(project_root=root):
+                reason = 'dependency stamp does not match the checkout'
+    if reason:
+        raise ServingGenerationPublishError('Serving generation publication failed: ' + reason)
+    if not record_completed_generation(root, stamp):
+        from pm.environments import install_state_dir
+        snapshot = install_state_dir(root) / 'serving-source' / stamp['commit']
+        reason = ('archived source stamp/resources (skills/locales/scripts) did not validate'
+                  if snapshot.is_dir() and not _complete_source(snapshot, stamp['commit']) else
+                  'snapshot validation or Git identity changed during publication')
+        raise ServingGenerationPublishError('Serving generation publication failed: ' + reason)
+    print(f'hermes: completed serving generation published: {record_path(root)} (commit {stamp["commit"]})',
+          file=sys.stderr, flush=True)
+
+
+def ensure_first_serving_generation(root: Path) -> None:
+    """Publish only a provably completed legacy checkout; never adopt update debt."""
+    try:
+        if read_generation(root) is not None:
+            return
+        from hermes_cli.steward import read_install_stamp
+        from hermes_cli.update_lock import update_marker_path
+        from hermes_cli.venv_sync import completion_pending_path
+        from pm.install import venv_is_current  # Read-only local stamp probe; no PM worker or provisioning.
+        stamp = read_install_stamp(root)
+        if completion_pending_path(root).exists() or update_marker_path().exists():
+            raise ValueError('pending update/completion marker')
+        if not venv_is_current(project_root=root):
+            raise ValueError('dependency stamp does not match the checkout')
+        # A legacy adoption is sufficient only after the full current dependency
+        # stamp probe above independently verifies it; adoption alone is not proof.
+        stamp = {key: value for key, value in stamp.items() if key != 'adoptedAt'}
+        publish_completed_generation(root, stamp)
+        if read_generation(root) is None:
+            raise ValueError('published serving record did not validate')
+    except Exception as exc:
+        reason = ' '.join(str(exc).split())
+        raise GatewayServingRefused(
+            f'Refusing gateway startup: no validated completed generation; {reason}; '
+            'repair with `hermes update` from the owning install; will not run a half-updated tree') from None
+    print('hermes: first-deploy serving generation published from consistent install', file=sys.stderr, flush=True)
+
+
+def exit_refused_gateway(exc: GatewayServingRefused) -> None:
+    """Fail at the process boundary, with an alert and a supervisor-independent retry floor."""
+    import time
+    from hermes_startup_watchdog import disarm_startup_watchdog
+    disarm_startup_watchdog()  # This refusal/backoff is intentional, not a startup deadlock.
+    print(f'hermes: {exc}; retry backoff 60s; exit 78', file=sys.stderr, flush=True)
+    try:
+        from gateway.status import write_runtime_status
+        write_runtime_status(gateway_state='startup_failed', exit_reason='unvalidated_serving_generation',
+                             platform='startup', platform_state='fatal', needs_attention=True,
+                             error_code='unvalidated_serving_generation', error_message=str(exc), wait_timeout=1.0)
+    except Exception:
+        pass  # The one stderr line remains authoritative if local alert persistence fails.
+    time.sleep(60)  # Applies even to an older supervisor without launcher markers or throttling.
+    raise SystemExit(78)
+
+
 def record_completed_generation(root: Path, stamp: dict) -> bool:
     """Publish source at update completion; no source copy or install at boot."""
     from pm.environments import committed_venv, install_state_dir

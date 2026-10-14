@@ -21,13 +21,13 @@ def transition(tmp_path):
     home.mkdir()
     package = root / "hermes_cli"
     package.mkdir()
-    (package / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("", encoding='utf-8')
     pm_package = root / "pm"
     pm_package.mkdir()
-    (pm_package / "__init__.py").write_text("OLD_API = True\n")
+    (pm_package / "__init__.py").write_text("OLD_API = True\n", encoding='utf-8')
 
     def git(*args):
-        return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+        return subprocess.run(["git", *args], cwd=root, text=True, encoding='utf-8', capture_output=True, check=True).stdout.strip()
 
     git("init", "-b", "main")
     git("config", "user.name", "Completion test")
@@ -41,24 +41,24 @@ def transition(tmp_path):
         "def sync_venv(*, explicit, project_root, evict_incompatible_plugins):\n"
         "    assert explicit and evict_incompatible_plugins\n"
         "    event('prepare')\n"
-    )
+    , encoding='utf-8')
     (root / "pm/receipt.py").write_text(
         "from contextlib import nullcontext\n"
         "worker_context = lambda update_id: nullcontext()\n"
         "last_for_update = lambda update_id: {'update_id': update_id, 'outcome': 'success'}\n"
         "def accept_worker_receipt(data, update_id):\n"
         "    assert data['update_id'] == update_id\n"
-    )
+    , encoding='utf-8')
     (root / "pm/client.py").write_text(
         "from hermes_cli.probe import event\n"
         "ensure_tools_for_sync = lambda: event('tools')\n"
-    )
+    , encoding='utf-8')
     (package / "probe.py").write_text(
         "import json, os, pathlib, sys\n"
         "def event(name, **values):\n"
         "    with pathlib.Path('events.jsonl').open('a') as f:\n"
         "        f.write(json.dumps(dict(name=name, pid=os.getpid(), python=sys.executable, **values)) + '\\n')\n"
-    )
+    , encoding='utf-8')
     selected = tmp_path / "selected-python"
     venv.EnvBuilder(with_pip=False).create(selected)
     selected_python = selected / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -71,7 +71,7 @@ def transition(tmp_path):
         "def activate_dependencies(root):\n"
         "    from hermes_cli.probe import event\n"
         "    event('activate')\n"
-    )
+    , encoding='utf-8')
     (root / "hermes_constants.py").write_text(
         # source_completion's update lock resolves the process home through
         # hermes_constants (never a profile override), like the Rust updater does.
@@ -79,7 +79,7 @@ def transition(tmp_path):
         "from pathlib import Path\n"
         "def get_process_hermes_home():\n"
         "    return Path(os.environ['HERMES_HOME'])\n"
-    )
+    , encoding='utf-8')
     (package / "venv_sync.py").write_text(
         "from hermes_cli.probe import event\n"
         "publish_launchers = lambda root: event('launchers')\n"
@@ -93,15 +93,15 @@ def transition(tmp_path):
         "    return path\n"
         "def clear_completion(root):\n"
         "    (Path(os.environ['HERMES_HOME']) / 'completion-pending').unlink()\n"
-    )
+    , encoding='utf-8')
     (package / "source_build.py").write_text(
         "from hermes_cli.probe import event\n"
         "def build_update_products(root, *, desktop): event('build', desktop=desktop)\n"
-    )
+    , encoding='utf-8')
     (package / "source_stamp.py").write_text(
         "from hermes_cli.probe import event\n"
-        "write_source_stamp = lambda root: event('stamp')\n"
-    )
+        "write_source_stamp = lambda root: event('stamp') or {'commit': 'completed-fixture'}\n"
+    , encoding='utf-8')
     # The shared completion tail is part of the NEW tree the child runs from, and so are the
     # modules its imports reach: update_lock (the tail claims the shared update lock) and
     # _subprocess_compat (it exposes PM's git for the builds) — neither exists in the OLD
@@ -112,18 +112,18 @@ def transition(tmp_path):
                  package / "update_lock.py")
     shutil.copy2(Path(update_completion.__file__).with_name("_subprocess_compat.py"),
                  package / "_subprocess_compat.py")
-    (package / "main.py").write_text("")
-    (package / "update_cmd_config.py").write_text("_LAST_SIBLING_SNAPSHOTS = {}\n")
+    (package / "main.py").write_text("", encoding='utf-8')
+    (package / "update_cmd_config.py").write_text("_LAST_SIBLING_SNAPSHOTS = {}\n", encoding='utf-8')
     (package / "update_inventory.py").write_text(
         "from types import SimpleNamespace\nRuntimeRecord = UpdatePlan = SimpleNamespace\n"
-    )
+    , encoding='utf-8')
     (package / "update_cmd_maint.py").write_text(
         "from hermes_cli.probe import event\n"
         "def _run_post_update_maintenance(**kwargs):\n"
         "    from hermes_cli.update_cmd_config import _LAST_SIBLING_SNAPSHOTS\n"
         "    event('maintenance', snapshots=_LAST_SIBLING_SNAPSHOTS, **kwargs)\n"
         "    return True\n"
-    )
+    , encoding='utf-8')
     (package / "update_cmd.py").write_text(
         "from hermes_cli.probe import event\n"
         "_invalidate_update_cache = lambda: event('cache')\n"
@@ -145,7 +145,7 @@ def transition(tmp_path):
         "    from hermes_cli.update_receipt import finalize_pending_update_receipt\n"
         "    event('verify')\n"
         "    finalize_pending_update_receipt(0, 'verified')\n"
-    )
+    , encoding='utf-8')
     (package / "update_receipt.py").write_text(
         "import contextvars, json, os, pathlib\n"
         "_current = contextvars.ContextVar('receipt', default=None)\n"
@@ -161,7 +161,7 @@ def transition(tmp_path):
         "    path.write_text(json.dumps(r.data, ensure_ascii=False), encoding=r.data.get('encoding', 'utf-8'))\n"
         "    _current.set(None)\n"
         "    return path\n"
-    )
+    , encoding='utf-8')
     git("add", ".")
     git("-c", "commit.gpgsign=false", "commit", "-m", "new incompatible runtime")
     new = git("rev-parse", "HEAD")
@@ -196,7 +196,7 @@ def test_old_process_new_git_tree_completes_in_fresh_python(transition, tmp_path
         "spec = importlib.util.spec_from_file_location('transport', sys.argv[1])\n"
         "transport = importlib.util.module_from_spec(spec); spec.loader.exec_module(transport)\n"
         f"if {bom_boundary == 'request'!r}:\n"
-        "    transport._write_json = lambda path, data: path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8-sig')\n"
+        "    transport._write_json = lambda path, data: path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8-sig')\n"  # windows-footgun: ok — intentional BOM fixture tests the reader
         "import pm\nassert pm.OLD_API\n"
         "subprocess.run(['git', 'checkout', sys.argv[2]], check=True)\n"
         "result = transport.run_completion(json.loads(sys.argv[3]))\n"
@@ -214,7 +214,7 @@ def test_old_process_new_git_tree_completes_in_fresh_python(transition, tmp_path
     assert response["receipt"]["update_id"] == request["receipt"]["update_id"]
     assert response["windows_resume"]["resume_needed"] is False
     assert not (Path(request["home"]) / "completion-pending").exists()
-    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text(encoding='utf-8-sig').splitlines()]
     by_name = {event["name"]: event for event in events}
     assert by_name["activate"]["pid"] == by_name["build"]["pid"]
     assert by_name["prepare"]["pid"] != by_name["build"]["pid"]
@@ -233,7 +233,7 @@ def test_missing_child_result_fails_boundary_receipt_and_releases_lock(transitio
     from hermes_cli import main, update_cmd, update_receipt, update_lock
 
     root, git, old, new, request = transition
-    (root / "hermes_cli/update_completion.py").write_text(f"import os\nos._exit({code})\n")
+    (root / "hermes_cli/update_completion.py").write_text(f"import os\nos._exit({code})\n", encoding='utf-8')
     monkeypatch.setenv("HERMES_HOME", request["home"])
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
@@ -253,7 +253,7 @@ def test_missing_child_result_fails_boundary_receipt_and_releases_lock(transitio
     assert receipt["exit_code"] == (code or 1)
     assert receipt["update_id"] == request["receipt"]["update_id"]
     assert request["windows_resume"]["resume_needed"] is True
-    assert (Path(request["home"]) / ".update_exit_code").read_text().strip() == "1"
+    assert (Path(request["home"]) / ".update_exit_code").read_text(encoding='utf-8-sig').strip() == "1"
     lock = update_lock.UpdateLock()
     assert lock.acquire()
     lock.release()
@@ -272,7 +272,7 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
         "(pathlib.Path(os.environ['HERMES_HOME']) / '.update_exit_code').write_text('0\\n')\n"
         "print('SUCCESS_PUBLISHED', flush=True)\n"
         "time.sleep(30)\n"
-    )
+    , encoding='utf-8')
     monkeypatch.setenv("HERMES_HOME", request["home"])
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
@@ -315,7 +315,7 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
             nonlocal interrupted
             result = super().write(value)
             if not interrupted and "SUCCESS_PUBLISHED" in self.getvalue():
-                assert marker.read_text().strip() == "0"
+                assert marker.read_text(encoding='utf-8-sig').strip() == "0"
                 interrupted = True
                 raise KeyboardInterrupt()
             return result
@@ -341,7 +341,7 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
     assert receipt["outcome"] == "failed"
     assert receipt["exit_code"] == 1
     assert receipt["stop_reason"].startswith("KeyboardInterrupt:")
-    assert marker.read_text().strip() == "1"
+    assert marker.read_text(encoding='utf-8-sig').strip() == "1"
     lock = update_lock.UpdateLock()
     assert lock.acquire()
     lock.release()
@@ -355,8 +355,8 @@ def test_killed_selected_python_returns_signal_exit_status(transition):
     shutil.copy2(update_completion.__file__, root / "hermes_cli/update_completion.py")
     (root / "hermes_cli/source_build.py").write_text(
         "import os, signal\n"
-        "def build_update_products(*a, **kw): os.kill(os.getpid(), signal.SIGKILL)\n"
-    )
+        "def build_update_products(*a, **kw): os.kill(os.getpid(), getattr(signal, 'SIGKILL', signal.SIGTERM))\n"
+    , encoding='utf-8')
     result = update_completion.run_completion(request)
     assert result["exit_code"] == 137
     assert result["pm_receipt"]["update_id"] == request["receipt"]["update_id"]
@@ -370,12 +370,12 @@ def test_failed_build_preserves_exit_status_without_maintenance(transition):
     (root / "hermes_cli/source_build.py").write_text(
         "import subprocess\n"
         "def build_update_products(*a, **kw): raise subprocess.CalledProcessError(23, ['builder'])\n"
-    )
+    , encoding='utf-8')
     result = update_completion.run_completion(request)
     assert result["exit_code"] == 23
     assert result["receipt"]["outcome"] == "failed"
-    assert (Path(request["home"]) / "completion-pending").read_text() == "owed"
-    events = [json.loads(line)["name"] for line in (root / "events.jsonl").read_text().splitlines()]
+    assert (Path(request["home"]) / "completion-pending").read_text(encoding='utf-8-sig') == "owed"
+    events = [json.loads(line)["name"] for line in (root / "events.jsonl").read_text(encoding='utf-8-sig').splitlines()]
     assert "maintenance" not in events
     assert "restart" not in events
     assert "emergency_resume" in events
@@ -389,7 +389,7 @@ def test_prepare_failure_preserves_correlated_pm_receipt(transition, monkeypatch
     shutil.copy2(update_completion.__file__, root / "hermes_cli/update_completion.py")
     (root / "pm/__init__.py").write_text(
         "def sync_venv(**kw): raise RuntimeError('dependency refused')\n"
-    )
+    , encoding='utf-8')
     with (root / "pm/receipt.py").open("a") as stream:
         stream.write("last_for_update = lambda update_id: {'update_id': update_id, 'outcome': 'refused', 'refusal': {'reason': 'dependency refused'}}\n")
     monkeypatch.setenv("HERMES_HOME", request["home"])
@@ -422,7 +422,7 @@ def test_bootstrap_does_not_initialize_old_site_packages(transition, tmp_path, m
     site = obsolete / ("Lib/site-packages" if os.name == "nt" else
                        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
     trap = tmp_path / "old-site-loaded"
-    (site / "application.pth").write_text(f"import pathlib; pathlib.Path({str(trap)!r}).touch()\n")
+    (site / "application.pth").write_text(f"import pathlib; pathlib.Path({str(trap)!r}).touch()\n", encoding='utf-8')
     monkeypatch.setattr(sys, "executable", str(obsolete / ("Scripts/python.exe" if os.name == "nt" else "bin/python")))
     result = update_completion.run_completion(request)
     assert result["exit_code"] == 0
@@ -451,7 +451,7 @@ def test_progress_is_forwarded_before_held_stage_is_released(transition, monkeyp
         ("pm/__init__.py", "def sync_venv(**kw):\n") if stage == "prepare" else
         ("hermes_cli/source_build.py", "def build_update_products(*a, **kw):\n")
     )
-    (root / module).write_text("import time\nfrom pathlib import Path\n" + definition + held_body)
+    (root / module).write_text("import time\nfrom pathlib import Path\n" + definition + held_body, encoding='utf-8')
     observed = threading.Event()
 
     class Output(io.StringIO):
@@ -502,7 +502,7 @@ def test_interactive_configuration_keeps_terminal_input(transition):
         "    assert sys.stdin.isatty() and sys.stdout.isatty()\n"
         "    event('answer', value=input('CONFIG? '))\n"
         "    return True\n"
-    )
+    , encoding='utf-8')
     master, slave = pty.openpty()
     driver = "import json,runpy,sys; m=runpy.run_path(sys.argv[1]); raise SystemExit(m['run_completion'](json.loads(sys.argv[2]))['exit_code'])"
     proc = subprocess.Popen([sys.executable, "-c", driver, update_completion.__file__, json.dumps(request)],
@@ -517,7 +517,7 @@ def test_interactive_configuration_keeps_terminal_input(transition):
                 output += os.read(master, 8192)
         os.write(master, b"yes\n")
         assert proc.wait(timeout=20) == 0
-        events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+        events = [json.loads(line) for line in (root / "events.jsonl").read_text(encoding='utf-8-sig').splitlines()]
         assert next(e for e in events if e["name"] == "answer")["value"] == "yes"
     finally:
         if proc.poll() is None:
@@ -540,7 +540,7 @@ def test_interrupt_reaps_completion_descendants_before_return(transition, monkey
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
         "print('READY ' + str(child.pid), flush=True)\n"
         "time.sleep(600)\n"
-    )
+    , encoding='utf-8')
     pids = []
 
     class Interrupt(io.StringIO):
@@ -579,7 +579,7 @@ def test_taskkill_failure_still_reaps_child_and_preserves_interrupt(tmp_path, mo
     package.mkdir()
     (package / "update_completion.py").write_text(
         "import time\nprint('READY', flush=True)\ntime.sleep(60)\n"
-    )
+    , encoding='utf-8')
     request = {"source": str(tmp_path), "home": str(tmp_path), "receipt": {"update_id": "test"}}
     interrupted = KeyboardInterrupt("cancel completion")
     child = None

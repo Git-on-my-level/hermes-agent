@@ -19,8 +19,8 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     built, so it must never read as a completed install/update of this commit.
 
     A root git cannot identify -- the ZIP update fallback runs precisely because
-    git is unusable -- publishes no identity: the old stamp is removed rather
-    than left naming the commit that was just replaced. Returns None then.
+    git is unusable -- removes the old identity and fails completion loudly.
+    Adoption alone may return None; completed updates must publish a serving pair.
     """
     root = Path(root).resolve()
     info = _git_version_info(root, include_untracked=True)
@@ -28,6 +28,9 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
         with suppress(FileNotFoundError):
             (root / "install-stamp.json").unlink()
         _reset_version_info_cache()
+        if not adopted:
+            from hermes_cli.serving_generation import ServingGenerationPublishError
+            raise ServingGenerationPublishError('Serving generation publication failed: Git identity is unknown')
         return None
     stamp = {
         "schemaVersion": 2,
@@ -67,10 +70,10 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     _reset_version_info_cache()
     # Every path that publishes a new checkout identity (completion handoff, the PM
     # updater's finish, boot-time adoption) moves the installers' receipt with it.
-    refresh_bootstrap_receipt(root, stamp)
     if not adopted:
-        from hermes_cli.serving_generation import record_completed_generation
-        record_completed_generation(root, stamp)
+        from hermes_cli.serving_generation import publish_completed_generation
+        publish_completed_generation(root, stamp)
+    refresh_bootstrap_receipt(root, stamp)
     return stamp
 
 

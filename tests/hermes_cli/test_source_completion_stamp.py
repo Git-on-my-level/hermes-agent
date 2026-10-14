@@ -13,6 +13,11 @@ from hermes_cli.source_completion import complete_source_checkout
 from hermes_cli.source_stamp import write_source_stamp
 
 
+@pytest.fixture(autouse=True)
+def identity_only_publication(monkeypatch):
+    monkeypatch.setattr('hermes_cli.serving_generation.publish_completed_generation', lambda *args: None)
+
+
 def _repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()

@@ -542,13 +542,16 @@ from hermes_cli._parser import command_argv
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
 if not _pm_repair:
-    from hermes_cli.serving_generation import launch_completed_gateway
+    from hermes_cli.serving_generation import (
+        GatewayServingRefused, exit_refused_gateway, launch_completed_gateway,
+    )
 
     launch_completed_gateway(_root)
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:
         _launch_python = prepare_launch(_root, sys.argv[1:])
+        launch_completed_gateway(_root)  # First deploy may have just published its completed pair.
         if _launch_python is not None:
             _main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
             _command = relaunch_command(
@@ -560,6 +563,8 @@ if not _pm_repair:
 
                 raise RelaunchExit(subprocess.call(_command))
             os.execv(str(_launch_python), _command)
+    except GatewayServingRefused as exc:
+        exit_refused_gateway(exc)
     except Exception as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)

@@ -29,6 +29,8 @@ def fake_root(tmp_path, monkeypatch):
         PROJECT_ROOT = tmp_path
 
     monkeypatch.setattr(update_cmd, "_m", lambda: _FakeMain)
+    # This identity-only tree intentionally has no dependency environment.
+    monkeypatch.setattr('hermes_cli.serving_generation.publish_completed_generation', lambda *args: None)
     return tmp_path
 
 
