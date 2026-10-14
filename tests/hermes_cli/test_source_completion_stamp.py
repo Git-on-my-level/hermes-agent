@@ -316,3 +316,13 @@ def test_finish_without_a_terminal_receipt_does_not_announce_success(tmp_path, m
 
     assert code == 1
     assert "Code updated!" not in capsys.readouterr().out
+
+
+def test_unreadable_completed_identity_does_not_announce_success(tmp_path, monkeypatch, capsys):
+    root = _repo(tmp_path)
+    _completion_dependencies(monkeypatch, lambda **kwargs: True)
+    monkeypatch.setattr("hermes_cli.source_stamp.write_source_stamp", lambda root: None)
+    assert not complete_source_checkout(root, desktop=False, assume_yes=True, announce="Code updated!")
+    output = capsys.readouterr()
+    assert "Code updated!" not in output.out
+    assert "identity could not be read" in output.err

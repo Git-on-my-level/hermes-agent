@@ -49,16 +49,18 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
     generation = environment.parent.resolve()
     import shutil
     import tempfile
-    from pm.workspace import _copy_core_inputs
+    from scripts.bundles.payload import snapshot as snapshot_source, INERT_SNAPSHOT_DIRS
     snapshots = install_state_dir(root) / "serving-source"
     snapshots.mkdir(parents=True, exist_ok=True)
     snapshot = snapshots / stamp["commit"]
     if not snapshot.is_dir():
         staging = Path(tempfile.mkdtemp(dir=snapshots, prefix=".staging-"))
         try:
-            _copy_core_inputs(Path(root), staging)
-            if (Path(root) / "uv.lock").is_file():
-                shutil.copy2(Path(root) / "uv.lock", staging / "uv.lock")
+            # Reuse the distribution snapshot contract, retaining runtime bridge
+            # scripts. This also freezes locales, catalog manifests and bundled
+            # skills that are outside setuptools' Python-package roots.
+            excluded = tuple(name for name in INERT_SNAPSHOT_DIRS if name != "scripts")
+            snapshot_source(Path(root), stamp["commit"], staging, exclude=excluded)
             atomic_json_write(staging / "install-stamp.json", {**stamp, "updateMechanism": "external"})
             (staging / ".lease-managed").touch()
             os.replace(staging, snapshot)

@@ -315,7 +315,7 @@ def cmd_converge_tick(args: Any) -> None:
     previous = read_latest_receipt()
     if previous and previous.get("outcome") in {"failed", "partial"}:
         message = ("Converge has an unfinished failed update; serving the completed generation; "
-                   "repair will retry when idle. Inspect `hermes update status` or run `hermes update`.")
+                   "repair will retry when idle. Inspect converge.log and the latest update receipt, or run `hermes update`.")
         logger.error(message)
         _log_tick("ALERT " + message)
         print(message, file=sys.stderr, flush=True)

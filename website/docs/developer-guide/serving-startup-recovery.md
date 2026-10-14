@@ -5,7 +5,8 @@ worker. Successful source completion publishes `serving-generation.json` in the
 install's PM state. It pairs the verified dependency generation with an immutable
 source snapshot under `serving-source/<commit>`. Source is captured at completion,
 not inferred from PM's dependency-build snapshot: code can change without changing
-dependencies. Boot selects that pair before PM probing or update-lock acquisition.
+dependencies. It reuses the distribution archive contract and retains runtime
+bridge scripts, locales, catalog manifests and bundled skills. Boot selects that pair before PM probing or update-lock acquisition.
 Both directories are leased for the process lifetime; GC keeps the selected pair
 and collects older unleased snapshots after the existing age floor.
 

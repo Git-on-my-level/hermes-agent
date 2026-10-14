@@ -19,6 +19,20 @@ def installed(tmp_path, monkeypatch):
     (root / "hermes_cli" / "__init__.py").touch()
     (root / "hermes_cli" / "main.py").write_text("print('previous good code')\n")
     (root / "pyproject.toml").write_text('[project]\nname="test"\n[tool.setuptools.packages.find]\ninclude=["hermes_cli*", "hermes_constants*", "pm*"]\n')
+    (root / "locales").mkdir()
+    (root / "locales" / "en.yaml").write_text("hello: preserved\n")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "bridge.js").write_text("// preserved runtime bridge\n")
+    git_env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+    def git(*args):
+        subprocess.run(["git", *args], cwd=root, env=git_env, check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "test@example.invalid")
+    git("add", ".")
+    git("commit", "-qm", "completed source")
+    for tag in ("abc123", "good", "first", "second"):
+        git("tag", tag)
     generation = install_state_dir(root) / "environments" / "completed"
     python = venv_python(generation / "venv")
     python.parent.mkdir(parents=True)
@@ -38,6 +52,8 @@ def test_failed_update_boots_old_code_without_mutable_checkout(tmp_path, monkeyp
     # Supply only the existing generic lease implementation; no application import
     # or update preparation is needed before dispatching the frozen entry point.
     snapshot = Path(sg.read_generation(root)["source"])
+    assert (snapshot / "locales" / "en.yaml").is_file()
+    assert (snapshot / "scripts" / "bridge.js").is_file()
     (snapshot / "hermes_cli" / "runtime_state.py").write_text("def lease_generation(x): pass\ndef lease_directory(x): pass\n")
     result = subprocess.run(command, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
@@ -61,7 +77,6 @@ def test_legacy_serving_boot_never_calls_update_worker(tmp_path, monkeypatch):
     from hermes_cli import venv_sync, steward, _launchers
     import pm
     root, generation = installed(tmp_path, monkeypatch)
-    (root / ".git").mkdir()
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
     monkeypatch.setattr(steward, "read_install_stamp", lambda r: {"updateMechanism": "self"})
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda r: venv_python(generation / "venv"))
