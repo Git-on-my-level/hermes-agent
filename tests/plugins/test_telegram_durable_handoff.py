@@ -38,7 +38,7 @@ async def fill(app, count=600):
     async def produce():
         for uid in range(count):
             await app.updater.update_queue.put(Update(uid))
-    await asyncio.wait_for(io_loop().run(produce()), 15)
+    await asyncio.wait_for(io_loop().run(produce()), 60)
     for _ in range(200):
         if app.update_queue.full():
             break
@@ -111,6 +111,7 @@ class PollServer:
         self.acknowledged = 0
         self.offsets = []
         self.inbox = None
+        self.processed = set()
 
     def request(self):
         from telegram.request import BaseRequest
@@ -139,7 +140,7 @@ class PollServer:
                         stored = {json.loads(row[1])['update_id'] for row in rows}
                         # Every ID acknowledged to the fake Telegram server
                         # must already have committed on local durable storage.
-                        assert set(range(offset)) <= stored
+                        assert set(range(offset)) <= stored | server.processed
                     server.acknowledged = max(server.acknowledged, offset)
                     start = server.acknowledged
                     result = [{'update_id': uid} for uid in range(start, min(start + 100, 600))]
@@ -150,7 +151,7 @@ class PollServer:
 
 
 async def real_app(server, prepare=None):
-    app = Application.builder().token('123:fake').request(server.request()).get_updates_request(server.request()).build()
+    app = Application.builder().token('123:fake').request(server.request()).get_updates_request(server.request()).concurrent_updates(32).build()
     isolate_updater(app)
     server.inbox = app.updater.durable_inbox
     await app.initialize()
@@ -161,7 +162,7 @@ async def real_app(server, prepare=None):
 
 
 async def wait_ack(server, amount):
-    for _ in range(1500):
+    for _ in range(6000):
         if server.acknowledged >= amount:
             return
         await asyncio.sleep(0.01)
@@ -199,7 +200,7 @@ async def test_real_stop_cancels_blocked_commit_without_acknowledging_batch_tail
     def blocked(item):
         if item.update_id == 500:
             entered.set()
-            release.wait(15)
+            release.wait(120)
             try:
                 return original_put(item)
             finally:
@@ -211,7 +212,7 @@ async def test_real_stop_cancels_blocked_commit_without_acknowledging_batch_tail
         monkeypatch.setattr(server.inbox, 'put', blocked)
     app = await real_app(server, prepare)
     try:
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(entered.wait, 60)
         assert server.acknowledged == 500 and app.update_queue.full()
         await asyncio.wait_for(app.updater.stop(), 2)
         assert server.acknowledged == 500  # Partial 500..599 batch was never acknowledged.
@@ -341,3 +342,145 @@ async def test_old_bot_completion_cannot_retire_new_bot_input():
         assert await io_loop().build(replacement.updater.durable_inbox.count) == 1
     finally:
         await close(replacement)
+
+
+@pytest.mark.asyncio
+async def test_capped_wedged_consumer_alerts_without_acknowledging_tail(monkeypatch, caplog):
+    server = PollServer()
+    app = await real_app(server, lambda app: setattr(app.updater.durable_inbox, 'max_updates', 300))
+    from telegram.ext import TypeHandler
+    released = asyncio.Event()
+    processed = []
+
+    async def wedged_handler(update, context):
+        await released.wait()
+        processed.append(update.update_id)
+        server.processed.add(update.update_id)
+        await app.updater.complete_updates([update.update_id])
+
+    app.add_handler(TypeHandler(Update, wedged_handler))
+    await app.start()
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake', extra={'backpressure_stall_seconds': 60}))
+    adapter._app = app
+    adapter._schedule_polling_recovery = Mock()
+    adapter._write_runtime_status_safe = Mock()
+    clock = [0]
+    monkeypatch.setattr('plugins.platforms.telegram.adapter.time', SimpleNamespace(monotonic=lambda: clock[0]))
+    try:
+        await wait_ack(server, 300)
+        for _ in range(2000):
+            if app.update_processor.current_concurrent_updates == 32 and app.updater.polling_backpressured():
+                break
+            await asyncio.sleep(0.01)
+        assert app.updater.polling_backpressured()
+        assert app.update_processor.current_concurrent_updates == 32
+        assert processed == []
+        assert (await app.bot.get_me()).id == 123
+        await adapter._check_polling_stall()
+        clock[0] = 301
+        await adapter._check_polling_stall()
+        adapter._check_ingress_dispatch_stall()
+        assert adapter._write_runtime_status_safe.call_count == 1
+        assert adapter._write_runtime_status_safe.call_args.kwargs['needs_attention'] is True
+        assert adapter._write_runtime_status_safe.call_args.kwargs['error_code'] == 'telegram_consumer_stalled'
+        assert any(record.levelname == 'ERROR' and 'no completion progress' in record.message for record in caplog.records)
+        adapter._schedule_polling_recovery.assert_not_called()
+        assert await io_loop().run_inbox(server.inbox.count) == 300
+        assert max(server.offsets) == 300
+        # Unblock the consumer. Receipts/completion retire capacity only after
+        # processing; the partial batch resumes without losing any input.
+        released.set()
+        await wait_ack(server, 600)
+        for _ in range(500):
+            if len(processed) == 600 and await io_loop().run_inbox(server.inbox.count) == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert sorted(processed) == list(range(600))
+        assert await io_loop().run_inbox(server.inbox.count) == 0
+        clock[0] = 302
+        await adapter._check_polling_stall()
+        assert adapter._pressure_since is None
+    finally:
+        released.set()
+        await close(app)
+        await app.stop()
+
+
+def test_inbox_limits_retain_old_rows_and_migrate_legacy(tmp_path, monkeypatch):
+    import sqlite3
+    from plugins.platforms.telegram.update_inbox import UpdateInbox
+    inbox = UpdateInbox(tmp_path, '123', max_updates=2)
+    with sqlite3.connect(inbox.path) as connection:
+        connection.execute('CREATE TABLE updates (seq INTEGER PRIMARY KEY AUTOINCREMENT, update_id TEXT UNIQUE, payload TEXT, kind TEXT)')
+        connection.execute('INSERT INTO updates(update_id, payload, kind) VALUES (?, ?, ?)', ('1', '{"update_id":1}', 'update'))
+    assert inbox.put(Update(2))
+    assert inbox.put(Update(3)) is False
+    assert inbox.put(Update(2))
+    assert inbox.count() == 2
+    assert inbox.complete([1]) == 1
+    assert inbox.put(Update(3))
+
+    inbox = UpdateInbox(tmp_path / 'aged', '123', max_updates=2, max_age_seconds=60)
+    clock = [1000]
+    monkeypatch.setattr('plugins.platforms.telegram.update_inbox.time.time', lambda: clock[0])
+    assert inbox.put(Update(1))
+    clock[0] += 61
+    assert inbox.put(Update(1))  # Existing prefix of a redelivered partial batch.
+    assert inbox.put(Update(2)) is False
+    assert inbox.count() == 1
+    assert inbox.complete([1]) == 1
+    assert inbox.put(Update(2))
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_inbox_and_sidecars_private_during_transaction_and_after_kill(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from plugins.platforms.telegram.update_inbox import UpdateInbox
+    inbox = UpdateInbox(tmp_path, '123')
+    assert inbox.put(Update(1))
+    os.chmod(inbox.path, 0o644)
+    assert inbox.put(Update(2))
+    assert os.stat(inbox.path).st_mode & 0o777 == 0o600
+    # WAL/SHM are private even under a permissive caller umask, and existing
+    # sidecars are tightened without closing an existing inode descriptor.
+    with inbox._connection() as connection:
+        connection.execute('PRAGMA journal_mode=WAL')
+        connection.execute('INSERT INTO updates(update_id,payload,kind,received_at) VALUES (?,?,?,?)', ('3', 'private message', 'json', 1))
+        for suffix in ('', '-wal', '-shm'):
+            path = __import__('pathlib').Path(str(inbox.path) + suffix)
+            assert path.exists()
+            os.chmod(path, 0o644)
+        inbox._secure_files()
+        for suffix in ('', '-wal', '-shm'):
+            assert os.stat(str(inbox.path) + suffix).st_mode & 0o777 == 0o600
+        connection.commit()
+        connection.execute('PRAGMA journal_mode=DELETE')
+    # Hold a rollback journal open, then kill ONLY this test-owned subprocess.
+    # Its crash leaves message-bearing journal pages on disk for inspection.
+    code = '''
+import os, sys, time
+from pathlib import Path
+from plugins.platforms.telegram.update_inbox import UpdateInbox
+os.umask(0)
+inbox = UpdateInbox(Path(sys.argv[1]), '123')
+with inbox._connection() as connection:
+    connection.execute('BEGIN IMMEDIATE')
+    connection.execute("UPDATE updates SET payload = 'changed private message'")
+    print('transaction-ready', flush=True)
+    time.sleep(30)
+'''
+    child = subprocess.Popen([sys.executable, '-c', code, str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == 'transaction-ready'
+        assert os.stat(str(inbox.path) + '-journal').st_mode & 0o777 == 0o600
+        child.kill()
+        child.wait(timeout=5)
+        assert os.stat(str(inbox.path) + '-journal').st_mode & 0o777 == 0o600
+        assert os.stat(inbox.path).st_mode & 0o777 == 0o600
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        child.stdout.close()

@@ -9,7 +9,23 @@ bounded 256-item gateway queue is a cache; its suspended pump holds at most one
 256-row page. Unfinished inbox rows have no expiration and replay on replacement
 or restart. Completed dispatch writes its replay receipt before retiring the
 inbox row; replay of an already-completed receipt retires it without dispatch.
-Disk errors fail acceptance rather than acknowledge unpersisted input.
+Disk errors fail acceptance rather than acknowledge unpersisted input. The database
+and rollback/WAL/SHM sidecars are created under umask 0077 and tightened to 0600
+on each transaction, including existing stores.
+
+`platforms.telegram.extra.inbox_max_updates` defaults to 10,000 rows;
+`inbox_max_age_seconds` defaults to 21,600 seconds (six hours). Either limit
+pauses new acceptance without deleting unfinished rows. Duplicate prefixes of
+partially accepted batches remain safe to accept. PTB cannot advance the batch
+offset until every item is durable; unaccepted tails remain on Telegram (whose
+retention is about 24 hours, so operators must resolve a stuck consumer promptly).
+Completion wakes acceptance without periodic disk polling.
+
+`platforms.telegram.extra.backpressure_stall_seconds` defaults to 300 seconds.
+No completed input during backpressure for this interval logs ERROR and publishes
+`needs_attention` with `telegram_consumer_stalled` through runtime status, at most
+once per five minutes. This alert does not rebuild the adapter or discard input.
+Dispatch entry and enqueue activity do not count as consumer completion.
 
 Queue pressure and outstanding acceptance commits pause polling/ingress stall
 clocks. Stop cancels the polling action and delivery pump without waiting for a

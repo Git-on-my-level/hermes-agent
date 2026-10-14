@@ -2372,6 +2372,32 @@ class TelegramAdapter(BasePlatformAdapter):
         check = getattr(updater, "polling_backpressured", None)
         return callable(check) and check() is True
 
+    def _check_backpressure_consumer(self) -> None:
+        """Alert on stalled completion without destroying the durable backlog."""
+        now = time.monotonic()
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        progress = getattr(updater, "consumer_progress", None)
+        completed = progress() if callable(progress) else 0
+        if not self._polling_is_backpressured():
+            self._pressure_since = None
+            self._pressure_completed = completed
+            return
+        since = getattr(self, "_pressure_since", None)
+        if since is None or completed != getattr(self, "_pressure_completed", None):
+            self._pressure_since = now
+            self._pressure_completed = completed
+            return
+        threshold = max(1, float(self.config.extra.get("backpressure_stall_seconds", 300)))
+        if now - since < threshold or now - getattr(self, "_pressure_alert_at", float("-inf")) < 300:
+            return
+        self._pressure_alert_at = now
+        message = ("Telegram consumer made no completion progress for %.0fs while backpressured; "
+                   "durable input retained, acceptance pauses at inbox limits. Check wedged handlers; "
+                   "Telegram retains unacknowledged input for about 24h." % (now - since))
+        logger.error("[%s] %s", self.name, message)
+        self._write_runtime_status_safe("consumer_backpressure", needs_attention=True,
+                                        error_code="telegram_consumer_stalled", error_message=message)
+
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
 
@@ -2383,6 +2409,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
+        self._check_backpressure_consumer()
         if self._polling_is_backpressured():
             self._ingress_stalled_heartbeats = 0
             return
@@ -2418,6 +2445,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
         now = time.monotonic()
+        self._check_backpressure_consumer()
         if self._polling_is_backpressured():
             # Queue pressure / an outstanding durable commit is not a dead
             # socket. Resume the stall clock only after acceptance can progress.

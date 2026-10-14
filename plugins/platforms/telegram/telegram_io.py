@@ -56,6 +56,7 @@ _inbox_readers = {}
 def _wake_inbox_readers(key):
     for reader in tuple(_inbox_readers.get(key, ())):
         reader.wake.set()
+        io_loop().loop.call_soon_threadsafe(reader.capacity.set)
 
 
 # Created only by gateway-loop setup, never from an agent turn.
@@ -127,7 +128,10 @@ def isolate_updater(app):
     from hermes_constants import get_hermes_home
     adapter = getattr(app, 'adapter', None)
     directory = getattr(adapter, '_update_receipt_dir', None) or get_hermes_home()
-    inbox = UpdateInbox(directory, app.bot.token.split(':', 1)[0])
+    extra = getattr(getattr(adapter, 'config', None), 'extra', {}) or {}
+    inbox = UpdateInbox(directory, app.bot.token.split(':', 1)[0],
+                        max_updates=extra.get('inbox_max_updates', 10000),
+                        max_age_seconds=extra.get('inbox_max_age_seconds', 21600))
     inbox_key = (gateway_loop, inbox.path)
 
     class QueueBridge:
@@ -137,6 +141,8 @@ def isolate_updater(app):
             self.accepting = False
             self.cursor = 0
             self.wake = asyncio.Event()
+            self.capacity = asyncio.Event()  # Waiters and setters belong to the IO loop.
+            self.completed = 0
 
         async def put(self, item):
             # Durability, not bounded RAM, is the polling acceptance boundary.
@@ -144,14 +150,22 @@ def isolate_updater(app):
             self.accepting = True
             try:
                 def persist():
-                    inbox.put(item)
+                    accepted = inbox.put(item)
                     # Runs even if cancellation abandoned this write's waiter.
                     # All registry lookup/mutation remains on the gateway loop.
                     try:
-                        gateway_loop.call_soon_threadsafe(_wake_inbox_readers, inbox_key)
+                        if accepted is not False:
+                            gateway_loop.call_soon_threadsafe(_wake_inbox_readers, inbox_key)
                     except RuntimeError:
                         pass  # Process loop ended; committed rows replay on next boot.
-                await io.run_inbox(persist)
+                    return accepted
+                while True:
+                    self.capacity.clear()
+                    if await io.run_inbox(persist) is not False:
+                        break
+                    # Do not occupy the SQLite worker or advance PTB offset.
+                    # Completion wakes this waiter, including across replacement.
+                    await self.capacity.wait()
             finally:
                 self.accepting = False
 
@@ -203,8 +217,13 @@ def isolate_updater(app):
         def polling_backpressured(self):
             return bridge.backpressured()
 
+        def consumer_progress(self):
+            return bridge.completed
+
         async def complete_updates(self, update_ids):
-            await io.run_inbox(inbox.complete, update_ids)
+            completed = await io.run_inbox(inbox.complete, update_ids)
+            bridge.completed += completed
+            _wake_inbox_readers(inbox_key)
 
         async def start_polling(self, *args, **kwargs):
             if self.running or bridge.task is not None:

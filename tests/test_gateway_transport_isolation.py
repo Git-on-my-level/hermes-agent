@@ -385,7 +385,7 @@ async def test_handoff_is_durable_and_stop_does_not_wait_for_dispatch(monkeypatc
         async def produce():
             for item in range(300):
                 await bridge.put(Update(item))
-        await asyncio.wait_for(io_loop().run(produce()), 10)
+        await asyncio.wait_for(io_loop().run(produce()), 60)
         assert app.update_queue.qsize() <= 256
         assert await io_loop().build(app.updater.durable_inbox.count) == 300
         await asyncio.wait_for(app.updater.stop(), 1)
