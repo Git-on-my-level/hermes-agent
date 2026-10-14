@@ -113,7 +113,10 @@ async def test_polling_handoff_accepts_with_bounded_gateway_backpressure(monkeyp
     await asyncio.wait_for(asyncio.wrap_future(blocked), 1)
     assert app.update_queue.qsize() == 256
     assert app.update_queue.get_nowait() == 0
-    await asyncio.sleep(0.03)
+    for _ in range(100):
+        if app.update_queue.qsize() == 256:
+            break
+        await asyncio.sleep(0.01)
     assert app.update_queue.qsize() == 256
     assert [app.update_queue.get_nowait() for _ in range(256)] == list(range(1, 256)) + ["blocked"]
     app.updater._running = True

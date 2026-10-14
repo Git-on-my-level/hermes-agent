@@ -7,7 +7,7 @@ agent locks, but cannot isolate the process GIL or OS scheduler starvation.
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import queue
+import json
 
 
 class TelegramIOLoop:
@@ -102,50 +102,75 @@ def isolate_updater(app):
         original_queue = asyncio.Queue(maxsize=256)
         app.update_queue = original_queue
 
+    from .update_inbox import UpdateInbox
+    from hermes_constants import get_hermes_home
+    adapter = getattr(app, 'adapter', None)
+    directory = getattr(adapter, '_update_receipt_dir', None) or get_hermes_home()
+    inbox = UpdateInbox(directory, app.bot.token.split(':', 1)[0])
+
     class QueueBridge:
         def __init__(self):
-            # Acceptance is synchronous into a real bounded queue, before PTB
-            # advances its offset. No update exists only as a scheduled callback.
-            self.pending = queue.Queue(maxsize=256)
             self.task = None
             self.closing = False
+            self.accepting = False
+            self.cursor = 0
+            self.wake = asyncio.Event()
 
         async def put(self, item):
-            while True:
-                try:
-                    self.pending.put_nowait(item)
-                    return
-                except queue.Full:
-                    await asyncio.sleep(0.01)
+            # Durability, not bounded RAM, is the polling acceptance boundary.
+            # A disk failure propagates: PTB must not advance its offset.
+            self.accepting = True
+            try:
+                await asyncio.to_thread(inbox.put, item)
+                gateway_loop.call_soon_threadsafe(self.wake.set)
+            finally:
+                self.accepting = False
+
+        def backpressured(self):
+            return self.accepting or original_queue.full()
 
         async def pump(self):
-            while not self.closing or not self.pending.empty():
-                # Keep gateway admission bounded as well. Application retains
-                # its existing update-processor concurrency policy.
-                if not self.closing and original_queue.qsize() >= 256:
-                    await asyncio.sleep(0.01)
+            from telegram import Update
+            while not self.closing:
+                self.wake.clear()
+                rows = await io.build(inbox.after, self.cursor)
+                if not rows:
+                    await self.wake.wait()
                     continue
-                try:
-                    item = self.pending.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.01)
-                    continue
-                await original_queue.put(item)
-                self.pending.task_done()
+                for sequence, payload, kind in rows:
+                    item = Update.de_json(json.loads(payload), app.bot) if kind == 'update' else json.loads(payload)
+                    await original_queue.put(item)
+                    self.cursor = sequence
+                    if self.closing:
+                        return
 
         def start(self):
             self.closing = False
+            self.cursor = 0  # Replay uncompleted rows on every polling generation.
+            self.wake.set()
             self.task = gateway_loop.create_task(self.pump())
 
         async def finish(self):
             self.closing = True
             if self.task is not None:
-                await self.task
+                self.task.cancel()
+                try:
+                    await self.task
+                except asyncio.CancelledError:
+                    pass
                 self.task = None
+            # Gateway-queued and pump-held items remain durable until admission
+            # completion. No dispatcher drain is needed to stop polling.
 
     bridge = QueueBridge()
 
     class IsolatedUpdater(Updater):
+        def polling_backpressured(self):
+            return bridge.backpressured()
+
+        async def complete_updates(self, update_ids):
+            await io.build(inbox.complete, update_ids)
+
         async def start_polling(self, *args, **kwargs):
             if self.running or bridge.task is not None:
                 raise RuntimeError("Telegram polling is already starting or running")
@@ -193,9 +218,18 @@ def isolate_updater(app):
         async def stop(self):
             if self._httpd is not None:
                 return await super().stop()
+            async def stop_polling():
+                # PTB normally waits for its action (including queue.put) before
+                # observing the stop event. Cancel it instead: accepted items are
+                # already committed, and unaccepted batch tails remain on Telegram.
+                task = getattr(self, '_Updater__polling_task', None)
+                if task is not None:
+                    task.cancel()
+                return await super(IsolatedUpdater, self).stop()
             try:
-                return await io.run(super().stop())
+                return await io.run(stop_polling())
             finally:
                 await bridge.finish()
 
     app.updater = IsolatedUpdater(app.bot, original_queue)
+    app.updater.durable_inbox = inbox

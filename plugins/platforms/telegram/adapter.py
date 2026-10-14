@@ -2367,6 +2367,11 @@ class TelegramAdapter(BasePlatformAdapter):
         logger.warning(log_message, self.name)
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
 
+    def _polling_is_backpressured(self) -> bool:
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        check = getattr(updater, "polling_backpressured", None)
+        return callable(check) and check() is True
+
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
 
@@ -2377,6 +2382,9 @@ class TelegramAdapter(BasePlatformAdapter):
         per stall (``_PollingStallError``: an in-place restart keeps the wedged dispatcher); re-arms on progress.
         """
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
+            return
+        if self._polling_is_backpressured():
+            self._ingress_stalled_heartbeats = 0
             return
         received = getattr(self, "_updates_received_total", 0)
         dispatched = getattr(self, "_updates_dispatched_total", 0)
@@ -2410,6 +2418,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
         now = time.monotonic()
+        if self._polling_is_backpressured():
+            # Queue pressure / an outstanding durable commit is not a dead
+            # socket. Resume the stall clock only after acceptance can progress.
+            self._polling_last_progress_monotonic = now
+            return
         last_progress = getattr(self, "_polling_last_progress_monotonic", None)
         generation_started = getattr(self, "_polling_generation_started_monotonic", None)
         if last_progress is not None:

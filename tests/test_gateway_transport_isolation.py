@@ -364,7 +364,8 @@ async def test_webhook_keeps_gateway_owned_queue(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handoff_is_bounded_accepts_before_ack_and_drains_on_stop(monkeypatch):
+async def test_handoff_is_durable_and_stop_does_not_wait_for_dispatch(monkeypatch):
+    from telegram import Update
     from telegram.ext import Updater
     async def start(self, **kwargs):
         self._running = True
@@ -379,25 +380,18 @@ async def test_handoff_is_bounded_accepts_before_ack_and_drains_on_stop(monkeypa
         bridge = app.updater.update_queue
         with pytest.raises(RuntimeError):
             await app.updater.start_polling()
-        assert app.updater.running
         with pytest.raises(RuntimeError):
             await app.updater.start_webhook()
-        assert app.updater.update_queue is bridge
         async def produce():
             for item in range(300):
-                await bridge.put(item)
-        producer = asyncio.run_coroutine_threadsafe(produce(), io_loop().loop)
-        time.sleep(0.1)  # The gateway cannot accept callbacks during this window.
-        assert bridge.pending.qsize() == 256
-        assert not producer.done()
-        assert app.update_queue.empty()
-        await asyncio.wait_for(asyncio.wrap_future(producer), 1)
+                await bridge.put(Update(item))
+        await asyncio.wait_for(io_loop().run(produce()), 10)
         assert app.update_queue.qsize() <= 256
-        async def consume():
-            return [await app.update_queue.get() for _ in range(300)]
-        consumer = asyncio.create_task(consume())
-        await app.updater.stop()
-        assert await consumer == list(range(300))
+        assert await io_loop().build(app.updater.durable_inbox.count) == 300
+        await asyncio.wait_for(app.updater.stop(), 1)
+        # No dispatcher drain: every accepted update is still stored.
+        rows = await io_loop().build(app.updater.durable_inbox.after, 0, 400)
+        assert [json.loads(row[1])['update_id'] for row in rows] == list(range(300))
     finally:
         for request in app.bot._request:
             await request.shutdown()

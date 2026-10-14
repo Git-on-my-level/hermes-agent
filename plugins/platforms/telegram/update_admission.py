@@ -68,6 +68,10 @@ def _load_receipts(adapter, bot_id) -> None:
 def _record_receipt(adapter, key: str) -> None:
     bounded_put(adapter._seen_update_ids, key, time.time(), _SEEN_CAP)
     adapter._update_receipts_dirty.add(key.split(":", 1)[0])
+    completed = getattr(adapter, '_durable_updates_completed', None)
+    if completed is None:
+        completed = adapter._durable_updates_completed = {}
+    completed.setdefault(key.split(':', 1)[0], set()).add(key.split(':', 1)[1])
     task = adapter._update_receipt_flush
     if task is None or task.done():
         # One writer per adapter coalesces bursts; the fsync stays off the event loop.
@@ -80,6 +84,7 @@ async def _flush_receipts(adapter) -> None:
 
     while adapter._update_receipts_dirty:
         bot_id = adapter._update_receipts_dirty.pop()
+        completed = getattr(adapter, '_durable_updates_completed', {}).pop(bot_id, set())
         prefix, cutoff = f"{bot_id}:", time.time() - RECEIPT_TTL_SECONDS
         # Snapshot on the loop: admission mutates this dict only from loop callbacks.
         ids = {key[len(prefix):]: ts for key, ts in adapter._seen_update_ids.items()
@@ -88,7 +93,12 @@ async def _flush_receipts(adapter) -> None:
         try:
             mkdir_under_hermes_home(path.parent)
             await asyncio.to_thread(atomic_json_write, path, {"update_ids": ids}, indent=None)
+            updater = getattr(getattr(adapter, '_app', None), 'updater', None)
+            retire = getattr(updater, 'complete_updates', None)
+            if retire is not None:
+                await retire(completed)
         except Exception:
+            getattr(adapter, '_durable_updates_completed', {}).setdefault(bot_id, set()).update(completed)
             logger.warning("[Telegram] Failed to persist update receipts to %s", path, exc_info=True)
 
 
@@ -285,7 +295,12 @@ class TelegramApplication(Application):
         self.adapter._updates_dispatched_total += 1
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
-        if key in seen or key in pending:
+        if key in seen:
+            retire = getattr(self.updater, 'complete_updates', None)
+            if retire is not None:
+                await retire([update.update_id])  # Replay of a persisted completed receipt.
+            return
+        if key in pending:
             return
         claim = _Claim(key, asyncio.current_task())
         # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its

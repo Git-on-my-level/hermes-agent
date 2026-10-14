@@ -2,10 +2,21 @@
 
 Telegram HTTP requests and PTB's `Updater` polling run on one dedicated
 `telegram-io` thread and asyncio loop. Application handlers and agent turns stay
-on the gateway loop. A thread-safe handoff queue accepts each update before
-PTB advances its offset and buffers at most 256 updates. The gateway pump pauses
-transfer when the SDK queue has 256 queued items; stop drains accepted handoff
-items before Application teardown. The SDK retains its update-processor
+on the gateway loop. Polling acceptance commits each update to a profile- and
+bot-scoped SQLite inbox (`telegram_update_inbox_<bot-id>.sqlite3`, private file
+permissions, FULL synchronous commits) before PTB advances its offset. The
+bounded 256-item gateway queue is a cache; its suspended pump holds at most one
+256-row page. Unfinished inbox rows have no expiration and replay on replacement
+or restart. Completed dispatch writes its replay receipt before retiring the
+inbox row; replay of an already-completed receipt retires it without dispatch.
+Disk errors fail acceptance rather than acknowledge unpersisted input.
+
+Queue pressure and outstanding acceptance commits pause polling/ingress stall
+clocks. Stop cancels the polling action and delivery pump without waiting for a
+saturated dispatcher. Accepted input remains on disk; partial batch tails that
+were not accepted keep their previous Telegram offset and remain unacknowledged.
+The pump wakes on committed input, rather than querying the disk on an idle timer.
+The SDK retains its update-processor
 concurrency policy. HTTPX returns fully read response bytes across the request
 boundary. Error and progress callbacks re-enter the gateway loop, with conflict
 retry disarmed synchronously on the polling loop before deferring recovery.
@@ -13,7 +24,8 @@ Polling stop/disarm and orphan client close run on the transport loop. Webhook
 serving retains its original gateway queue.
 
 
-The transport loop has a separate two-worker executor for TLS pool construction.
+The transport loop has a separate two-worker executor for TLS pool construction
+and durable inbox I/O.
 It survives individual request shutdown/reinitialize cycles because PTB's
 polling events and locks bind to that loop. Clients and transports still close
 on drain, failed initialization, and disconnect. This is process-lifetime
