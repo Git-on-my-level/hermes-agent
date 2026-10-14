@@ -283,3 +283,34 @@ async def test_coalesced_status_readd_follows_profile_drop(monkeypatch):
         {'drop_profile_platforms': 'alpha'},
         {'platform': 'alpha:telegram', 'platform_state': 'connected'},
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_diagnostic_lock_does_not_block_transport_loop(monkeypatch):
+    import plugins.platforms.telegram.telegram_network as network
+    lock = threading.Lock()
+    entered = threading.Event()
+    closed = []
+    def describe(error):
+        entered.set()
+        with lock:
+            return 'mock-redacted-error'
+    class Pool(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            raise httpx.ConnectTimeout('fake')
+        async def aclose(self):
+            closed.append(self)
+    monkeypatch.setattr(network, '_describe_transport_error', describe)
+    monkeypatch.setattr(network, '_build_inner_transport', lambda _: Pool())
+    monkeypatch.setattr(network, '_resolve_proxy_url', lambda **_: None)
+    transport = TelegramFallbackTransport(['149.154.166.110'])
+    with lock:
+        request = asyncio.create_task(io_loop().run(transport.handle_async_request(
+            httpx.Request('POST', 'https://api.telegram.org/bot123:fake/getUpdates'))))
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert closed  # Failed pool released before contended diagnostics.
+        await asyncio.wait_for(io_loop().run(asyncio.sleep(0.01)), 0.3)
+        assert not request.done()
+    with pytest.raises(httpx.ConnectTimeout):
+        await request
+    await io_loop().run(transport.aclose())

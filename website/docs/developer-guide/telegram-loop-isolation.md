@@ -17,7 +17,8 @@ infrastructure, not one new thread per reconnect.
 
 Runtime status preparation uses a separate single-worker executor and coalesces
 pending fields by platform. The synchronous status API remains available for CLI
-callers. Gateway producers never wait on the status RLock or logging handler
+callers. Profile control and shared-listener publication await preparation
+cooperatively before returning. Gateway producers never wait on the status RLock or logging handler
 RLocks: console writes queue to a writer thread, and the file queue handler skips
 its unnecessary producer lock. Profile file-router locks remain on the logging
 listener, away from transport and gateway dispatch.
@@ -28,7 +29,9 @@ once per 30 seconds. It does not exit the process or change existing liveness
 recovery thresholds. `gateway.loop_watchdog: false` disables both diagnostics
 and the existing lifetime guards.
 
-Pool reset detaches and closes a failed pool before building another. Read/write
+Pool reset detaches and closes a failed pool before building another. Failure
+diagnostics run in the I/O executor because redaction takes the vault registry
+lock also used by agent tools. Read/write
 transport failures also discard pools, without retrying messages whose acceptance
 is ambiguous. Final close attempts every pool even when another close fails, and
 closed transports refuse new fallback pools. Concurrent failures identify the

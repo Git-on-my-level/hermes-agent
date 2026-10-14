@@ -228,7 +228,14 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                             await self._reset_fallback(ip, transport)
                     raise
                 path = ip or _TELEGRAM_API_HOST
-                failure = _describe_transport_error(exc)
+                # Close before diagnostics: redaction can wait on a vault lock
+                # held by agent work. Neither that lock nor cancellation during
+                # formatting may hold a failed network pool alive.
+                if ip is None:
+                    await self._reset_primary(transport)
+                else:
+                    await self._reset_fallback(ip, transport)
+                failure = await asyncio.to_thread(_describe_transport_error, exc)
                 self._last_failure = (path, failure)
                 if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
                     async with self._sticky_lock:
@@ -238,11 +245,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                                 "[Telegram] Sticky Telegram path %s failed; re-walking IPv4 literals before the hostname",
                                 ip if ip is not None else "api.telegram.org")
                 if ip is None:
-                    await self._reset_primary(transport)
                     logger.warning("[Telegram] Dual-stack api.telegram.org path failed (%s)", failure)
                     continue
                 logger.warning("[Telegram] IPv4 Telegram API IP %s failed: %s", ip, failure)
-                await self._reset_fallback(ip, transport)
                 continue
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
