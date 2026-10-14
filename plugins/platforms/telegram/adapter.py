@@ -2320,6 +2320,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_pending_stuck_count = 0
             return
         if not getattr(updater, "running", False):
+            if self._polling_is_backpressured():
+                self._polling_pending_stuck_count = self._polling_not_running_count = 0
+                self._check_backpressure_consumer()
+                return
             # Long-poll task gone, general-path calls still succeed, so no error_callback/probe ever
             # fires. Debounced over two probes so a just-starting updater never trips it.
             self._polling_pending_stuck_count = 0
@@ -2346,6 +2350,12 @@ class TelegramAdapter(BasePlatformAdapter):
             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
         except (asyncio.TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
+        # A server queue is expected while durable acceptance is paused. Check
+        # after the await too: pressure may have appeared during the probe.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
+            return
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
             self._polling_pending_stuck_count = 0
@@ -2363,6 +2373,11 @@ class TelegramAdapter(BasePlatformAdapter):
     def _escalate_stuck_consumer(self, log_message: str, reason: str) -> None:
         """Second consecutive stuck probe: restart polling via the network-error ladder (unless tearing down)."""
         if self._teardown_started:
+            return
+        # Last guard against pressure appearing between a probe and escalation.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
             return
         logger.warning(log_message, self.name)
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))

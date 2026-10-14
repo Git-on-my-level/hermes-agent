@@ -112,6 +112,7 @@ class PollServer:
         self.offsets = []
         self.inbox = None
         self.processed = set()
+        self.webhook_probes = 0
 
     def request(self):
         from telegram.request import BaseRequest
@@ -128,6 +129,9 @@ class PollServer:
                 endpoint = url.rsplit('/', 1)[-1]
                 if endpoint == 'getMe':
                     result = {'id': 123, 'is_bot': True, 'first_name': 'Offline'}
+                elif endpoint == 'getWebhookInfo':
+                    server.webhook_probes += 1
+                    result = {'url': '', 'has_custom_certificate': False, 'pending_update_count': 600 - server.acknowledged}
                 elif endpoint == 'deleteWebhook':
                     result = True
                 else:
@@ -345,7 +349,7 @@ async def test_old_bot_completion_cannot_retire_new_bot_input():
 
 
 @pytest.mark.asyncio
-async def test_capped_wedged_consumer_alerts_without_acknowledging_tail(monkeypatch, caplog):
+async def test_heartbeat_keeps_capped_put_and_alerts_until_consumer_resumes(monkeypatch, caplog):
     server = PollServer()
     app = await real_app(server, lambda app: setattr(app.updater.durable_inbox, 'max_updates', 300))
     from telegram.ext import TypeHandler
@@ -360,12 +364,31 @@ async def test_capped_wedged_consumer_alerts_without_acknowledging_tail(monkeypa
 
     app.add_handler(TypeHandler(Update, wedged_handler))
     await app.start()
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake', extra={'backpressure_stall_seconds': 60}))
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake', extra={'backpressure_stall_seconds': 300}))
     adapter._app = app
     adapter._schedule_polling_recovery = Mock()
     adapter._write_runtime_status_safe = Mock()
     clock = [0]
     monkeypatch.setattr('plugins.platforms.telegram.adapter.time', SimpleNamespace(monotonic=lambda: clock[0]))
+    from unittest.mock import AsyncMock
+    stop = AsyncMock(wraps=app.updater.stop)
+    monkeypatch.setattr(app.updater, 'stop', stop)
+    ticks, heartbeat_boundaries = asyncio.Queue(), asyncio.Queue()
+    real_sleep = asyncio.sleep
+
+    async def heartbeat_sleep(delay):
+        if delay != 90:
+            return await real_sleep(delay)
+        heartbeat_boundaries.put_nowait(clock[0])
+        await ticks.get()
+        clock[0] += 90
+
+    heartbeat_asyncio = SimpleNamespace(**{name: getattr(asyncio, name) for name in dir(asyncio)})
+    heartbeat_asyncio.sleep = heartbeat_sleep
+    monkeypatch.setattr('plugins.platforms.telegram.adapter.asyncio', heartbeat_asyncio)
+    alerts = []
+    adapter._write_runtime_status_safe.side_effect = lambda *args, **kwargs: alerts.append(clock[0])
+    heartbeat = None
     try:
         await wait_ack(server, 300)
         for _ in range(2000):
@@ -376,15 +399,28 @@ async def test_capped_wedged_consumer_alerts_without_acknowledging_tail(monkeypa
         assert app.update_processor.current_concurrent_updates == 32
         assert processed == []
         assert (await app.bot.get_me()).id == 123
-        await adapter._check_polling_stall()
-        clock[0] = 301
-        await adapter._check_polling_stall()
-        adapter._check_ingress_dispatch_stall()
-        assert adapter._write_runtime_status_safe.call_count == 1
+        polling_task = app.updater._Updater__polling_task
+        heartbeat = asyncio.create_task(adapter._polling_heartbeat_loop())
+        assert await asyncio.wait_for(heartbeat_boundaries.get(), 15) == 0
+        # Real heartbeat order: getMe -> getWebhookInfo/pending probe -> stall
+        # checks, for 13.5 minutes of pending server input and a capped inbox.
+        for sample in range(1, 10):
+            ticks.put_nowait(None)
+            assert await asyncio.wait_for(heartbeat_boundaries.get(), 15) == sample * 90
+            assert app.updater._Updater__polling_task is polling_task
+            assert polling_task.cancelling() == 0 and not polling_task.done()
+            assert not adapter._recovery_in_flight()
+        assert server.webhook_probes == 9
+        assert alerts == [450, 810]  # 300s threshold/rate limit sampled every 90s.
         assert adapter._write_runtime_status_safe.call_args.kwargs['needs_attention'] is True
         assert adapter._write_runtime_status_safe.call_args.kwargs['error_code'] == 'telegram_consumer_stalled'
-        assert any(record.levelname == 'ERROR' and 'no completion progress' in record.message for record in caplog.records)
+        assert sum(record.levelname == 'ERROR' and 'no completion progress' in record.message for record in caplog.records) == 2
+        stop.assert_not_awaited()
         adapter._schedule_polling_recovery.assert_not_called()
+        # Exercise the final escalation guard independently of the probe guard.
+        adapter._escalate_stuck_consumer('[%s] stale probe', 'stale pending sample')
+        assert not adapter._recovery_in_flight()
+        assert alerts == [450, 810]
         assert await io_loop().run_inbox(server.inbox.count) == 300
         assert max(server.offsets) == 300
         # Unblock the consumer. Receipts/completion retire capacity only after
@@ -397,10 +433,15 @@ async def test_capped_wedged_consumer_alerts_without_acknowledging_tail(monkeypa
             await asyncio.sleep(0.01)
         assert sorted(processed) == list(range(600))
         assert await io_loop().run_inbox(server.inbox.count) == 0
-        clock[0] = 302
-        await adapter._check_polling_stall()
+        ticks.put_nowait(None)
+        assert await asyncio.wait_for(heartbeat_boundaries.get(), 15) == 900
         assert adapter._pressure_since is None
+        assert alerts == [450, 810]
+        stop.assert_not_awaited()
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await heartbeat
         released.set()
         await close(app)
         await app.stop()
@@ -471,7 +512,7 @@ with inbox._connection() as connection:
     print('transaction-ready', flush=True)
     time.sleep(30)
 '''
-    child = subprocess.Popen([sys.executable, '-c', code, str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    child = subprocess.Popen([sys.executable, '-c', code, str(tmp_path)], stdout=subprocess.PIPE, text=True, encoding='utf-8')
     try:
         assert child.stdout.readline().strip() == 'transaction-ready'
         assert os.stat(str(inbox.path) + '-journal').st_mode & 0o777 == 0o600
