@@ -19,7 +19,7 @@ def record_path(root: Path) -> Path:
 def read_generation(root: Path) -> dict | None:
     from pm.environments import install_state_dir, venv_python
     try:
-        data = json.loads(record_path(root).read_text(encoding="utf-8"))
+        data = json.loads(record_path(root).read_text(encoding="utf-8-sig"))
         generation = Path(data["generation"]).resolve()
         if generation.parent != (install_state_dir(root) / "environments").resolve():
             return None

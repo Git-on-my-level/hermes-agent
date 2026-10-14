@@ -64,6 +64,9 @@ def test_completion_only_publishes_good_pairs(tmp_path, monkeypatch):
     root, generation = installed(tmp_path, monkeypatch)
     assert sg.record_completed_generation(root, {"commit": "good", "dirty": False})
     before = sg.record_path(root).read_bytes()
+    sg.record_path(root).write_bytes(b"\xef\xbb\xbf" + before)
+    assert sg.read_generation(root) is not None
+    sg.record_path(root).write_bytes(before)
     for stamp in ({"commit": "bad", "dirty": True}, {"commit": "adopted", "dirty": False, "adoptedAt": "now"}):
         assert not sg.record_completed_generation(root, stamp)
         assert sg.record_path(root).read_bytes() == before
