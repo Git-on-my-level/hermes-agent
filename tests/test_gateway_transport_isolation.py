@@ -245,3 +245,25 @@ async def test_shutdown_reinitialize_keeps_transport_on_its_loop(bot_api):
         await request.shutdown()
         assert request._client.is_closed
     assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_adapter_connect_disconnect_uses_real_local_bot_api(bot_api, monkeypatch, tmp_path):
+    from gateway.config import PlatformConfig
+    import plugins.platforms.telegram.adapter as adapter_module
+    url, calls = bot_api
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_TELEGRAM_DISABLE_FALLBACK_IPS', 'true')
+    monkeypatch.setattr(adapter_module, 'resolve_proxy_url', lambda *_, **__: None)
+    monkeypatch.setattr(adapter_module, '_get_scoped_secret', lambda *_: None)
+    adapter = adapter_module.TelegramAdapter(PlatformConfig(
+        enabled=True, token='123:fake', extra={'base_url': url, 'base_file_url': url},
+    ))
+    try:
+        assert await adapter.connect()
+        assert any(method == 'getUpdates' for method, _ in calls)
+        assert adapter._polling_progress_event.is_set()
+        assert adapter._send_path_degraded is False
+    finally:
+        await adapter.disconnect()
+    assert not adapter._running

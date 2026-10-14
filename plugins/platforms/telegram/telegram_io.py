@@ -11,18 +11,15 @@ import threading
 
 class TelegramIOLoop:
     def __init__(self):
-        ready = threading.Event()
+        self.loop = asyncio.new_event_loop()
 
         def serve():
-            self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             self.loop.set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix='telegram-build'))
-            ready.set()
             self.loop.run_forever()
 
         self.thread = threading.Thread(target=serve, name='telegram-io', daemon=True)
         self.thread.start()
-        ready.wait()
 
     async def build(self, factory, *args, **kwargs):
         return await self.run(asyncio.to_thread(factory, *args, **kwargs))
@@ -103,7 +100,8 @@ def isolate_updater(app):
             return original_queue
 
         def disarm_polling(self):
-            io.loop.call_soon_threadsafe(self._Updater__polling_task_stop_event.set)
+            event = getattr(self, "_Updater__polling_task_stop_event")
+            io.loop.call_soon_threadsafe(event.set)
 
         async def stop(self):
             if self._httpd is not None:
