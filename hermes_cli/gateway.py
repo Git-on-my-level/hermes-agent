@@ -3169,8 +3169,17 @@ def _service_system_dirs() -> list[str]:
 def _normalize_service_path_entry(entry: str) -> str:
     """Lexically normalize one service PATH entry so equivalent spellings deduplicate against
     the canonical system-dir lists: trailing slashes, ``.``/``..`` components, duplicate
-    slashes. Purely lexical (no filesystem access, no symlink resolution)."""
-    return os.path.normpath(entry) if entry else entry
+    slashes, and redundant leading slashes (POSIX treats ``//usr/bin`` as ``/usr/bin``).
+    Purely lexical (no filesystem access, no symlink resolution)."""
+    if not entry:
+        return entry
+    normalized = os.path.normpath(entry)
+    # normpath keeps a double leading slash (POSIX allows implementation-defined meaning there),
+    # but launchd/systemd PATH lookup treats it as the ordinary root-relative dir; collapse it
+    # so "//usr/bin/" deduplicates against the canonical "/usr/bin".
+    while normalized.startswith("//"):
+        normalized = normalized[1:]
+    return normalized
 
 
 def _strip_canonical_system_dirs(entries: list[str], system_dirs: list[str]) -> list[str]:
@@ -3341,7 +3350,21 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     working_dir = _stable_service_working_dir()
     project_root = PROJECT_ROOT
 
-    path_entries = _build_service_path_dirs()
+    if system:
+        # The service runs as the TARGET user: its head PATH segments (configured extras,
+        # tool dirs, hermes-home extras) must come from the TARGET user's hermes home /
+        # config, never from the invoking (sudo) caller's — read them under the target-home
+        # override, then restore, exactly like _systemd_watchdog_seconds does.
+        username, group_name, home_dir, uid = _system_service_identity(run_as_user)
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        target_hermes_home = _hermes_home_for_target_user(home_dir)
+        override_token = set_hermes_home_override(target_hermes_home)
+        try:
+            path_entries = _build_service_path_dirs()
+        finally:
+            reset_hermes_home_override(override_token)
+    else:
+        path_entries = _build_service_path_dirs()
     if not system:
         # System units add managed Node once the TARGET user's home is known (not the sudo caller's).
         _append_node_dir_for_service(path_entries)

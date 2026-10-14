@@ -265,6 +265,29 @@ class TestLaunchdServicePath:
         assert sane.count("/usr/bin") == 1
         assert sane[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+    def test_double_leading_slash_spellings_bubble_to_tail(
+        self, gateway_cli, launchd, tmp_path, monkeypatch,
+    ):
+        """POSIX treats a double leading slash as implementation-defined but path lookup
+        resolves it to the ordinary root-relative dir: '//usr/bin/' must deduplicate against
+        the canonical '/usr/bin' — in the head AND when carried forward from an install."""
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        sane = launchd._launchd_service_path(
+            ["//usr/bin/", str(custom)], tmp_path / "absent.plist",
+        ).split(":")
+        assert not any(e.startswith("//") for e in sane)
+        assert sane.index(custom) < sane.index("/usr/bin")
+        assert sane.count("/usr/bin") == 1
+
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": f"//usr/bin/:{custom}"},
+        }))
+        sane2 = launchd._launchd_service_path([], installed).split(":")
+        assert not any(e.startswith("//") for e in sane2)
+        assert sane2.index(str(custom)) < sane2.index("/usr/bin")
+        assert sane2.count("/usr/bin") == 1
+
     def test_relative_config_extra_anchors_and_stabilizes(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
     ):
@@ -289,9 +312,12 @@ class TestLaunchdServicePath:
         assert str(workdir / "bin") in first_path.split(":")
         assert "bin" != first_path.split(":")[0]
 
-        # Regenerate as if `first` were installed: identical PATH, no duplicated entry.
+        # Install it, then regenerate THROUGH the real carry-forward path: the getter must
+        # point at the installed plist so its PATH is read back and carried forward.
         installed = tmp_path / "ai.hermes.gateway.plist"
         installed.write_text(first, encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: installed)
+        assert gateway_cli.launchd_plist_is_current() is True
         second = gateway_cli.generate_launchd_plist()
         assert second == first
 
@@ -549,6 +575,41 @@ class TestSystemdUnitPath:
         assert entries.index(str(custom)) < entries.index("/usr/bin")
         assert entries.count("/usr/bin") == 1
         assert entries[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+    def test_system_unit_reads_target_users_config_extras(self, gateway_cli, tmp_path, monkeypatch):
+        """A system unit's service_path_extra must come from the TARGET user's hermes-home
+        config, not the invoking (sudo) caller's: with distinct configs, the installer-only
+        dir is absent and the target-only dir present."""
+        import hermes_cli.config as config_mod
+
+        root_home = tmp_path / "root-home"
+        target_home = tmp_path / "target-home"
+        installer_extra = _make_dir(root_home / "installer-only" / "bin")
+        target_extra = _make_dir(target_home / "target-only" / "bin")
+
+        configs = {
+            root_home / ".hermes": {"gateway": {"service_path_extra": [installer_extra]}},
+            target_home / ".hermes": {"gateway": {"service_path_extra": [target_extra]}},
+        }
+
+        def fake_load_config_readonly():
+            from hermes_constants import get_hermes_home
+
+            return configs.get(Path(get_hermes_home()), {})
+
+        monkeypatch.setattr(config_mod, "load_config_readonly", fake_load_config_readonly)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
+        monkeypatch.setenv("HERMES_HOME", str(root_home / ".hermes"))
+        monkeypatch.setattr(
+            gateway_cli, "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
+        )
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_home / ".hermes")
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert installer_extra not in unit
+        assert target_extra in unit
 
 
 @pytest.mark.platforms("macos")
