@@ -2128,6 +2128,12 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        # Extra directories prepended to the service definition's PATH (launchd plist /
+        # systemd unit), ahead of the deterministic host dirs' node segment and the system
+        # tail. Relative entries anchor to the service working directory; ``~`` expands
+        # against the service account's home. Lets hosts add tool dirs without hand-editing
+        # the plist/unit (see website/docs/user-guide/configuration.md, Gateway Service PATH).
+        "service_path_extra": [],
 
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.

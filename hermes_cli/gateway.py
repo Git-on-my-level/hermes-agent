@@ -3119,20 +3119,16 @@ def _expand_tilde(entry: str, home: Path) -> str:
 def _resolve_service_path_entry(entry: str, home: Path | None = None) -> str:
     """Resolve one service PATH entry to an absolute path WITHOUT changing its filesystem
     meaning: relative entries anchor to *home* (else the service working dir), ``~`` expands
-    against *home*, and ``..`` components are resolved through the filesystem (realpath) —
-    a lexical collapse would rewrite ``link/../bin`` to a sibling that may not exist, because
-    ``link/..`` follows the symlink, not the spelling."""
+    against *home*. ``..`` components are kept verbatim: PATH lookup resolves them through
+    the kernel (following symlinks), so liveness checks and carried-forward regeneration must
+    see the same spelling — a lexical or realpath rewrite would change what the entry means
+    (or resurrect a dir the entry no longer reaches when a symlink target was removed)."""
     from hermes_cli.gateway import _stable_service_working_dir
 
     target_home = Path(home) if home is not None else Path.home()
     expanded = _expand_tilde(entry, target_home)
     if not os.path.isabs(expanded):
         expanded = str(Path(_stable_service_working_dir()) / expanded)
-    if ".." in expanded.split("/"):
-        try:
-            expanded = os.path.realpath(expanded)
-        except OSError:
-            pass
     return expanded
 
 
@@ -3195,18 +3191,22 @@ def _service_system_dirs() -> list[str]:
 
 
 def _normalize_service_path_entry(entry: str) -> str:
-    """Lexically normalize one service PATH entry so equivalent spellings deduplicate against
-    the canonical system-dir lists: trailing slashes, ``.``/``..`` components, duplicate
-    slashes, and redundant leading slashes (POSIX treats ``//usr/bin`` as ``/usr/bin``).
-    Purely lexical (no filesystem access, no symlink resolution)."""
+    """Comparison spelling for one service PATH entry: collapse duplicate slashes, ``.``
+    components and trailing slashes — none of these change which directory a path names —
+    but keep ``..`` components verbatim: ``..`` traverses through symlinks at lookup time,
+    so a lexical collapse (normpath) would change what the entry means. Purely lexical
+    (no filesystem access, no symlink resolution)."""
     if not entry:
         return entry
-    normalized = os.path.normpath(entry)
-    # normpath keeps a double leading slash (POSIX allows implementation-defined meaning there),
-    # but launchd/systemd PATH lookup treats it as the ordinary root-relative dir; collapse it
-    # so "//usr/bin/" deduplicates against the canonical "/usr/bin".
-    while normalized.startswith("//"):
-        normalized = normalized[1:]
+    normalized = entry
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    while "/./" in normalized:
+        normalized = normalized.replace("/./", "/")
+    if normalized.endswith("/.") and normalized != "/.":
+        normalized = normalized[:-2]
+    while normalized.endswith("/") and normalized != "/":
+        normalized = normalized[:-1]
     return normalized
 
 

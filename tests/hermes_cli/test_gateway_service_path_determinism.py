@@ -176,6 +176,21 @@ class TestServicePathExtraConfig:
         monkeypatch.setattr(config_mod, "load_config_readonly", lambda: None)
         assert gateway_cli._service_path_extra_dirs() == []
 
+    def test_key_registered_in_config_defaults(self, gateway_cli, tmp_path, monkeypatch):
+        """gateway.service_path_extra must be a REGISTERED key: the real config loader
+        (DEFAULT_CONFIG defaults) recognizes it, so hermes config tooling does not warn
+        'unrecognized config key' for a supported setting."""
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert "service_path_extra" in DEFAULT_CONFIG["gateway"]
+        (tmp_path / ".hermes" / "config.yaml").write_text(
+            "gateway:\n  service_path_extra:\n    - /opt/from-config/bin\n",
+            encoding="utf-8",
+        )
+        config = load_config_readonly()
+        assert config["gateway"]["service_path_extra"] == ["/opt/from-config/bin"]
+
 
 @pytest.mark.platforms("macos")
 class TestLaunchdServicePath:
@@ -373,25 +388,53 @@ class TestLaunchdServicePath:
     def test_dotdot_carry_forward_keeps_symlink_semantics(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
     ):
-        """An installed entry '<link>/../bin' with link → actual/vX.Y must keep its filesystem
-        meaning: link/.. lands in actual/, so the entry resolves to actual/bin. A lexical
-        collapse (normpath) rewrites it to the sibling tmp/bin, which does not exist — the
-        old behavior dropped the real executable dir and warned it dead."""
+        """An installed entry '<link>/../bin' with link -> actual/vX.Y keeps its verbatim
+        spelling: PATH lookup resolves '..' through the kernel (following the symlink), so
+        the entry is live exactly while <link>/../bin exists. The carried entry must NOT be
+        rewritten (a lexical collapse to tmp/bin, or a realpath rewrite, would change what
+        the entry means or resurrect a dir the entry no longer reaches)."""
         installed = tmp_path / "ai.hermes.gateway.plist"
         version_dir = _make_dir(tmp_path / "actual" / "vX.Y")
         actual_bin = _make_dir(tmp_path / "actual" / "bin")
         link = tmp_path / "link"
         link.symlink_to(Path(version_dir))
+        raw_entry = f"{link}/../bin"
         installed.write_bytes(plistlib.dumps({
-            "EnvironmentVariables": {"PATH": f"{link}/../bin:/usr/bin:/bin"},
+            "EnvironmentVariables": {"PATH": f"{raw_entry}:/usr/bin:/bin"},
         }))
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
         sane = launchd._launchd_service_path([], installed).split(":")
-        # realpath also resolves macOS's /var→/private/var alias, so compare through it.
-        resolved = [os.path.realpath(e) for e in sane]
-        assert os.path.realpath(actual_bin) in resolved
-        assert os.path.realpath(str(tmp_path / "bin")) not in resolved
+        assert raw_entry in sane  # verbatim, liveness checked through the kernel
+        # And the entry really resolves to actual/bin via PATH semantics:
+        assert os.path.isdir(raw_entry) and os.path.realpath(raw_entry) == os.path.realpath(actual_bin)
+
+    def test_dotdot_carry_forward_dropped_when_symlink_target_removed(
+        self, gateway_cli, launchd, tmp_path, monkeypatch, caplog,
+    ):
+        """When the symlink target is removed, '<link>/../bin' is no longer resolvable:
+        regeneration must DROP it (the kernel cannot resolve it either) — a non-strict
+        realpath rewrite would resurrect the old target's bin and change lookup meaning."""
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        version_dir = tmp_path / "actual" / "vX.Y"
+        version_dir.mkdir(parents=True)
+        actual_bin = _make_dir(tmp_path / "actual" / "bin")
+        link = tmp_path / "link"
+        link.symlink_to(Path(version_dir))
+        raw_entry = f"{link}/../bin"
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"PATH": f"{raw_entry}:/usr/bin:/bin"},
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        # The version dir disappears; link dangles, so link/../bin is unresolvable.
+        version_dir.rmdir()
+        assert not os.path.isdir(raw_entry)
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.gateway_launchd"):
+            sane = launchd._launchd_service_path([], installed).split(":")
+        assert raw_entry not in sane
+        assert any("no longer present on disk" in r.getMessage() for r in caplog.records)
 
     def test_reset_service_path_drops_carry_forward(
         self, gateway_cli, launchd, tmp_path, monkeypatch,
