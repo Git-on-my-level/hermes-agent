@@ -443,6 +443,11 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
     system_set = {normalize(d) for d in system_dirs}
     if plist_path.exists():
         carried = [normalize(_resolve_entry(e)) for e in _installed_plist_path_dirs(plist_path)]
+        # Snapshot the host-derived head before carry-forward so the warning names only
+        # dirs the installed plist actually rescued — not Homebrew/~/.local/bin that
+        # generation re-derives on every run (a converge under launchd's minimal PATH
+        # would otherwise log those as "carried" on every no-op regeneration).
+        pre_carry_set = {normalize(e) for e in segments}
         if not reset_service_path:
             for entry in carried:
                 if normalize(entry) not in system_set:
@@ -453,6 +458,7 @@ def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
             e for e in carried
             if normalize(e) not in caller_set and normalize(e) in segments_set
             and normalize(e) not in system_set
+            and normalize(e) not in pre_carry_set
         )
         if caller_lacking_carried:
             # The task-spec warning: the caller env lacks an entry the installed plist has.

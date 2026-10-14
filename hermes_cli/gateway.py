@@ -3419,10 +3419,10 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         project_root = Path(_remap_path_for_user(str(project_root), home_dir))
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
-        # Managed Node for the TARGET user's tree, prepended so it outranks remapped shell-PATH entries.
-        _target_node_entries: list[str] = []
-        _append_node_dir_for_service(_target_node_entries, Path(hermes_home) if hermes_home else None)
-        path_entries = [e for e in _target_node_entries if e not in path_entries] + path_entries
+        # Managed Node for the TARGET user's tree (not the sudo caller's), appended so it
+        # ranks after ~/.local/bin and service_path_extra — same contract as user units.
+        # Prepending here used to outrank remapped caller-PATH entries; those are gone.
+        _append_node_dir_for_service(path_entries, Path(hermes_home) if hermes_home else None)
         user_home = Path(home_dir)
         identity_lines = f"User={username}\nGroup={group_name}\n"
         # Restart-safe cron/Kanban workers cross `systemd-run --user`, which needs this user's manager;

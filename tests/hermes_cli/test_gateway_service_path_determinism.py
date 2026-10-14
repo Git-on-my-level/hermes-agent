@@ -485,6 +485,33 @@ class TestLaunchdServicePath:
         assert a == b
 
 
+class TestLaunchdCarryForwardWarning:
+    def test_carry_forward_does_not_warn_for_host_derived_dirs(
+        self, gateway_cli, launchd, tmp_path, monkeypatch, caplog,
+    ):
+        """A healthy converge (minimal PATH, same host-derived dirs as the installed
+        plist) must not log carry-forward for Homebrew/~/.local/bin: those were
+        re-derived, not rescued. A custom installed-only dir still warns."""
+        installed = tmp_path / "ai.hermes.gateway.plist"
+        brew_bin = _make_dir(tmp_path / "hb" / "bin")
+        local_bin = _make_dir(tmp_path / ".local" / "bin")
+        custom = _make_dir(tmp_path / "custom-tool-dir")
+        installed.write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {
+                "PATH": f"{local_bin}:{brew_bin}:{custom}:/usr/bin:/bin",
+            },
+        }))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.gateway_launchd"):
+            sane = launchd._launchd_service_path([local_bin, brew_bin], installed).split(":")
+        assert sane.index(local_bin) < sane.index(brew_bin) < sane.index(custom)
+        carry_msgs = [r.getMessage() for r in caplog.records if "carried forward" in r.getMessage()]
+        assert len(carry_msgs) == 1
+        assert custom in carry_msgs[0]
+        assert brew_bin not in carry_msgs[0]
+        assert local_bin not in carry_msgs[0]
+
+
 @pytest.mark.platforms("macos")
 class TestLaunchdPlistIsCurrent:
     def test_same_answer_under_minimal_and_full_caller_env(
@@ -708,6 +735,42 @@ class TestSystemdUnitPath:
 
         assert str(target_home / ".local" / "bin") in unit
         assert str(root_home / ".local" / "bin") not in unit
+
+    def test_system_unit_ranks_managed_node_after_tool_dirs_and_extras(
+        self, gateway_cli, tmp_path, monkeypatch,
+    ):
+        """User units append managed Node; system units must not prepend it ahead of
+        ~/.local/bin or service_path_extra (the leftover prepend was for remapped
+        caller-PATH entries that no longer exist)."""
+        local_bin = _make_dir(tmp_path / ".local" / "bin")
+        extra = _make_dir(tmp_path / "opt" / "tools" / "bin")
+        node_bin = "/managed/node/bin"
+
+        monkeypatch.setattr(
+            gateway_cli, "_build_service_path_dirs",
+            lambda project_root=None, home=None: [local_bin, extra],
+        )
+
+        def _append_node(entries, hermes_root=None):
+            if node_bin not in entries:
+                entries.append(node_bin)
+
+        monkeypatch.setattr(gateway_cli, "_append_node_dir_for_service", _append_node)
+        monkeypatch.setattr(
+            gateway_cli, "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(tmp_path), 1001),
+        )
+
+        def _path_entries(unit: str) -> list[str]:
+            env_line = next(l for l in unit.splitlines() if l.startswith('Environment="PATH='))
+            return env_line[len('Environment="PATH='):].rstrip('"').split(":")
+
+        user_entries = _path_entries(gateway_cli.generate_systemd_unit(system=False))
+        system_entries = _path_entries(
+            gateway_cli.generate_systemd_unit(system=True, run_as_user="alice"),
+        )
+        for entries in (user_entries, system_entries):
+            assert entries.index(local_bin) < entries.index(extra) < entries.index(node_bin)
 
 
 @pytest.mark.platforms("macos")
