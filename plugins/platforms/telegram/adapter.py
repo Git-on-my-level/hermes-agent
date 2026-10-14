@@ -1712,11 +1712,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # initialize() only rebuilds the client when ``client.is_closed``; an abandoned aclose()
             # leaves it false, so start_polling would reuse the CLOSE-WAIT socket (alive but deaf).
             # Swap in a fresh client before initialize(). See #87057.
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
         if await self._bounded_request_step(polling_req.initialize(), "Polling request re-initialize failed/timed out (non-fatal)"):
             logger.debug("[%s] Polling request pool drained before reconnect", self.name)
         else:
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
 
     async def _bounded_request_step(self, awaitable, failure_msg: str) -> bool:
         """Await a request shutdown()/initialize() under ``_DRAIN_TIMEOUT``; False (debug-logged) on failure."""
@@ -1727,7 +1727,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] " + failure_msg, self.name, exc_info=True)
             return False
 
-    def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
+    async def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
         """Replace a wedged HTTPXRequest client after a hung aclose(): swap in a fresh client and close
         the old one in a detached, bounded task so it can't block the reconnect ladder.
 
@@ -1735,24 +1735,40 @@ class TelegramAdapter(BasePlatformAdapter):
         ``is_closed``. If ``shutdown()`` was abandoned on a CLOSE-WAIT socket, that flag stays false and the
         next ``start_polling()`` reuses the dead getUpdates connection (#87057).
         """
-        old = getattr(polling_req, "_client", None)
-        build = getattr(polling_req, "_build_client", None)
-        if old is None or not callable(build) or getattr(old, "is_closed", True):
-            return
+        from .telegram_io import io_loop
+        io = io_loop()
+
+        async def _rebuild():
+            old = getattr(polling_req, "_client", None)
+            build = getattr(polling_req, "_build_client", None)
+            if old is None or not callable(build) or getattr(old, "is_closed", True):
+                return None
+            try:
+                polling_req._client = build()  # noqa: SLF001
+            except Exception:
+                logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
+                return None
+            logger.warning("[%s] Replaced wedged getUpdates HTTP client after drain timeout (likely CLOSE-WAIT socket)", self.name)
+            return old
+
         try:
-            polling_req._client = build()  # noqa: SLF001
+            old = await io.run(_rebuild())
         except Exception:
             logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
             return
-        logger.warning("[%s] Replaced wedged getUpdates HTTP client after drain timeout (likely CLOSE-WAIT socket)", self.name)
+        if old is None:
+            return
+
+        async def _close_old() -> None:
+            aclose = getattr(old, "aclose", None)
+            if not callable(aclose):
+                return
+            # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
+            await _await_with_thread_deadline(aclose(), timeout=_DRAIN_TIMEOUT)
 
         async def _orphan_aclose() -> None:
             try:
-                aclose = getattr(old, "aclose", None)
-                if not callable(aclose):
-                    return
-                # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
-                await _await_with_thread_deadline(aclose(), timeout=_DRAIN_TIMEOUT)
+                await io.run(_close_old())
             except Exception:
                 logger.debug("[%s] Orphan polling client aclose failed (non-fatal)", self.name, exc_info=True)
 

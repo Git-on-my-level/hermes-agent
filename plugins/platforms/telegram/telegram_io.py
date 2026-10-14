@@ -27,8 +27,25 @@ class TelegramIOLoop:
     async def run(self, awaitable):
         if asyncio.get_running_loop() is self.loop:
             return await awaitable
-        future = asyncio.run_coroutine_threadsafe(awaitable, self.loop)
-        return await asyncio.wrap_future(future)
+        task_holder = []
+
+        async def tracked():
+            task_holder.append(asyncio.current_task())
+            return await awaitable
+
+        future = asyncio.run_coroutine_threadsafe(tracked(), self.loop)
+        try:
+            return await asyncio.wrap_future(future)
+        finally:
+            # wrap_future cancel cannot stop a running concurrent future; cancel the
+            # I/O task on its own loop so a timed-out send cannot still deliver.
+            if not future.done():
+                def cancel_io():
+                    for task in task_holder:
+                        if task is not None and not task.done():
+                            task.cancel()
+                self.loop.call_soon_threadsafe(cancel_io)
+                future.cancel()
 
 
 # Created only by gateway-loop setup, never from an agent turn.
@@ -64,48 +81,100 @@ def isolate_request(request):
     return request
 
 
+def _is_polling_conflict(error):
+    text = str(error).lower()
+    return (
+        error.__class__.__name__.lower() == 'conflict'
+        or 'terminated by other getupdates request' in text
+        or 'another bot instance is running' in text
+    )
+
+
 def isolate_updater(app):
     """Move only polling to the I/O loop; webhook serving stays on gateway."""
     from telegram.ext import Updater
     if not isinstance(Updater, type) or not isinstance(app.updater, Updater):
         return
+    if callable(getattr(type(app.updater), 'disarm_polling', None)):
+        return
     gateway_loop = asyncio.get_running_loop()
     io = io_loop()
     original_queue = app.update_queue
+    if original_queue.maxsize == 0:
+        # Pause polling/webhook intake at 256 updates waiting for dispatch.
+        original_queue = asyncio.Queue(maxsize=256)
+        app.update_queue = original_queue
 
     class QueueBridge:
-        def __init__(self):
-            self.slots = asyncio.Semaphore(256)
-
         async def put(self, item):
-            # Bounded handoff, with no agent callback on the transport loop.
-            # Keep polling through a short dispatch stall without unbounded buffering.
-            await self.slots.acquire()
+            # Do not return to PTB (which would ack getUpdates) until the gateway
+            # queue holds the item. A bounded queue pauses polling at capacity.
+            done = asyncio.get_running_loop().create_future()
 
-            def admitted(done):
-                io.loop.call_soon_threadsafe(self.slots.release)
+            def finish(task):
+                cancelled = task.cancelled()
+                exc = None if cancelled else task.exception()
+
+                def settle():
+                    if done.done():
+                        return
+                    if cancelled:
+                        done.cancel()
+                    elif exc is not None:
+                        done.set_exception(exc)
+                    else:
+                        done.set_result(None)
+                io.loop.call_soon_threadsafe(settle)
 
             def deliver():
                 task = gateway_loop.create_task(original_queue.put(item))
-                task.add_done_callback(admitted)
+                task.add_done_callback(finish)
 
             gateway_loop.call_soon_threadsafe(deliver)
+            await done
 
     class IsolatedUpdater(Updater):
         async def start_polling(self, *args, **kwargs):
             callback = kwargs.get('error_callback')
             if callback:
-                kwargs['error_callback'] = lambda error: gateway_loop.call_soon_threadsafe(callback, error)
-            await io.run(super().start_polling(*args, **kwargs))
-            return original_queue
+                def wrapped(error):
+                    # PTB retries unless the stop event is set before this returns.
+                    if _is_polling_conflict(error):
+                        self.disarm_polling()
+                    gateway_loop.call_soon_threadsafe(callback, error)
+                kwargs['error_callback'] = wrapped
+            self.update_queue = QueueBridge()
+            try:
+                await io.run(super().start_polling(*args, **kwargs))
+                return original_queue
+            except BaseException:
+                self.update_queue = original_queue
+                raise
 
         def disarm_polling(self):
-            event = getattr(self, "_Updater__polling_task_stop_event")
-            io.loop.call_soon_threadsafe(event.set)
+            event = None
+            for attr in ('_Updater__polling_task_stop_event', '_polling_task_stop_event'):
+                candidate = getattr(self, attr, None)
+                if isinstance(candidate, asyncio.Event):
+                    event = candidate
+                    break
+            if event is None or event.is_set():
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is io.loop:
+                event.set()
+            else:
+                io.loop.call_soon_threadsafe(event.set)
 
         async def stop(self):
-            if self._httpd is not None:
-                return await super().stop()
-            return await io.run(super().stop())
+            try:
+                if self._httpd is not None:
+                    return await super().stop()
+                return await io.run(super().stop())
+            finally:
+                self.update_queue = original_queue
 
-    app.updater = IsolatedUpdater(app.bot, QueueBridge())
+    app.updater = IsolatedUpdater(app.bot, original_queue)
