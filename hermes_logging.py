@@ -743,6 +743,17 @@ class _NonFormattingQueueHandler(QueueHandler):
     the emitting thread's synchronous handlers may mutate ``record.message`` meanwhile.
     """
 
+    def handle(self, record: logging.LogRecord):
+        # SimpleQueue and prepare() have no mutable per-handler emit state.
+        # Skip Handler.handle's shared RLock on the producer (Python 3.14
+        # unconditionally enters it, so setting lock=None is insufficient).
+        filtered = self.filter(record)
+        if isinstance(filtered, logging.LogRecord):
+            record = filtered
+        if filtered:
+            self.emit(record)
+        return filtered
+
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
         return copy.copy(record)
 

@@ -1712,11 +1712,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # initialize() only rebuilds the client when ``client.is_closed``; an abandoned aclose()
             # leaves it false, so start_polling would reuse the CLOSE-WAIT socket (alive but deaf).
             # Swap in a fresh client before initialize(). See #87057.
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
         if await self._bounded_request_step(polling_req.initialize(), "Polling request re-initialize failed/timed out (non-fatal)"):
             logger.debug("[%s] Polling request pool drained before reconnect", self.name)
         else:
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
 
     async def _bounded_request_step(self, awaitable, failure_msg: str) -> bool:
         """Await a request shutdown()/initialize() under ``_DRAIN_TIMEOUT``; False (debug-logged) on failure."""
@@ -1727,7 +1727,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] " + failure_msg, self.name, exc_info=True)
             return False
 
-    def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
+    async def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
         """Replace a wedged HTTPXRequest client after a hung aclose(): swap in a fresh client and close
         the old one in a detached, bounded task so it can't block the reconnect ladder.
 
@@ -1740,7 +1740,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if old is None or not callable(build) or getattr(old, "is_closed", True):
             return
         try:
-            polling_req._client = build()  # noqa: SLF001
+            rebuild = getattr(type(polling_req), 'rebuild_client', None)
+            if callable(rebuild):
+                old = await rebuild(polling_req)
+            else:
+                polling_req._client = await asyncio.to_thread(build)  # noqa: SLF001
         except Exception:
             logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
             return
@@ -1752,7 +1756,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not callable(aclose):
                     return
                 # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
-                await _await_with_thread_deadline(aclose(), timeout=_DRAIN_TIMEOUT)
+                close_on_owner = getattr(type(polling_req), 'close_client', None)
+                closing = close_on_owner(polling_req, old) if callable(close_on_owner) else aclose()
+                await _await_with_thread_deadline(closing, timeout=_DRAIN_TIMEOUT)
             except Exception:
                 logger.debug("[%s] Orphan polling client aclose failed (non-fatal)", self.name, exc_info=True)
 
@@ -1854,6 +1860,7 @@ class TelegramAdapter(BasePlatformAdapter):
         (#64482). It only appeared to work on Python 3.12, where those instances still had a ``__dict__``.
         """
         adapter = self
+        owner_loop = asyncio.get_running_loop()
 
         class _InstrumentedPollingRequest(type(request)):
             __slots__ = ()
@@ -1861,7 +1868,10 @@ class TelegramAdapter(BasePlatformAdapter):
             async def do_request(self, *args, **kwargs):
                 generation = _POLLING_GENERATION_CONTEXT.get()
                 result = await super().do_request(*args, **kwargs)
-                adapter._observe_polling_request_result(self, generation, result)
+                if asyncio.get_running_loop() is owner_loop:
+                    adapter._observe_polling_request_result(self, generation, result)
+                else:
+                    owner_loop.call_soon_threadsafe(adapter._observe_polling_request_result, self, generation, result)
                 return result
 
         request.__class__ = _InstrumentedPollingRequest
@@ -2310,6 +2320,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_pending_stuck_count = 0
             return
         if not getattr(updater, "running", False):
+            if self._polling_is_backpressured():
+                self._polling_pending_stuck_count = self._polling_not_running_count = 0
+                self._check_backpressure_consumer()
+                return
             # Long-poll task gone, general-path calls still succeed, so no error_callback/probe ever
             # fires. Debounced over two probes so a just-starting updater never trips it.
             self._polling_pending_stuck_count = 0
@@ -2336,6 +2350,12 @@ class TelegramAdapter(BasePlatformAdapter):
             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
         except (asyncio.TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
+        # A server queue is expected while durable acceptance is paused. Check
+        # after the await too: pressure may have appeared during the probe.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
+            return
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
             self._polling_pending_stuck_count = 0
@@ -2354,8 +2374,44 @@ class TelegramAdapter(BasePlatformAdapter):
         """Second consecutive stuck probe: restart polling via the network-error ladder (unless tearing down)."""
         if self._teardown_started:
             return
+        # Last guard against pressure appearing between a probe and escalation.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
+            return
         logger.warning(log_message, self.name)
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
+
+    def _polling_is_backpressured(self) -> bool:
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        check = getattr(updater, "polling_backpressured", None)
+        return callable(check) and check() is True
+
+    def _check_backpressure_consumer(self) -> None:
+        """Alert on stalled completion without destroying the durable backlog."""
+        now = time.monotonic()
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        progress = getattr(updater, "consumer_progress", None)
+        completed = progress() if callable(progress) else 0
+        if not self._polling_is_backpressured():
+            self._pressure_since = None
+            self._pressure_completed = completed
+            return
+        since = getattr(self, "_pressure_since", None)
+        if since is None or completed != getattr(self, "_pressure_completed", None):
+            self._pressure_since = now
+            self._pressure_completed = completed
+            return
+        threshold = max(1, float(self.config.extra.get("backpressure_stall_seconds", 300)))
+        if now - since < threshold or now - getattr(self, "_pressure_alert_at", float("-inf")) < 300:
+            return
+        self._pressure_alert_at = now
+        message = ("Telegram consumer made no completion progress for %.0fs while backpressured; "
+                   "durable input retained, acceptance pauses at inbox limits. Check wedged handlers; "
+                   "Telegram retains unacknowledged input for about 24h." % (now - since))
+        logger.error("[%s] %s", self.name, message)
+        self._write_runtime_status_safe("consumer_backpressure", needs_attention=True,
+                                        error_code="telegram_consumer_stalled", error_message=message)
 
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
@@ -2367,6 +2423,10 @@ class TelegramAdapter(BasePlatformAdapter):
         per stall (``_PollingStallError``: an in-place restart keeps the wedged dispatcher); re-arms on progress.
         """
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
+            return
+        self._check_backpressure_consumer()
+        if self._polling_is_backpressured():
+            self._ingress_stalled_heartbeats = 0
             return
         received = getattr(self, "_updates_received_total", 0)
         dispatched = getattr(self, "_updates_dispatched_total", 0)
@@ -2400,6 +2460,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
         now = time.monotonic()
+        self._check_backpressure_consumer()
+        if self._polling_is_backpressured():
+            # Queue pressure / an outstanding durable commit is not a dead
+            # socket. Resume the stall clock only after acceptance can progress.
+            self._polling_last_progress_monotonic = now
+            return
         last_progress = getattr(self, "_polling_last_progress_monotonic", None)
         generation_started = getattr(self, "_polling_generation_started_monotonic", None)
         if last_progress is not None:
@@ -2477,6 +2543,10 @@ class TelegramAdapter(BasePlatformAdapter):
         already False, which would skip the real teardown and poison the next start."""
         updater = getattr(self._app, "updater", None) if self._app else None
         if updater is None:
+            return
+        disarm = getattr(type(updater), "disarm_polling", None)
+        if callable(disarm):
+            disarm(updater)
             return
         for attr in ("_Updater__polling_task_stop_event", "_polling_task_stop_event"):
             stop_event = getattr(updater, attr, None)
@@ -3033,6 +3103,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
+        from .telegram_io import io_loop
+        io = io_loop()
         # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
         request_kwargs = {
             "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
@@ -3089,11 +3161,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url(
+        proxy_url = await io.build(resolve_proxy_url,
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
+            from .telegram_network import _telegram_ssl_context
+            general_httpx.setdefault("verify", _telegram_ssl_context())
+            updates_httpx.setdefault("verify", _telegram_ssl_context())
             return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
                     HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
 
@@ -3114,20 +3189,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 _updates_transport_kwargs["limits"] = _updates_limits
             from .telegram_request import build_fallback_request
 
-            request = build_fallback_request(
+            request = await io.build(build_fallback_request,
                 HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_transport_kwargs),
                 **request_kwargs)
-            get_updates_request = build_fallback_request(
+            get_updates_request = await io.build(build_fallback_request,
                 HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs),
                 **request_kwargs)
         elif proxy_url:
             logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
         else:
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
-        return request, self._instrument_polling_request(get_updates_request)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits})
+        from .telegram_io import isolate_request
+        return isolate_request(request), self._instrument_polling_request(isolate_request(get_updates_request))
 
     async def _initialize_app_with_retries(self, builder) -> None:
         """``app.initialize()`` with a bounded retry ladder; rebuilds ``self._app``/``self._bot`` from
@@ -3184,6 +3260,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if rebuild_app and _attempt < _max_connect - 1:
                     old_app = self._app
                     self._app = builder.build()
+                    from .telegram_io import isolate_updater
+                    isolate_updater(self._app)
                     self._bot = self._app.bot
                     # Same order as connect(): plugin handlers first (the wired-set is keyed per app, so
                     # the rebuilt app gets them again), then core and the observer in lockstep.
@@ -3307,6 +3385,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # connect-retry rebuild in _initialize_app_with_retries gets it too.
             builder = builder.concurrent_updates(build_update_processor(self.config.extra, self.name))
             self._app = builder.build()
+            from .telegram_io import isolate_updater
+            isolate_updater(self._app)
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)

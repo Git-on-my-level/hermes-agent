@@ -68,6 +68,10 @@ def _load_receipts(adapter, bot_id) -> None:
 def _record_receipt(adapter, key: str) -> None:
     bounded_put(adapter._seen_update_ids, key, time.time(), _SEEN_CAP)
     adapter._update_receipts_dirty.add(key.split(":", 1)[0])
+    completed = getattr(adapter, '_durable_updates_completed', None)
+    if completed is None:
+        completed = adapter._durable_updates_completed = {}
+    completed.setdefault(key.split(':', 1)[0], set()).add(key.split(':', 1)[1])
     task = adapter._update_receipt_flush
     if task is None or task.done():
         # One writer per adapter coalesces bursts; the fsync stays off the event loop.
@@ -80,6 +84,7 @@ async def _flush_receipts(adapter) -> None:
 
     while adapter._update_receipts_dirty:
         bot_id = adapter._update_receipts_dirty.pop()
+        completed = getattr(adapter, '_durable_updates_completed', {}).pop(bot_id, set())
         prefix, cutoff = f"{bot_id}:", time.time() - RECEIPT_TTL_SECONDS
         # Snapshot on the loop: admission mutates this dict only from loop callbacks.
         ids = {key[len(prefix):]: ts for key, ts in adapter._seen_update_ids.items()
@@ -88,7 +93,13 @@ async def _flush_receipts(adapter) -> None:
         try:
             mkdir_under_hermes_home(path.parent)
             await asyncio.to_thread(atomic_json_write, path, {"update_ids": ids}, indent=None)
+            updater = getattr(getattr(adapter, '_app', None), 'updater', None)
+            retire = getattr(updater, 'complete_updates', None)
+            inbox = getattr(updater, 'durable_inbox', None)
+            if retire is not None and getattr(inbox, 'bot_id', None) == bot_id:
+                await retire(completed)
         except Exception:
+            getattr(adapter, '_durable_updates_completed', {}).setdefault(bot_id, set()).update(completed)
             logger.warning("[Telegram] Failed to persist update receipts to %s", path, exc_info=True)
 
 
@@ -179,11 +190,12 @@ def build_update_processor(extra, name: str) -> PerChatUpdateProcessor:
 
 
 class TelegramApplication(Application):
-    __slots__ = ("adapter", "_current_claim")
+    __slots__ = ("adapter", "_current_claim", "_claim_tasks")
 
     def __init__(self, *, adapter, **kwargs):
         super().__init__(**kwargs)
         self.adapter = adapter
+        self._claim_tasks = {}
         if adapter._update_admission is None:
             adapter._update_admission = ContextVar[_Claim | None]("telegram_update_claim", default=None)
         self._current_claim: ContextVar[_Claim | None] = adapter._update_admission
@@ -248,14 +260,36 @@ class TelegramApplication(Application):
             # Pin scheduled work before callback entry, including cancellation before entry.
             claim.owners += 1
 
-            def finished(done):
-                # PTB's task wrapper may never start, leaving its callback unawaited.
-                if done.cancelled() and asyncio.iscoroutine(coroutine):
-                    coroutine.close()
-                self._release_claim(claim, done)
-
-            task.add_done_callback(finished)
+            self._claim_tasks[task] = (claim, coroutine)
+            # PTB does not track tasks created while stopped. Keep a fallback
+            # for that case; settlement is idempotent when PTB also invokes it.
+            task.add_done_callback(self._settle_task_claim)
         return task
+
+    def _settle_task_claim(self, task):
+        owned = self._claim_tasks.pop(task, None)
+        if owned is None:
+            return
+        claim, coroutine = owned
+        try:
+            # Cancellation before PTB's wrapper starts leaves this unawaited.
+            if task.cancelled() and asyncio.iscoroutine(coroutine):
+                coroutine.close()
+        finally:
+            self._release_claim(claim, task)
+
+    async def stop(self):
+        try:
+            await super().stop()
+        finally:
+            # Python's gather can return immediately for already-done tasks
+            # while their done callbacks are still queued. PTB stop() therefore
+            # does not guarantee our ownership callbacks have run. Settle every
+            # finished claim before returning, including cancelled-before-entry
+            # callbacks; leave genuinely running owners pinned for safe replay.
+            for task in tuple(self._claim_tasks):
+                if task.done():
+                    self._settle_task_claim(task)
 
     def _release_claim(self, claim, task=None):
         if task is not None and task.cancelled():
@@ -285,7 +319,12 @@ class TelegramApplication(Application):
         self.adapter._updates_dispatched_total += 1
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
-        if key in seen or key in pending:
+        if key in seen:
+            retire = getattr(self.updater, 'complete_updates', None)
+            if retire is not None:
+                await retire([update.update_id])  # Replay of a persisted completed receipt.
+            return
+        if key in pending:
             return
         claim = _Claim(key, asyncio.current_task())
         # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its

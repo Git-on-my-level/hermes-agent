@@ -11,6 +11,7 @@ pytest.importorskip("telegram", reason="real python-telegram-bot required for cl
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram import telegram_network as tnet
+from plugins.platforms.telegram.telegram_io import io_loop
 
 
 class _WireTransport(httpx.AsyncBaseTransport):
@@ -104,6 +105,18 @@ async def test_reconnect_builds_fresh_transport_for_each_client(adapter, pool):
         await polling.shutdown()
 
 
+def _io_set(event):
+    io_loop().loop.call_soon_threadsafe(event.set)
+
+
+async def _await_io_tasks(tasks):
+    if not tasks:
+        return
+    async def wait():
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await io_loop().run(wait())
+
+
 @pytest.mark.asyncio
 async def test_abandoned_close_cannot_close_replacement_or_interrupt_send(adapter, monkeypatch):
     general, polling = await adapter._build_ptb_requests()
@@ -122,15 +135,18 @@ async def test_abandoned_close_cannot_close_replacement_or_interrupt_send(adapte
     original_close = old_client.aclose
 
     async def delayed_close():
-        closers.add(asyncio.current_task())
-        close_started.set()
-        # Mimic a cancellation-shielded close which outlives the drain deadline.
-        while not release_close.is_set():
-            try:
-                await release_close.wait()
-            except asyncio.CancelledError:
-                continue
-        await original_close()
+        # Shield the close onto its own I/O task so cancelling the hop
+        # cannot busy-loop the transport loop on CancelledError.
+        async def body():
+            closers.add(asyncio.current_task())
+            close_started.set()
+            await release_close.wait()
+            await original_close()
+        task = asyncio.create_task(body())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            return
 
     monkeypatch.setattr(old_client, "aclose", delayed_close)
     monkeypatch.setattr(tg_adapter, "_DRAIN_TIMEOUT", 2.0)
@@ -144,19 +160,44 @@ async def test_abandoned_close_cannot_close_replacement_or_interrupt_send(adapte
         assert general._client is general_client
         assert not send.done()
         await _request(polling)
-        release_close.set()
-        await asyncio.wait_for(asyncio.gather(*closers), 5)
+        _io_set(release_close)
+        await asyncio.wait_for(_await_io_tasks(closers), 5)
         await asyncio.gather(*list(adapter._background_tasks))
         # The late close must touch only the old client's transport.
         await _request(polling)
         assert old_transport._primary_closed
         _assert_pool_contract(general, polling)
         assert polling._client._transport is not old_transport
-        send_wire.release_send.set()
+        _io_set(send_wire.release_send)
         await asyncio.wait_for(send, 5)
     finally:
-        release_close.set()
-        send_wire.release_send.set()
-        await asyncio.gather(drain, send, *closers, *list(adapter._background_tasks), return_exceptions=True)
+        _io_set(release_close)
+        _io_set(send_wire.release_send)
+        await asyncio.gather(drain, send, *list(adapter._background_tasks), return_exceptions=True)
+        await _await_io_tasks(closers)
+        await general.shutdown()
+        await polling.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_orphan_rebuild_closes_client_on_io_loop(adapter, monkeypatch):
+    general, polling = await adapter._build_ptb_requests()
+    adapter._app = SimpleNamespace(bot=SimpleNamespace(_request=(polling, general)))
+    await polling.initialize()
+    old = polling._client
+    loops = []
+    original_close = old.aclose
+
+    async def track_close():
+        loops.append(asyncio.get_running_loop())
+        await original_close()
+
+    monkeypatch.setattr(old, "aclose", track_close)
+    try:
+        await adapter._orphan_and_rebuild_polling_client(polling)
+        await asyncio.gather(*list(adapter._background_tasks))
+        assert loops == [io_loop().loop]
+        assert polling._client is not old
+    finally:
         await general.shutdown()
         await polling.shutdown()
