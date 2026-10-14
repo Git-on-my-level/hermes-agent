@@ -78,10 +78,10 @@ def _service_tool_dirs(home: Path | None = None) -> list[str]:
     ~/.local/bin is probed — system units pass the TARGET user's home, never the installer's."""
     base_home = Path(home) if home is not None else Path.home()
     candidates = [str(base_home / ".local" / "bin")]
-    if sys.platform == "darwin":
-        candidates += ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"]
-    else:
-        candidates += ["/usr/local/sbin", "/usr/local/bin"]
+    # Known-dir tables live in hermes_platform (AGENTS.md): one spelling per host dir,
+    # shared with runtime resolution instead of a private copy here.
+    from hermes_platform.resolver.known_dirs import package_manager_dirs
+    candidates += package_manager_dirs()
     out: list[str] = []
     for candidate in candidates:
         try:
