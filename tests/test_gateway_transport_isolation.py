@@ -267,3 +267,19 @@ async def test_adapter_connect_disconnect_uses_real_local_bot_api(bot_api, monke
     finally:
         await adapter.disconnect()
     assert not adapter._running
+
+
+@pytest.mark.asyncio
+async def test_coalesced_status_readd_follows_profile_drop(monkeypatch):
+    from gateway import status
+    from gateway.status_async import publish_runtime_status
+    calls = []
+    monkeypatch.setattr(status, 'publish_runtime_status', lambda **fields: calls.append(fields))
+    publish_runtime_status(platform='alpha:telegram', platform_state='retrying')
+    publish_runtime_status(drop_profile_platforms='alpha')
+    settled = publish_runtime_status(platform='alpha:telegram', platform_state='connected')
+    await settled
+    assert calls == [
+        {'drop_profile_platforms': 'alpha'},
+        {'platform': 'alpha:telegram', 'platform_state': 'connected'},
+    ]

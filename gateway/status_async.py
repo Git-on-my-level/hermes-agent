@@ -24,7 +24,9 @@ def publish_runtime_status(**fields):
         batch = {'pending': {}, 'task': None}
         _batches[loop] = batch
     key = (fields.get('platform'), fields.get('drop_profile_platforms'), fields.get('clear_profile_platforms'))
-    previous = batch['pending'].get(key)
+    # A later update must stay after structural drops/clears queued between
+    # two snapshots of the same platform. Preserve last-submission order.
+    previous = batch['pending'].pop(key, None)
     merged = {**(previous[1] if previous else {}), **fields}
     batch['pending'][key] = (copy_context(), merged)
     if batch['task'] is None:
