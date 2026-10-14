@@ -15,6 +15,7 @@ class UpdateInbox:
     def __init__(self, directory: Path, bot_id: str):
         if not bot_id.isdigit():
             raise ValueError("Telegram bot token must contain a numeric bot id")
+        self.bot_id = bot_id
         self.path = Path(directory) / f"telegram_update_inbox_{bot_id}.sqlite3"
 
     def _connect(self):

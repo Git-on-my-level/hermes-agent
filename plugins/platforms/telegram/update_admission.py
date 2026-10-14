@@ -95,7 +95,8 @@ async def _flush_receipts(adapter) -> None:
             await asyncio.to_thread(atomic_json_write, path, {"update_ids": ids}, indent=None)
             updater = getattr(getattr(adapter, '_app', None), 'updater', None)
             retire = getattr(updater, 'complete_updates', None)
-            if retire is not None:
+            inbox = getattr(updater, 'durable_inbox', None)
+            if retire is not None and getattr(inbox, 'bot_id', None) == bot_id:
                 await retire(completed)
         except Exception:
             getattr(adapter, '_durable_updates_completed', {}).setdefault(bot_id, set()).update(completed)

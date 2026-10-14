@@ -324,3 +324,20 @@ async def test_late_commit_from_cancelled_put_wakes_replacement(monkeypatch):
         await close(app)
         if replacement is not None:
             await close(replacement)
+
+
+@pytest.mark.asyncio
+async def test_old_bot_completion_cannot_retire_new_bot_input():
+    from plugins.platforms.telegram.update_admission import _record_receipt
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='123:fake'))
+    replacement = Application.builder().token('456:fake').build()
+    isolate_updater(replacement)
+    adapter._app = replacement
+    try:
+        await io_loop().build(replacement.updater.durable_inbox.put, Update(11))
+        # An old Application finishes after its adapter has switched bot token.
+        _record_receipt(adapter, '123:11')
+        await adapter._update_receipt_flush
+        assert await io_loop().build(replacement.updater.durable_inbox.count) == 1
+    finally:
+        await close(replacement)
