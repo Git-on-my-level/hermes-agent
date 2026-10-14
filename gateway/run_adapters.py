@@ -959,7 +959,7 @@ class GatewayAdapterLifecycleMixin:
             # would keep refusing (exit 78) / reporting "served" for profiles nobody serves.
             with _log_suppressed(logging.DEBUG, "could not clear served_profiles", exc_info=True):
                 from gateway.status_async import publish_runtime_status
-                publish_runtime_status(served_profiles=[])
+                await publish_runtime_status(served_profiles=[])
             return 0
         try:
             from hermes_cli.profiles import get_active_profile_name, profiles_to_serve, profile_is_parked
@@ -995,6 +995,8 @@ class GatewayAdapterLifecycleMixin:
             else:
                 self._served_profile_signatures[profile_name] = scan_signature
         self._record_served_profiles(active, profile_homes)
+        from gateway.status_async import flush_pending
+        await flush_pending()
         # ``_note_served_profiles`` fills a missing signature with the current one; that refill
         # would park a transiently-failed profile before the first watcher tick can retry it.
         for profile_name in transient_failed:
