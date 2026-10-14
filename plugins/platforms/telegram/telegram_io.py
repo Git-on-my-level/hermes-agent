@@ -6,6 +6,8 @@ agent locks, but cannot isolate the process GIL or OS scheduler starvation.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from tools.daemon_pool import DaemonThreadPoolExecutor
 import threading
 import json
 import weakref
@@ -14,6 +16,9 @@ import weakref
 class TelegramIOLoop:
     def __init__(self):
         self.loop = asyncio.new_event_loop()
+        # A slow fsync must not occupy the DNS/TLS executor. Pending writes
+        # have not been accepted/acknowledged, so they need not hold exit open.
+        self.inbox_executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix='telegram-inbox')
 
         def serve():
             asyncio.set_event_loop(self.loop)
@@ -25,6 +30,11 @@ class TelegramIOLoop:
 
     async def build(self, factory, *args, **kwargs):
         return await self.run(asyncio.to_thread(factory, *args, **kwargs))
+
+    async def run_inbox(self, factory, *args):
+        async def work():
+            return await self.loop.run_in_executor(self.inbox_executor, partial(factory, *args))
+        return await self.run(work())
 
     async def run(self, awaitable):
         if asyncio.get_running_loop() is self.loop:
@@ -141,7 +151,7 @@ def isolate_updater(app):
                         gateway_loop.call_soon_threadsafe(_wake_inbox_readers, inbox_key)
                     except RuntimeError:
                         pass  # Process loop ended; committed rows replay on next boot.
-                await asyncio.to_thread(persist)
+                await io.run_inbox(persist)
             finally:
                 self.accepting = False
 
@@ -152,7 +162,7 @@ def isolate_updater(app):
             from telegram import Update
             while not self.closing:
                 self.wake.clear()
-                rows = await io.build(inbox.after, self.cursor)
+                rows = await io.run_inbox(inbox.after, self.cursor)
                 if not rows:
                     await self.wake.wait()
                     continue
@@ -194,7 +204,7 @@ def isolate_updater(app):
             return bridge.backpressured()
 
         async def complete_updates(self, update_ids):
-            await io.build(inbox.complete, update_ids)
+            await io.run_inbox(inbox.complete, update_ids)
 
         async def start_polling(self, *args, **kwargs):
             if self.running or bridge.task is not None:

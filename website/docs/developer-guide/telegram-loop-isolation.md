@@ -24,8 +24,10 @@ Polling stop/disarm and orphan client close run on the transport loop. Webhook
 serving retains its original gateway queue.
 
 
-The transport loop has a separate two-worker executor for TLS pool construction
-and durable inbox I/O.
+The transport loop has a separate two-worker executor for DNS/TLS pool work.
+Inbox I/O uses its own single daemon worker, so slow disk commits cannot occupy
+network construction/resolution workers or hold process exit open. Acceptance
+awaits the FULL commit: an abandoned pending write has never been acknowledged.
 It survives individual request shutdown/reinitialize cycles because PTB's
 polling events and locks bind to that loop. Clients and transports still close
 on drain, failed initialization, and disconnect. This is process-lifetime
