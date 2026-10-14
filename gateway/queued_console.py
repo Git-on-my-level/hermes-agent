@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 from logging.handlers import QueueListener
+from typing import cast
 
 
 class _BoundedQueueListener(QueueListener):
@@ -24,6 +25,8 @@ class _BoundedQueueListener(QueueListener):
 
 
 class QueuedConsoleHandler(logging.StreamHandler):
+    _closed: bool  # Initialized and updated by logging.Handler.
+
     def __init__(self, stream):
         super().__init__(stream)
         self._queue = queue.SimpleQueue()
@@ -71,7 +74,8 @@ class QueuedConsoleHandler(logging.StreamHandler):
                 except Exception:
                     owner.handleError(record)
 
-        self._listener = _BoundedQueueListener(self._queue, Sink())
+        # QueueListener uses only handle() when respect_handler_level is false.
+        self._listener = _BoundedQueueListener(self._queue, cast(logging.Handler, Sink()))
         self._listener.start()
         atexit.register(self.close)
 

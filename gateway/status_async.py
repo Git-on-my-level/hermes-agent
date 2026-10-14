@@ -7,10 +7,11 @@ import asyncio
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from contextvars import copy_context
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 _executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix='gateway-status-prepare')
-_batches = {}
+_batches: dict[asyncio.AbstractEventLoop, dict[str, Any]] = {}
 
 
 def publish_runtime_status(**fields):
@@ -19,7 +20,7 @@ def publish_runtime_status(**fields):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return publish(**fields)
-    batch = _batches.get(loop)
+    batch: dict[str, Any] | None = _batches.get(loop)
     if batch is None:
         batch = {'pending': {}, 'task': None}
         _batches[loop] = batch
