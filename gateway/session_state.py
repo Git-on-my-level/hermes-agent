@@ -43,6 +43,7 @@ class ConversationState:
     """State scoped to one conversation (survives turns, not boundaries)."""
 
     model_override: Optional[Dict[str, Any]] = None  # /model per-session override
+    route_policy_notice: Optional[str] = None  # consumed only by the actual turn, never hygiene probes
     one_turn_restore: Optional[Dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[Dict[str, Any]] = None  # /reasoning override
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent

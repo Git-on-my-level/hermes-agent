@@ -1979,6 +1979,12 @@ class TurnRunner:
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
             pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
             runner._pre_agent_fallback_notice = None
+            state = runner._peek_session_state(ctx.session_key)
+            if state and state.conversation.route_policy_notice:
+                policy_notice = state.conversation.route_policy_notice
+                state.conversation.route_policy_notice = None
+                pending_fallback_notice = ([pending_fallback_notice, policy_notice]
+                                           if pending_fallback_notice else policy_notice)
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
