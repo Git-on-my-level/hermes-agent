@@ -464,10 +464,10 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
 
 
 # /model override keys safe to persist; ``api_key``/``api_mode`` must NEVER reach sessions.json.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url", "route_policy", "route_policy_rule")
 
 
-def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Copy of *override* with only persistable, non-secret keys, or ``None`` when empty."""
     if not isinstance(override, dict):
         return None
@@ -475,6 +475,11 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if cleaned.get("route_policy") in {"True", "true"}:
+        cleaned["route_policy"] = True
+    else:
+        cleaned.pop("route_policy", None)
+        cleaned.pop("route_policy_rule", None)
     return cleaned or None
 
 
@@ -527,9 +532,9 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
+    # Session-scoped /model override (route + policy ownership; never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
-    model_override: Optional[Dict[str, str]] = None
+    model_override: Optional[Dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -1114,7 +1119,7 @@ class SessionStore(
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
 
-    def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
+    def get_model_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)

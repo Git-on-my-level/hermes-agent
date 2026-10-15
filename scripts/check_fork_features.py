@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # (relative path, required substring, human label)
 KEEP_LIST: list[tuple[str, str, str]] = [
+    ("agent/route_policy.py", "def evaluate_route_policy", "default-off pressure route policy"),
     (
         "tests/gateway/test_auto_start_goal.py",
         "def test_auto_start_and_inference_share_one_goal_loop(",

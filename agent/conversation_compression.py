@@ -3570,6 +3570,10 @@ def _finish_compaction_boundary(
         else:
             compressor._verify_compaction_cleared_threshold = True
     _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+    if session_commit_succeeded and compression_made_progress:
+        from agent.route_policy import apply_compaction_policy
+        with _swallow('route policy at compaction boundary failed: %s'):
+            apply_compaction_policy(agent, old_session_id=_old_sid)
     return _compressed_est
 
 
