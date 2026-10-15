@@ -1501,6 +1501,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     _record_pre_update_backup_outcome(args, pre_update_snapshot_id)
     _record_snapshot_stage(args, pre_update_snapshot_id)
 
+    # Capture the existing completed pair before the first source mutation.
+    from hermes_cli.serving_generation import record_completed_generation
+    from hermes_cli.steward import read_install_stamp
+    from hermes_cli.venv_sync import _tree_matches_completed_stamp
+    if _tree_matches_completed_stamp(_m().PROJECT_ROOT):
+        record_completed_generation(_m().PROJECT_ROOT, read_install_stamp(_m().PROJECT_ROOT))
+
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:
         import atexit as _atexit

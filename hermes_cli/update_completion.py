@@ -198,14 +198,14 @@ def _complete_selected(request: dict) -> None:
     # gateway watcher's status BEFORE that operation, and demote on later failure.
     if request["gateway_mode"]:
         update_cmd._write_gateway_update_exit_code(complete)
+    if not complete:
+        raise SystemExit(1)  # No restart or restart-deferred success advice after publication failure.
     if request.get("no_gateway_restart", False):
         from hermes_cli.update_receipt import record_skip
 
         record_skip("gateway_restart", "--no-gateway-restart: deferred, marker kept")
         record_stage("restart", "skipped")
         print("→ Gateway restart deferred (--no-gateway-restart); restart gateways separately.")
-        if not complete:
-            raise SystemExit(1)
         return
     skip = update_cmd._fleet_restart_skip_reason(plan)
     if skip:
@@ -218,8 +218,6 @@ def _complete_selected(request: dict) -> None:
         # fleet still owing the restart fails closed exactly like a stale matrix would.
         if update_cmd._pending_fleet_restart_needed():
             print("  ⚠ Gateways are still off the checkout code. Recover with: hermes gateway restart")
-            raise SystemExit(1)
-        if not complete:
             raise SystemExit(1)
         return
     restart = update_cmd._restart_gateway_fleet_after_update(plan, request["gateway_mode"])

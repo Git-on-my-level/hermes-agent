@@ -33,15 +33,32 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger("hermes_cli.plugins")
 
+_BACKGROUND_PLATFORM_LOADS = contextvars.ContextVar('hermes_background_platform_loads', default=False)
+
+
+def platform_loads_are_background() -> bool:
+    return _BACKGROUND_PLATFORM_LOADS.get()
+
+
+@contextmanager
+def background_platform_loads():
+    """Gateway transport startup may continue with late registration; metadata readers wait."""
+    token = _BACKGROUND_PLATFORM_LOADS.set(True)
+    try:
+        yield
+    finally:
+        _BACKGROUND_PLATFORM_LOADS.reset(token)
+
+
 _NS_PARENT = "hermes_plugins"
 _MODULE_NAMESPACE_LOCK = threading.RLock()
 _BARE_MODULE_SCOPE: Dict[str, str] = {}  # bare module name -> owning scope_key
 
-# Per-plugin deadline on import + register(): ``plugins.load_timeout_seconds`` (default 10s, 0 disables,
-# clamped to the max). A plugin that never returns is skipped with a named reason and loading moves on
+# Per-plugin deadline on import + register(): ``plugins.load_timeout_seconds`` (default 120s, 0 disables,
+# clamped to the max). Optional plugins that never return are skipped with a named reason and loading moves on
 # (#108139). Python cannot kill a thread, so the worker is abandoned as a daemon; the cap bounds how many
 # abandoned loaders one process may accumulate (#98382) — past it, further loads are refused, not run inline.
-_LOAD_TIMEOUT_SECS = 10.0
+_LOAD_TIMEOUT_SECS = 120.0
 _MAX_LOAD_TIMEOUT_SECS = 600.0
 _MAX_ABANDONED_LOADERS = 8
 _ABANDONED_LOADERS: List[threading.Thread] = []
@@ -56,13 +73,20 @@ class PluginLoadTimeout(Exception):
     """Raised on the loading thread when a plugin's import + ``register()`` overran its deadline."""
 
 
+class PlatformLoadPending(PluginLoadTimeout):
+    """Registration remains live; the caller must finish bookkeeping later."""
+    def __init__(self, worker, outcome, failure, warn_after=0):
+        self.worker, self.outcome, self.failure, self.warn_after = worker, outcome, failure, warn_after
+        super().__init__('platform registration still running in background')
+
+
 def in_plugin_load_worker() -> bool:
     """True on a deadline worker thread; re-entrant discovery from there must not block on its own parent."""
     return _IN_PLUGIN_LOAD.get() is not None
 
 
 def _resolve_plugin_load_timeout() -> float:
-    """Effective per-plugin load deadline from ``plugins.load_timeout_seconds`` (default 10s; ``0`` runs
+    """Effective per-plugin load deadline from ``plugins.load_timeout_seconds`` (default 120s; ``0`` runs
     loads inline with no deadline; clamped to ``_MAX_LOAD_TIMEOUT_SECS``)."""
     default = _LOAD_TIMEOUT_SECS
     try:
@@ -108,18 +132,24 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     and :class:`PluginLoadTimeout` is raised on the calling thread so the usual failure path records the
     reason and disposes whatever was registered before the hang.
     """
-    # Re-entrant load on our own deadline worker: run inline; the outer deadline covers it.
+    # Optional nested work shares its parent deadline. A critical platform has
+    # its own live context and bounded handoff even when an optional loader
+    # asks for it; it must not inherit abandonment or an unbounded inline wait.
+    critical = getattr(getattr(ctx, "manifest", None), "kind", None) == "platform"
     outer_scope = _IN_PLUGIN_LOAD.get()
-    if outer_scope is not None:
+    if outer_scope is not None and not critical:
         outer_scope.append(ctx)
         try:
             return fn()
         finally:
             outer_scope.remove(ctx)
     timeout = _resolve_plugin_load_timeout()
+    if critical and timeout <= 0:
+        timeout = _LOAD_TIMEOUT_SECS  # warning threshold, never an abandonment deadline
     if timeout <= 0:
         return fn()
-    _reserve_abandoned_loader_slot()
+    if not critical:
+        _reserve_abandoned_loader_slot()
     outcome: List[Any] = []
     failure: List[BaseException] = []
 
@@ -138,7 +168,17 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
         target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
     )
     worker.start()
-    worker.join(timeout)
+    budget = min(timeout, 0.1) if critical else timeout
+    worker.join(budget)
+    # A platform is a serving dependency: abandoning its context removes the
+    # only route for user input. Keep its registration alive and diagnose the
+    # slow import instead. Optional plugins retain their bounded-load policy.
+    if worker.is_alive() and critical:
+        remaining = max(0, timeout - budget)
+        (logger.error if not remaining else logger.warning)(
+            "Platform plugin '%s' is still loading; registration continues in background while other transports start",
+            plugin_key)
+        raise PlatformLoadPending(worker, outcome, failure, remaining)
     if worker.is_alive():
         for loaded_ctx in scope:
             loaded_ctx._abandon_load()
@@ -162,6 +202,11 @@ def _serialized_replacement(method):
     @wraps(method)
     def wrapped(*args, **kwargs):
         with replacement_coordinator.transaction():
+            # A pending load can be retired while waiting for this transaction.
+            # Recheck inside the existing registration lock; add no new locks
+            # to APIs that were previously callable without this transaction.
+            if args and getattr(args[0], '_load_abandoned', False) is True:
+                return None
             return method(*args, **kwargs)
 
     return wrapped
@@ -280,6 +325,7 @@ class PluginLoaderMixin:
                     if platform_registry.is_deferred_load_cancelled(platform_name, scope=scope):
                         return
                     self._load_plugin_scoped(_manifest)
+                self._wait_for_platform_metadata(lookup_key)
 
             previous = platform_registry.snapshot_registration(platform_name, scope=scope)
             platform_registry.register_deferred(platform_name, _loader, scope=scope)
@@ -296,6 +342,17 @@ class PluginLoaderMixin:
                 "Deferred platform registration failed for '%s'; eager-loading", lookup_key, exc_info=True)
             return False
         return True
+
+    def _wait_for_platform_metadata(self, lookup_key: str) -> None:
+        # Only synchronous metadata/config/status readers wait, always outside
+        # discovery lock. Gateway factories explicitly select background loads.
+        if _BACKGROUND_PLATFORM_LOADS.get():
+            return
+        ctx = getattr(self, '_pending_platform_contexts', {}).get(lookup_key)
+        worker = getattr(ctx, '_platform_load_worker', None)
+        if worker is not None:
+            with _plugin_home_scope(getattr(self, "home_path", None)):
+                worker.join(_resolve_plugin_load_timeout() or _LOAD_TIMEOUT_SECS)
 
     def _register_deferred_platform_tools(self, manifest: PluginManifest, loaded: LoadedPlugin) -> None:
         """Register a deferred platform's *client* tools without its adapter. Deferring the plugin would
@@ -436,6 +493,8 @@ class PluginLoaderMixin:
         from hermes_cli.plugins import LoadedPlugin, PluginContext, _PLUGINS_DEBUG
         loaded = LoadedPlugin(manifest=manifest)
         plugin_key = manifest_key(manifest)
+        if plugin_key in getattr(self, '_pending_platform_contexts', {}):
+            return  # Do not start another importer while registration is pending.
         logger.debug(
             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
             plugin_key, manifest.source, manifest.kind, manifest.path,
@@ -498,6 +557,48 @@ class PluginLoaderMixin:
                 from hermes_cli.plugins_ledger import _hook_source_of
 
                 self._drop_fallback_hooks(_hook_source_of(manifest.name, loaded.module))
+        except PlatformLoadPending as pending:
+            loaded.deferred = True
+            loaded.enabled = True
+            loaded.error = str(pending)
+            self._plugins[plugin_key] = loaded
+            contexts = getattr(self, '_pending_platform_contexts', None)
+            if contexts is None:
+                contexts = self._pending_platform_contexts = {}
+            setattr(ctx, "_platform_load_worker", pending.worker)
+            contexts[plugin_key] = ctx
+
+            def finish(pending=pending):
+                pending.worker.join(pending.warn_after)
+                if pending.warn_after and pending.worker.is_alive():
+                    logger.error("Configured platform plugin '%s' exceeded its load threshold; registration "
+                                 "remains live, operator attention required", plugin_key)
+                pending.worker.join()  # Daemon observer; never holds discovery lock while waiting.
+                with self._discovery_lock, _plugin_home_scope(self.home_path):
+                    if ctx._load_abandoned or self._plugins.get(plugin_key) is not loaded:
+                        return
+                    contexts.pop(plugin_key, None)
+                    loaded.deferred = False
+                    loaded.error = None
+                    if pending.failure or not pending.outcome or not pending.outcome[0]:
+                        owned = [r for r in self._registration_order if r.plugin_key == plugin_key]
+                        self._dispose_registrations(owned)
+                        self._forget_registrations(owned)
+                        self._remove_plugin_subscriptions(plugin_key)
+                        loaded.enabled = False
+                        loaded.error = _load_error_text(pending.failure[0]) if pending.failure else 'no register() function'
+                        logger.error("Platform plugin '%s' failed its background load: %s", plugin_key, loaded.error)
+                    else:
+                        self._attribute_registrations(loaded, plugin_key, registration_start)
+                        from hermes_cli.plugins_ledger import _hook_source_of
+                        self._drop_fallback_hooks(_hook_source_of(manifest.name, loaded.module))
+                    before = frozenset(self._plugins) - {plugin_key}
+                with _plugin_home_scope(self.home_path):
+                    self._notify_plugin_loaded(before)
+
+            threading.Thread(target=contextvars.copy_context().run, args=(finish,),
+                             name=f'platform-load-finish:{plugin_key}', daemon=True).start()
+            return
         except (Exception, SystemExit) as exc:
             # SystemExit too: a plugin module with an unguarded ``main()``/``sys.exit()`` must not take the
             # whole process (and every other plugin's registry) down with it; KeyboardInterrupt still propagates.

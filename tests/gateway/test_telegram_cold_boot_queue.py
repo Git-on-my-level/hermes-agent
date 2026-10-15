@@ -1,8 +1,6 @@
 """Cold-boot pending-queue knob for the Telegram adapter.
 
-Contract: a cold boot drops Telegram's server-side pending updates unless
-``extra.drop_pending_on_cold_boot`` is false; a watcher reconnect always
-preserves them. Conflict recovery is a separate path and is not covered here.
+Contract: cold boots and watcher reconnects preserve pending user input. Conflict recovery is a separate path and is not covered here.
 """
 
 import logging
@@ -35,13 +33,13 @@ async def _capture_drop_pending(adapter: TelegramAdapter, *, is_reconnect: bool)
 
 
 @pytest.mark.asyncio
-async def test_cold_boot_drops_queue_by_default():
-    """Default config: cold boot drops, reconnect preserves."""
+async def test_cold_boot_preserves_queue_by_default():
+    """Default config: cold boot and reconnect preserve input."""
     adapter = _make_adapter()
-    assert adapter._drop_pending_on_cold_boot is True
+    assert adapter._drop_pending_on_cold_boot is False
 
     cold = await _capture_drop_pending(adapter, is_reconnect=False)
-    assert cold["drop_pending_updates"] is True
+    assert cold["drop_pending_updates"] is False
 
     warm = await _capture_drop_pending(adapter, is_reconnect=True)
     assert warm["drop_pending_updates"] is False
@@ -104,3 +102,28 @@ async def test_webhook_reconnect_preserves_queue_regardless_of_the_knob(monkeypa
     captured = await _capture_webhook_drop_pending(adapter, monkeypatch, is_reconnect=True)
 
     assert captured["drop_pending_updates"] is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_drop_option_cannot_discard_input(caplog):
+    adapter = _make_adapter(extra={"drop_pending_on_cold_boot": True})
+    with caplog.at_level(logging.WARNING):
+        cold = await _capture_drop_pending(adapter, is_reconnect=False)
+    assert cold["drop_pending_updates"] is False
+    assert "Ignoring drop_pending_on_cold_boot=true" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_default_gateway_config_preserves_offline_updates_for_polling_and_webhook(tmp_path, monkeypatch):
+    """An operator who omitted the knob must retain downtime input on both transports."""
+    from gateway.config import load_gateway_config, Platform
+    monkeypatch.setenv('TELEGRAM_BOT_TOKEN', '111:offline-test')
+    monkeypatch.setenv('TELEGRAM_ALLOW_ALL_USERS', 'true')
+    config_file = tmp_path / 'config.yaml'
+    config_file.write_text('platforms:\n  telegram:\n    enabled: true\n', encoding='utf-8')
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = load_gateway_config()
+    adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
+    assert adapter._drop_pending_on_cold_boot is False
+    assert (await _capture_drop_pending(adapter, is_reconnect=False))['drop_pending_updates'] is False
+    assert (await _capture_webhook_drop_pending(adapter, monkeypatch, is_reconnect=False))['drop_pending_updates'] is False

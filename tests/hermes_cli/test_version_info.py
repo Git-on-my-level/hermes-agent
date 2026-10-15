@@ -274,3 +274,25 @@ def test_old_updater_version_stub_reads_the_same_stamp_as_version_info(tmp_path)
     unstamped = tmp_path / "unstamped"
     unstamped.mkdir()
     assert read(unstamped)[0] == "0.0.0"
+
+
+def test_unknown_git_status_cannot_certify_clean_generation(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from hermes_cli import version_info as vi
+    monkeypatch.setattr(vi, '_run_git', lambda root, *args: 'a'*40 if args[0] == 'rev-parse' else None)
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+    monkeypatch.setattr(vi.subprocess, 'run', timeout)
+    assert vi._git_version_info(tmp_path, include_untracked=True).dirty is True
+    from hermes_cli import serving_generation as sg
+    from pm import environments
+    monkeypatch.setattr(environments, 'committed_venv', lambda r: tmp_path/'generation'/'venv')
+    record = sg.record_path(tmp_path)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text('{"previous":"good"}', encoding='utf-8')
+    before = record.read_bytes()
+    assert sg.record_completed_generation(tmp_path, {'commit':'a'*40, 'dirty':False}) is False
+    assert record.read_bytes() == before
+    monkeypatch.setattr(vi.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=1, stdout=''))
+    assert vi._git_version_info(tmp_path, include_untracked=True).dirty is True

@@ -304,6 +304,10 @@ def _is_supervised_serving_gateway(argv: list[str]) -> bool:
     """
     if not _supervised_child():
         return False
+    return _is_serving_gateway(argv)
+
+
+def _is_serving_gateway(argv: list[str]) -> bool:
     from hermes_cli._parser import command_argv
 
     cmd = command_argv(argv)
@@ -351,6 +355,11 @@ def _tree_matches_completed_stamp(root: Path) -> bool:
     return info.commit == commit and not info.dirty
 
 
+def _require_completed_serving_generation(root: Path) -> None:
+    from hermes_cli.serving_generation import ensure_first_serving_generation
+    ensure_first_serving_generation(root)
+
+
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
@@ -375,6 +384,15 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     from hermes_cli._parser import command_argv
     from hermes_cli.steward import read_install_stamp
 
+    serving = _is_serving_gateway(argv) or Path(sys.argv[0]).resolve() == root / 'gateway' / 'run.py'
+    original_stamp = read_install_stamp(root)
+    if serving and not (_METADATA_FLAGS & set(argv)) and (
+            original_stamp.get('updateMechanism') == 'self'
+            or (not original_stamp and completion_pending_path(root).is_file())):
+        # Disabling lazy installs suppresses provisioning, not serving safety.
+        # A missing stamp during an owed tail must not be boot-time adopted.
+        _require_completed_serving_generation(root)
+
     if (command_argv(argv)[:1] == ["pm"]
             or _METADATA_FLAGS & set(argv)
             or os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes")
@@ -389,6 +407,12 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
         stamp = read_install_stamp(root)
     if stamp.get("updateMechanism") != "self":
         return None  # Developer checkouts and packaged runtimes retain their owner.
+
+    # A first boot on a legacy install may not yet have a completed snapshot.
+    # Even then serving must never enter a source update or wait for its lock.
+    if _is_serving_gateway(argv) or Path(sys.argv[0]).resolve() == root / "gateway" / "run.py":
+        _require_completed_serving_generation(root)  # Includes freshly adopted legacy installs.
+        return None  # Bootstrap immediately execs the validated serving pair.
 
     import pm
     from hermes_cli._launchers import resolve_store_python

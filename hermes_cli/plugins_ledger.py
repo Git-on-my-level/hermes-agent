@@ -231,10 +231,20 @@ class PluginLedgerMixin:
         unload_all = plugin is None
         if unload_all:
             target_keys = set(self._ownership_ledger) | set(self._plugins)
-            registrations = list(self._registration_order)
+            with replacement_coordinator.transaction():
+                for ctx in getattr(self, '_pending_platform_contexts', {}).values():
+                    ctx._abandon_load()
+                getattr(self, '_pending_platform_contexts', {}).clear()
+                registrations = list(self._registration_order)
         else:
             target_keys = self._unload_target_keys(self._resolve_plugin_key(plugin))
-            registrations = [r for r in self._registration_order if r.plugin_key in target_keys]
+            with replacement_coordinator.transaction():
+                pending = getattr(self, '_pending_platform_contexts', {})
+                for key in target_keys:
+                    ctx = pending.pop(key, None)
+                    if ctx is not None:
+                        ctx._abandon_load()
+                registrations = [r for r in self._registration_order if r.plugin_key in target_keys]
             # Persistent registrations are absent from _registration_order (unload-all keeps them), but a
             # *targeted* unload is the disable/uninstall path: a disabled auth plugin's provider must NOT stay
             # live process-wide.
