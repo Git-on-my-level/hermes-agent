@@ -104,6 +104,57 @@ def evaluate_route_policy(config, *, scope, boundary, now, current_override=None
     return current_override if keep_current else None
 
 
+def _rules_need_idle(config) -> bool:
+    for rule in ((config or {}).get("route_policy") or {}).get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        events = rule.get("apply_at") or ["new_session", "post_compaction"]
+        if "cache_cold" in events and rule.get("cache_cold_after") not in (None, "", 0):
+            return True
+    return False
+
+
+def _idle_from_stamp(stamp, now):
+    if isinstance(stamp, (int, float)):
+        return now.timestamp() - float(stamp)
+    if isinstance(stamp, str):
+        try:
+            return (now - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _prefix_facts(store, session_id, now, *, need_idle: bool):
+    """(has_turn, idle_seconds) without message bodies.
+
+    ponytail: one indexed probe. A store with no db falls back to load_transcript.
+    """
+    db = getattr(store, "_db", None)
+    if db is None or not session_id:
+        history = store.load_transcript(session_id) if session_id else []
+        has_turn = any(
+            isinstance(row, dict) and row.get("role") not in {None, "session_meta", "system"}
+            for row in history)
+        if not need_idle:
+            return has_turn, None
+        from gateway.run import _last_transcript_timestamp
+        return has_turn, _idle_from_stamp(_last_transcript_timestamp(history), now)
+    if need_idle:
+        row = db._read_one(
+            "SELECT timestamp FROM messages WHERE session_id = ? "
+            "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1",
+            (session_id,))
+        if not row:
+            return False, None
+        return True, _idle_from_stamp(row["timestamp"], now)
+    row = db._read_one(
+        "SELECT 1 FROM messages WHERE session_id = ? "
+        "AND role NOT IN ('session_meta', 'system') LIMIT 1",
+        (session_id,))
+    return row is not None, None
+
+
 def _ledger_remaining(store, quota, now):
     limit = float(quota.get("token_limit", 0))
     db = getattr(store, "_db", None)
@@ -146,20 +197,16 @@ def apply_gateway_policy(runner, key, source, config, *, boundary=None, now=None
         if runner._channel_override_for(source):
             return current
         now = now or datetime.now(timezone.utc)
-        history = store.load_transcript(entry.session_id)
-        if boundary is None:
-            boundary = "turn" if any(row.get("role") not in {"session_meta", "system"} for row in history) else "new_session"
         # updated_at is touched by intake, so it cannot measure prefix inactivity.
-        from gateway.run import _last_transcript_timestamp
-        stamp = _last_transcript_timestamp(history)
-        idle = None
-        if isinstance(stamp, (int, float)):
-            idle = now.timestamp() - stamp
-        elif isinstance(stamp, str):
-            try:
-                idle = (now - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
-            except (ValueError, TypeError):
-                pass
+        # Do not load_transcript here: that replays every message body on each
+        # gateway turn once the policy is enabled.
+        need_idle = _rules_need_idle(config)
+        if boundary is None or need_idle:
+            has_turn, idle = _prefix_facts(store, entry.session_id, now, need_idle=need_idle)
+            if boundary is None:
+                boundary = "turn" if has_turn else "new_session"
+        else:
+            idle = None
 
         def account_usage(provider):
             from agent.account_usage import fetch_account_usage

@@ -181,6 +181,21 @@ def test_new_session_resolver_diverts_with_destination_credentials(lane, monkeyp
         "Route policy peak: using grok-4.7 via xai-oauth until the next compaction or new session.")
 
 
+def test_enabled_policy_does_not_replay_transcript(lane, monkeypatch):
+    runner, store, source, entry = lane
+    store.append_to_transcript(entry.session_id, {"role": "user", "content": "hello"})
+
+    def boom(*_a, **_k):
+        raise AssertionError("route policy replayed the transcript")
+
+    monkeypatch.setattr(store, "load_transcript", boom)
+    model, runtime = runner._resolve_session_agent_runtime(source=source, user_config=CONFIG)
+    # A session that already has a turn is not new, so the peak window must not divert it.
+    assert (model, runtime["provider"]) == ("primary", "primary-provider")
+    assert apply_gateway_policy(runner, entry.session_key, source, CONFIG, now=NOW) is None
+    assert store.get_model_override(entry.session_key) is None
+
+
 def test_pinned_channel_is_not_diverted(lane, monkeypatch):
     runner, store, source, entry = lane
     monkeypatch.setattr(runner, "_channel_override_for", lambda source: SimpleNamespace(model="pin"))
