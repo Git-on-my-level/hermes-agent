@@ -430,6 +430,17 @@ class GatewayNotificationsMixin:
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
+                # Commentary-preview reconciliation: fold the final into the live preview bubble
+                # (stack + answer) instead of a fresh send beside the orphaned progress.
+                if (
+                    stream_consumer is not None
+                    and hasattr(stream_consumer, "reconcile_preview_with_final")
+                    and await stream_consumer.reconcile_preview_with_final(text_content)
+                ):
+                    logger.info(
+                        "Queued-lane final folded into commentary preview bubble (no duplicate send)."
+                    )
+                    return True
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
                 _reconciled = False

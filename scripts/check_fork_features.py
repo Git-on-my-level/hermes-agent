@@ -243,6 +243,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "commentary preview edit re-enable after degraded fresh send",
     ),
     (
+        "gateway/stream_consumer_preview_finalize.py",
+        "async def reconcile_preview_with_final",
+        "commentary preview final reconciliation (one bubble per turn)",
+    ),
+    (
+        "gateway/stream_consumer_preview_finalize.py",
+        "def preview_final_delivery_confirmed",
+        "commentary preview final-delivery short-circuit",
+    ),
+    (
         "gateway/commentary_preview.py",
         "def telegram_preview_channel",
         "telegram preview channel resolver",
@@ -415,6 +425,7 @@ TEST_FILES = [
     "tests/hermes_cli/test_converge_release_status.py",
     "tests/scripts/test_sync_prod_tip.py",
     "tests/gateway/test_stream_consumer_commentary_preview.py",
+    "tests/gateway/test_stream_consumer_preview_final_reconcile.py",
     "tests/gateway/test_interim_assistant_message_mode.py",
     "tests/gateway/test_telegram_edit_replacement.py",
     "tests/gateway/test_telegram_topic_scoped_send_lock.py",
