@@ -34,6 +34,7 @@ from gateway.response_filters import (
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_preview import StreamCommentaryPreviewMixin
+from gateway.stream_consumer_preview_finalize import StreamCommentaryPreviewFinalizeMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 
@@ -101,7 +102,13 @@ class _Tick:
         return not self.got_done and not self.got_segment_break and self.commentary_text is None
 
 
-class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, StreamFallbackMixin, StreamThinkFilterMixin):
+class GatewayStreamConsumer(
+    StreamTransportMixin,
+    StreamCommentaryPreviewMixin,
+    StreamCommentaryPreviewFinalizeMixin,
+    StreamFallbackMixin,
+    StreamThinkFilterMixin,
+):
     """Async consumer that progressively edits a platform message with streamed tokens.
     Usage: ``agent.stream_delta_callback = consumer.on_delta``; ``create_task(consumer.run())``;
     after the agent finishes ``consumer.finish()`` then ``await task`` for the final edit."""
@@ -208,6 +215,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamCommentaryPreviewMixin, 
         self._commentary_preview_is_placeholder = False
         self._commentary_waiting_label = str(getattr(self.cfg, "commentary_waiting_label", "") or "").strip()
         self._commentary_placeholder_sent = False
+        self._commentary_edit_fail_streak = 0
 
     def _reset_message_state(self) -> None:
         """Per-message (segment) state: fresh at construction and after each segment break."""
