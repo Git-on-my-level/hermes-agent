@@ -4266,6 +4266,23 @@ class GatewayTurnMixin:
         if _is_empty_sentinel:
             return
         _sk = session_key or "?"
+        # Commentary-preview reconciliation (#commentary-scatter): when the turn kept a Telegram
+        # preview bubble alive (placeholder + stacked interim notes) but streamed nothing (preview
+        # mode with text streaming off), fold the final into that bubble instead of scattering a
+        # fresh send beside the orphaned progress. Only when the normal send would have fired.
+        if (
+            not _streamed
+            and not _transformed
+            and _sc is not None
+            and hasattr(_sc, "reconcile_preview_with_final")
+        ):
+            if await _sc.reconcile_preview_with_final(_final):
+                logger.info(
+                    "Final folded into commentary preview bubble for session %s (len=%d).",
+                    _sk, len(_final),
+                )
+                response["already_sent"] = True
+                return
         if not _transformed and (_streamed or _content_delivered):
             logger.info(
                 "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
