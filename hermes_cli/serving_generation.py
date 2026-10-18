@@ -222,7 +222,7 @@ def ensure_snapshot_venv_seam(root: Path, stamp: dict, environment: Path | None 
     commit = stamp.get("commit")
     if not commit:
         return
-    from pm.environments import install_state_dir
+    from pm.environments import committed_venv, install_state_dir
     if environment is None:
         environment = committed_venv(root)
         if environment is None:
