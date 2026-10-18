@@ -360,6 +360,43 @@ def test_ensure_snapshot_venv_seam_repairs_link_but_keeps_real_tree(tmp_path, mo
     assert (seam / "keep").is_file()
 
 
+@pytest.mark.platforms("macos", "linux")
+def test_seam_binds_validated_environment_not_reread_selection(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    import shutil
+    import pm.environments as env_mod
+    from pm.environments import install_state_dir
+    install = install_state_dir(root)
+    newer = install / "environments" / "newer"
+    shutil.copytree(generation, newer, symlinks=True)
+    # The round-3 race: committed_venv answers the validated generation for
+    # publication's own validation, then a concurrent selection change makes
+    # it answer a NEWER generation at seam time. Binding must use the
+    # validated environment, never a reread.
+    calls = {"n": 0}
+    def flippy(project_root):
+        calls["n"] += 1
+        return generation / "venv" if calls["n"] == 1 else newer / "venv"
+    monkeypatch.setattr(env_mod, "committed_venv", flippy)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    seam = install / "serving-source" / "abc123" / "venv"
+    assert seam.is_symlink()
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    assert sg.read_generation(root) is not None
+    # Direct contract: an explicitly passed environment wins, whatever the
+    # current selection would answer.
+    seam.unlink()
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"}, generation / "venv")
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    # Pinned-down default: a bare (standalone/repair) call binds the CURRENT
+    # selection — the publish path above never did, which is exactly the
+    # race this test guards.
+    seam.unlink()
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+    assert Path(os.path.realpath(seam)) == (newer / "venv").resolve()
+
+
+@pytest.mark.platforms("macos", "linux")
 def test_serving_snapshot_python_fallback_answers_none_on_doubt(tmp_path, monkeypatch):
     root, generation = installed(tmp_path, monkeypatch)
     facts = runtime_facts_path(root)
@@ -400,10 +437,15 @@ def test_serving_snapshot_python_prefers_pinned_record_and_verifies_pair(tmp_pat
     # not serve this source is refused even though its shape is valid.
     (install / "serving-generation.json").unlink()
     assert sg.serving_snapshot_python(snapshot) is None
-    # A foreign install's environment is refused despite a valid shape.
+    # A foreign install's environment is refused despite a valid shape and
+    # matching declared dependencies — isolating the containment check (the
+    # written TOML uses real newlines; verified it parses with tomllib).
     foreign = tmp_path / "foreign-install" / "environments" / "abc" / "venv"
     foreign.mkdir(parents=True)
     (foreign / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    foreign_ws = foreign.parent / "workspace"
+    foreign_ws.mkdir()
+    shutil.copy(root / "pyproject.toml", foreign_ws / "pyproject.toml")
     runtime_facts_path(root).write_text(json.dumps({"schema": 1, "packages": {"venv": {
         "environment": str(foreign)}}}), encoding="utf-8")
     assert sg.serving_snapshot_python(snapshot) is None

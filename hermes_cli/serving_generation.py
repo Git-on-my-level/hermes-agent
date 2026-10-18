@@ -191,7 +191,7 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
     if not _complete_source(snapshot, stamp['commit']) or not _dependency_inputs_match(generation / 'workspace', snapshot):
         return False
     try:
-        ensure_snapshot_venv_seam(root, stamp)
+        ensure_snapshot_venv_seam(root, stamp, generation / "venv")
     except Exception as exc:
         # Best effort: the scheduler fallback still resolves the committed
         # generation, but flag the degraded publication for the update log.
@@ -202,7 +202,7 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
     return True
 
 
-def ensure_snapshot_venv_seam(root: Path, stamp: dict) -> None:
+def ensure_snapshot_venv_seam(root: Path, stamp: dict, environment: Path | None = None) -> None:
     """Bind the published snapshot's expected interpreter path to the committed venv.
 
     POSIX script jobs resolve ``project_python`` against their source tree
@@ -213,16 +213,20 @@ def ensure_snapshot_venv_seam(root: Path, stamp: dict) -> None:
     serves this snapshot (dependency declarations match), so a relative
     symlink at that path is the completion the design implies; it keeps the
     install directory movable and the snapshot free of a copied venv.
+    Pass the *validated* environment explicitly: rereading ``committed_venv``
+    here would race a concurrent PM selection change and bind a generation
+    the published record does not pin.
     """
     if os.name == "nt":
         return  # Windows script jobs resolve the committed venv directly.
     commit = stamp.get("commit")
     if not commit:
         return
-    from pm.environments import committed_venv, install_state_dir
-    environment = committed_venv(root)
+    from pm.environments import install_state_dir
     if environment is None:
-        return
+        environment = committed_venv(root)
+        if environment is None:
+            return
     seam = install_state_dir(root) / "serving-source" / commit / "venv"
     relative = os.path.relpath(environment, seam.parent)
     if seam.is_symlink():
