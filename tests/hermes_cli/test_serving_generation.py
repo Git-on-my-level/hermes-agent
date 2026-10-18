@@ -381,16 +381,30 @@ def test_posix_cron_script_argv_falls_back_to_committed_python(tmp_path, monkeyp
     root, generation = installed(tmp_path, monkeypatch)
     assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
     snapshot = Path(sg.read_generation(root)["source"])
+    # Pre-seam snapshot: publication predates the seam, or install state was wiped.
+    import shutil
+    import importlib.util
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    seam.unlink()
+    assert not seam.exists()
+    # The scheduler derives repo from its own __file__, so load it from a copy
+    # inside the snapshot -- the way the gateway serves it -- while hermes_cli
+    # stays this checkout's (already imported above).
+    repo_root = Path(__file__).resolve().parents[2]
+    shutil.copytree(repo_root / "cron", snapshot / "cron")
+    spec = importlib.util.spec_from_file_location(
+        "scheduler_script_under_test", snapshot / "cron" / "scheduler_script.py")
+    ss = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ss)
     store_python = tmp_path / "store" / "bin" / "python3"
     store_python.parent.mkdir(parents=True)
     store_python.write_text("", encoding="utf-8")
     monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda repo: store_python)
-    from cron.scheduler_script import _posix_cron_script_argv
-    # The snapshot has no venv seam; the committed generation still serves it.
-    argv, env = _posix_cron_script_argv(snapshot / "scripts" / "probe.py")
+    argv, env = ss._posix_cron_script_argv(Path("scripts") / "probe.py")
     assert argv[0] == str(venv_python(generation / "venv"))
     assert env == {"HERMES_DISABLE_LAZY_INSTALLS": "1"}
     # The fallback is a kill-switchable last resort, not a policy change.
     monkeypatch.setenv("HERMES_SNAPSHOT_VENV_FALLBACK", "0")
     with pytest.raises(RuntimeError, match="interpreter is missing"):
-        _posix_cron_script_argv(snapshot / "scripts" / "probe.py")
+        ss._posix_cron_script_argv(Path("scripts") / "probe.py")

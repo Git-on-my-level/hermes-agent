@@ -239,18 +239,33 @@ def serving_snapshot_python(root: Path) -> Path | None:
 
     Script jobs running from a published snapshot reach here only when the
     snapshot's own venv seam is missing (pre-seam publication or a wiped
-    install state). Mirrors ``_recorded_venv``'s location and sanity checks
-    without raising: any doubt answers ``None`` and the caller keeps its
-    precise missing-interpreter error.
+    install state). The gateway serves the snapshot as its repo, so PM state
+    for the snapshot-keyed install may not exist; when invoked inside
+    ``<install>/serving-source/`` the owning install's record answers instead.
+    Mirrors ``_recorded_venv``'s location and sanity checks without raising:
+    any doubt answers ``None`` and the caller keeps its precise
+    missing-interpreter error.
     """
-    from pm.environments import install_state_dir, runtime_facts_path, venv_python
+    from pm.environments import runtime_facts_path, venv_python
+    root = Path(root).resolve()
+    facts = None
+    for ancestor in (root, *root.parents):
+        if ancestor.name == "serving-source":
+            # The owning install's PM state dir: its name is a hash of the
+            # project root, which cannot be recomputed here, and its
+            # facts.json IS that checkout's recorded selection.
+            facts = ancestor.parent / "facts.json"
+            break
+    if facts is None:
+        facts = runtime_facts_path(root)
     try:
-        data = json.loads(runtime_facts_path(root).read_text(encoding="utf-8-sig"))
+        data = json.loads(facts.read_text(encoding="utf-8-sig"))
         environment = Path(data["packages"]["venv"]["environment"]).resolve()
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    generations = (install_state_dir(root) / "environments").resolve()
-    if not environment.is_relative_to(generations) or not (environment / "pyvenv.cfg").is_file():
+    # The record must name a generation venv inside an install's environments/
+    # directory; root may itself be that install, so do not recompute keys.
+    if environment.parent.parent.name != "environments" or not (environment / "pyvenv.cfg").is_file():
         return None
     return venv_python(environment)
 

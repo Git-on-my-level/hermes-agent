@@ -163,7 +163,9 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
         # a wrong-guess import error on a genuinely stale tree beats certain failure.
         if os.environ.get("HERMES_SNAPSHOT_VENV_FALLBACK") != "0":
             from hermes_cli.serving_generation import serving_snapshot_python
-            python = serving_snapshot_python(repo)
+            fallback = serving_snapshot_python(repo)
+            if fallback is not None and fallback.is_file():
+                python = fallback
     if not python.is_file():
         # The caller's interpreter is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
