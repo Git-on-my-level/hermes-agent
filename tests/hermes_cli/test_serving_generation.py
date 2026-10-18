@@ -321,3 +321,76 @@ raise SystemExit(0)
     assert 'Code updated!' not in result.stdout
     assert 'restart gateways separately' not in result.stdout
     assert sg.read_generation(root) is None
+
+
+def test_publish_binds_snapshot_venv_seam(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    assert seam.is_symlink()
+    expected = os.path.relpath(generation / "venv", seam.parent)
+    assert os.readlink(seam) == expected
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    # The published record still validates with the seam in place.
+    assert sg.read_generation(root) is not None
+    assert sg.serving_snapshot_python(root) == venv_python(generation / "venv")
+
+
+def test_ensure_snapshot_venv_seam_repairs_link_but_keeps_real_tree(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    expected = os.path.relpath(generation / "venv", seam.parent)
+    # A missing or wrong-target link is repaired to the committed environment.
+    for broken in (lambda: seam.unlink(),
+                   lambda: (seam.unlink(), seam.symlink_to("/nonexistent/target"))):
+        broken()
+        sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+        assert seam.is_symlink() and os.readlink(seam) == expected
+    # A real tree at the seam path is never replaced by a link.
+    seam.unlink()
+    seam.mkdir()
+    (seam / "keep").write_text("x", encoding="utf-8")
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+    assert seam.is_dir() and not seam.is_symlink()
+    assert (seam / "keep").is_file()
+
+
+def test_serving_snapshot_python_fallback_answers_none_on_doubt(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    facts = runtime_facts_path(root)
+    # Recorded environment outside this install's generations: refuse.
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(tmp_path / "elsewhere" / "venv")}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(root) is None
+    # Recorded environment without a real venv tree: refuse.
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(install_state_dir(root) / "environments" / "ghost" / "venv")}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(root) is None
+    # Garbage facts: refuse.
+    facts.write_bytes(b"{not json")
+    assert sg.serving_snapshot_python(root) is None
+    # Missing facts: refuse.
+    facts.unlink()
+    assert sg.serving_snapshot_python(root) is None
+
+
+def test_posix_cron_script_argv_falls_back_to_committed_python(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    snapshot = Path(sg.read_generation(root)["source"])
+    store_python = tmp_path / "store" / "bin" / "python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda repo: store_python)
+    from cron.scheduler_script import _posix_cron_script_argv
+    # The snapshot has no venv seam; the committed generation still serves it.
+    argv, env = _posix_cron_script_argv(snapshot / "scripts" / "probe.py")
+    assert argv[0] == str(venv_python(generation / "venv"))
+    assert env == {"HERMES_DISABLE_LAZY_INSTALLS": "1"}
+    # The fallback is a kill-switchable last resort, not a policy change.
+    monkeypatch.setenv("HERMES_SNAPSHOT_VENV_FALLBACK", "0")
+    with pytest.raises(RuntimeError, match="interpreter is missing"):
+        _posix_cron_script_argv(snapshot / "scripts" / "probe.py")
