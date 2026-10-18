@@ -323,6 +323,7 @@ raise SystemExit(0)
     assert sg.read_generation(root) is None
 
 
+@pytest.mark.platforms("macos", "linux")
 def test_publish_binds_snapshot_venv_seam(tmp_path, monkeypatch):
     root, generation = installed(tmp_path, monkeypatch)
     assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
@@ -337,6 +338,7 @@ def test_publish_binds_snapshot_venv_seam(tmp_path, monkeypatch):
     assert sg.serving_snapshot_python(root) == venv_python(generation / "venv")
 
 
+@pytest.mark.platforms("macos", "linux")
 def test_ensure_snapshot_venv_seam_repairs_link_but_keeps_real_tree(tmp_path, monkeypatch):
     root, generation = installed(tmp_path, monkeypatch)
     assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
@@ -377,6 +379,37 @@ def test_serving_snapshot_python_fallback_answers_none_on_doubt(tmp_path, monkey
     assert sg.serving_snapshot_python(root) is None
 
 
+@pytest.mark.platforms("macos", "linux")
+def test_serving_snapshot_python_prefers_pinned_record_and_verifies_pair(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    import shutil
+    from pm.environments import install_state_dir
+    install = install_state_dir(root)
+    snapshot = Path(sg.read_generation(root)["source"])
+    # A newer environment recorded in mutable facts (dependency declarations
+    # differ) must not leak into the fallback while the record pins the pair.
+    newer = install / "environments" / "newer"
+    shutil.copytree(generation, newer, symlinks=True)
+    (newer / "workspace" / "pyproject.toml").write_text('[project]\nname="incompatible"\n', encoding="utf-8")
+    runtime_facts_path(root).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(newer / "venv")}}}), encoding="utf-8")
+    # Snapshot-rooted call: the pinned record wins over the advanced facts.
+    assert sg.serving_snapshot_python(snapshot) == venv_python(generation / "venv")
+    # Without a pinned record, an environment whose declared dependencies do
+    # not serve this source is refused even though its shape is valid.
+    (install / "serving-generation.json").unlink()
+    assert sg.serving_snapshot_python(snapshot) is None
+    # A foreign install's environment is refused despite a valid shape.
+    foreign = tmp_path / "foreign-install" / "environments" / "abc" / "venv"
+    foreign.mkdir(parents=True)
+    (foreign / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    runtime_facts_path(root).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(foreign)}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(snapshot) is None
+
+
+@pytest.mark.platforms("macos", "linux")
 def test_posix_cron_script_argv_falls_back_to_committed_python(tmp_path, monkeypatch):
     root, generation = installed(tmp_path, monkeypatch)
     assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})

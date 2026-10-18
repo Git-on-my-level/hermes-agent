@@ -192,8 +192,11 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
         return False
     try:
         ensure_snapshot_venv_seam(root, stamp)
-    except Exception:
-        pass  # Best effort: a missing seam degrades to the pre-fix missing-interpreter behavior.
+    except Exception as exc:
+        # Best effort: the scheduler fallback still resolves the committed
+        # generation, but flag the degraded publication for the update log.
+        print(f'hermes: serving venv seam not bound ({exc}); script jobs rely on the '
+              'scheduler fallback', file=sys.stderr, flush=True)
     atomic_json_write(record_path(root), {"schema": 1, "generation": str(generation),
                                         "source": str(snapshot), "commit": stamp["commit"]})
     return True
@@ -249,23 +252,47 @@ def serving_snapshot_python(root: Path) -> Path | None:
     from pm.environments import runtime_facts_path, venv_python
     root = Path(root).resolve()
     facts = None
+    owner = None
+    snapshot_dir = None
+    prev = root
     for ancestor in (root, *root.parents):
         if ancestor.name == "serving-source":
             # The owning install's PM state dir: its name is a hash of the
-            # project root, which cannot be recomputed here, and its
-            # facts.json IS that checkout's recorded selection.
-            facts = ancestor.parent / "facts.json"
+            # project root, which cannot be recomputed here. Prefer the PINNED
+            # serving record over the mutable selection: facts.json can advance
+            # to a newer environment while this snapshot is still being served,
+            # and pairing the snapshot with an unverified venv breaks the
+            # validated source/dependency pair this resolver exists to protect.
+            owner = ancestor.parent
+            snapshot_dir = prev
+            facts = owner / "facts.json"
             break
-    if facts is None:
-        facts = runtime_facts_path(root)
-    try:
-        data = json.loads(facts.read_text(encoding="utf-8-sig"))
-        environment = Path(data["packages"]["venv"]["environment"]).resolve()
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+        prev = ancestor
+    environment = None
+    if owner is not None:
+        try:
+            record = json.loads((owner / "serving-generation.json").read_text(encoding="utf-8-sig"))
+            environment = Path(record["generation"]).resolve() / "venv"
+        except (OSError, ValueError, KeyError, TypeError):
+            environment = None
+    if environment is None:
+        if facts is None:
+            facts = runtime_facts_path(root)
+        try:
+            data = json.loads(facts.read_text(encoding="utf-8-sig"))
+            environment = Path(data["packages"]["venv"]["environment"]).resolve()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
     # The record must name a generation venv inside an install's environments/
-    # directory; root may itself be that install, so do not recompute keys.
+    # directory — and, when discovered, inside THIS install (facts can name a
+    # foreign install's tree; a basename check alone would accept it).
     if environment.parent.parent.name != "environments" or not (environment / "pyvenv.cfg").is_file():
+        return None
+    if owner is not None and not environment.is_relative_to(owner.resolve()):
+        return None
+    # Accepting any environment other than the pinned one requires its declared
+    # dependencies to serve this source; otherwise the pairing breaks silently.
+    if not _dependency_inputs_match(environment.parent / "workspace", snapshot_dir or root):
         return None
     return venv_python(environment)
 
