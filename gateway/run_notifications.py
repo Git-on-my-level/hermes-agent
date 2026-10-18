@@ -427,20 +427,20 @@ class GatewayNotificationsMixin:
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        from gateway.response_filters import is_intentional_silence_response
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
-                # Commentary-preview reconciliation: fold the final into the live preview bubble
-                # (stack + answer) instead of a fresh send beside the orphaned progress.
+                # Commentary-preview retraction (option 2): the fresh send below stands; retract
+                # the interim progress bubble first so it does not linger beside the final. A pure
+                # silence marker must not reach here at all (the queued-lane silence gate above the
+                # caller blanks it), but guard anyway: silent turns keep their progress bubble.
                 if (
                     stream_consumer is not None
-                    and hasattr(stream_consumer, "reconcile_preview_with_final")
-                    and await stream_consumer.reconcile_preview_with_final(text_content)
+                    and hasattr(stream_consumer, "retract_preview_bubbles")
+                    and not is_intentional_silence_response(text_content)
                 ):
-                    logger.info(
-                        "Queued-lane final folded into commentary preview bubble (no duplicate send)."
-                    )
-                    return True
+                    await stream_consumer.retract_preview_bubbles()
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
                 _reconciled = False

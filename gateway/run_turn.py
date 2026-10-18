@@ -4263,26 +4263,28 @@ class GatewayTurnMixin:
         _transformed = bool(response.get("response_transformed"))
         # Suppress the normal send only when the actual final reply reached the user.
         _streamed = self._run_agent_stream_confirmed_final_delivery(_sc, _final, previewed=_previewed)
+        from gateway.response_filters import is_intentional_silence_response
+        _is_silence_marker = is_intentional_silence_response(_final)
         if _is_empty_sentinel:
             return
         _sk = session_key or "?"
-        # Commentary-preview reconciliation (#commentary-scatter): when the turn kept a Telegram
-        # preview bubble alive (placeholder + stacked interim notes) but streamed nothing (preview
-        # mode with text streaming off), fold the final into that bubble instead of scattering a
-        # fresh send beside the orphaned progress. Only when the normal send would have fired.
+        # Commentary-preview retraction (#commentary-scatter, option 2): the final goes out as its
+        # own fresh bubble, so the interim progress stack (and any waiting placeholder) must not
+        # linger beside it. A pure silence marker must NOT retract: that turn delivers nothing by
+        # design and the progress bubble is its only visible trace — and folding/leaking the
+        # literal marker is exactly the [SILENT]-bubble bug this guards against.
         if (
             not _streamed
             and not _transformed
+            and not _is_silence_marker
             and _sc is not None
-            and hasattr(_sc, "reconcile_preview_with_final")
+            and hasattr(_sc, "retract_preview_bubbles")
         ):
-            if await _sc.reconcile_preview_with_final(_final):
+            if await _sc.retract_preview_bubbles():
                 logger.info(
-                    "Final folded into commentary preview bubble for session %s (len=%d).",
+                    "Retracted commentary preview bubble for session %s (fresh final follows, len=%d).",
                     _sk, len(_final),
                 )
-                response["already_sent"] = True
-                return
         if not _transformed and (_streamed or _content_delivered):
             logger.info(
                 "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",

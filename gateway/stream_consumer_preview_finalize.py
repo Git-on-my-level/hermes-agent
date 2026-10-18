@@ -1,12 +1,11 @@
-"""Final-reply reconciliation for the Telegram commentary preview bubble.
+"""Preview-bubble retraction for the Telegram commentary preview bubble.
 
-Preview mode keeps interim progress in one editable bubble. Without this
-reconciliation the turn's final reply always went out as a fresh send and the
-progress bubble stayed orphaned on screen, so a single logical job that wakes
-the agent several times (background notices, goal wakeups) scattered 2-3
-bubbles per wake. After the final lands, edit the preview bubble in place to
-carry the progress stack plus the answer; fall back to the fresh send (which
-the caller then performs) when the edit cannot carry the content.
+Option-(2) reconciliation: the turn's final reply goes out as its own fresh
+bubble (or the turn goes silent), so the interim progress stack must not
+linger beside the final — it is deleted when the fresh send is imminent. A
+pure silence marker is gated out by the caller (that turn delivers nothing by
+design and keeps its progress bubble as the only visible trace), so the
+literal marker is never written anywhere.
 """
 from __future__ import annotations
 
@@ -15,115 +14,84 @@ from typing import Any, Protocol
 
 logger = logging.getLogger("gateway.stream_consumer")
 
-_FINAL_SEPARATOR = "\n\n───────\n\n"
 
-
-class _PreviewReconcileHost(Protocol):
+class _PreviewRetractHost(Protocol):
     """The GatewayStreamConsumer surface this mixin composes with."""
 
-    cfg: Any
     adapter: Any
     chat_id: str
+    _commentary_preview_message_id: Any
+    _commentary_preview_message_ids: list
     _commentary_preview_last_text: str | None
     _commentary_edit_fail_streak: int
+    _commentary_preview_entries: list
     _commentary_preview_is_placeholder: bool
     _commentary_placeholder_sent: bool
 
-    def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None: ...
-
-    def _fit_commentary_stack(self, entries: list[str]) -> tuple[str, list[str], bool]: ...
-
-    def _mark_final_delivered(self, record: str | None = None) -> None: ...
-
 
 class StreamCommentaryPreviewFinalizeMixin:
-    """Edit the preview bubble with the turn's final answer (stack preserved)."""
+    """Delete the preview bubble when the turn's fresh final is imminent."""
 
-    def preview_final_delivery_confirmed(self) -> bool:
-        """True when the preview bubble already carries the turn-final text."""
-        return bool(getattr(self, "final_response_sent", False)) and bool(
-            getattr(self, "_commentary_preview_message_id", None)
-        )
+    async def retract_preview_bubbles(self) -> bool:
+        """Delete the live preview bubble(s): progress stack + waiting placeholder.
 
-    async def reconcile_preview_with_final(self, final_text: str) -> bool:
-        """Edit the preview bubble to progress stack + answer.
-
-        True = the bubble now carries the final; the caller suppresses its
-        normal fresh send. False = deliver the final as usual. Never raises.
+        True when nothing visible remains. Best-effort per bubble: one retry,
+        "not found" counts as success (already gone), a refused delete leaves
+        the other bubbles still retracted. Never raises.
         """
         try:
-            return await self._reconcile_preview_with_final_inner(str(final_text or ""))
-        except Exception as e:  # noqa: BLE001 — reconciliation is best-effort
-            logger.debug("Preview final reconciliation failed: %s", e)
+            return await self._retract_preview_bubbles_inner()
+        except Exception as e:  # noqa: BLE001 — retraction is best-effort
+            logger.debug("Preview bubble retraction failed: %s", e)
             return False
 
-    async def _reconcile_preview_with_final_inner(self, final_text: str) -> bool:
-        host: _PreviewReconcileHost = self  # type: ignore[assignment]
-        if not final_text.strip() or final_text == "(empty)":
-            return False
-        # Preview mode only; separate mode never had a stacked bubble.
-        if str(getattr(host.cfg, "commentary_mode", "separate")).lower() != "preview":
-            return False
-        message_id = getattr(host, "_commentary_preview_message_id", None)
-        if not message_id or not getattr(host, "_commentary_preview_edit_supported", False):
-            return False
-        # Already delivered through another path (queued-lane double-fire):
-        # nothing to fold in, and the caller must not re-send either.
-        if getattr(host, "final_response_sent", False):
-            return True
-        entries = getattr(host, "_commentary_preview_entries", None)
-        if getattr(host, "_commentary_preview_is_placeholder", False) or not entries:
-            body = final_text
-        else:
-            body = "\n\n".join(entries) + _FINAL_SEPARATOR + final_text
-        body, _entries, fits = host._fit_commentary_stack([body])
-        if not fits:
-            # The answer alone exceeds an editable bubble: the fresh final
-            # send must stand; progress stays as its own breadcrumb bubble.
-            return False
-        if body == getattr(host, "_commentary_preview_last_text", None):
-            host._mark_final_delivered(record=final_text)
-            return True
-        kwargs: dict[str, Any] = {
-            "chat_id": host.chat_id,
-            "message_id": message_id,
-            "content": body,
-            "finalize": True,
-        }
-        metadata = host._metadata_for_send(expect_edits=True)
-        if metadata:
+    async def _retract_preview_bubbles_inner(self) -> bool:
+        host: _PreviewRetractHost = self  # type: ignore[assignment]
+        ids: list[str] = []
+        for raw in (
+            getattr(host, "_commentary_preview_message_id", None),
+            *(getattr(host, "_commentary_preview_message_ids", None) or ()),
+        ):
+            if raw is None or str(raw) == "__no_edit__":
+                continue
+            mid = str(raw)
+            if mid not in ids:
+                ids.append(mid)
+        ok = True
+        for mid in ids:
+            if not await self._delete_preview_message(mid):
+                ok = False
+        self._reset_preview_retract_state()
+        return ok
+
+    async def _delete_preview_message(self, message_id: str) -> bool:
+        host: _PreviewRetractHost = self  # type: ignore[assignment]
+        for attempt in (1, 2):
             try:
-                import inspect
+                result = await host.adapter.delete_message(host.chat_id, message_id)
+            except Exception as e:
+                if "not found" in str(e).lower():
+                    return True  # already gone — same end state
+                if attempt == 2:
+                    logger.debug(
+                        "Preview bubble delete failed for %s: %s", message_id, e
+                    )
+                    return False
+                continue
+            if result is False:
+                if attempt == 2:
+                    logger.debug("Preview bubble delete refused for %s", message_id)
+                    return False
+                continue
+            return True
+        return False
 
-                params = inspect.signature(host.adapter.edit_message).parameters
-                if "metadata" in params or any(
-                    param.kind is inspect.Parameter.VAR_KEYWORD
-                    for param in params.values()
-                ):
-                    kwargs["metadata"] = metadata
-            except (TypeError, ValueError):
-                pass
-        try:
-            result = await host.adapter.edit_message(**kwargs)
-            if result is not None and not getattr(result, "success", False):
-                # One retry, mirroring the interim edit path.
-                result = await host.adapter.edit_message(**kwargs)
-        except Exception as e:
-            if "not modified" in str(e).lower():
-                # Bubble already shows exactly this content: success no-op.
-                host._commentary_preview_last_text = body
-                host._commentary_edit_fail_streak = 0
-                host._mark_final_delivered(record=final_text)
-                return True
-            logger.debug("Preview final reconciliation edit failed: %s", e)
-            return False
-        if result is None or not getattr(result, "success", False):
-            return False
-        host._commentary_preview_last_text = body
-        host._commentary_edit_fail_streak = 0
+    def _reset_preview_retract_state(self) -> None:
+        host: _PreviewRetractHost = self  # type: ignore[assignment]
+        host._commentary_preview_message_ids = []
+        host._commentary_preview_message_id = None
+        host._commentary_preview_last_text = ""
+        host._commentary_preview_entries = []
         host._commentary_preview_is_placeholder = False
-        host._commentary_placeholder_sent = True
-        # The bubble now shows the answer: record it as turn-final delivery so
-        # every downstream suppression predicate agrees.
-        host._mark_final_delivered(record=final_text)
-        return True
+        host._commentary_placeholder_sent = True  # placeholder, if any, is gone
+        host._commentary_edit_fail_streak = 0

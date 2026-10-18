@@ -244,13 +244,13 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ),
     (
         "gateway/stream_consumer_preview_finalize.py",
-        "async def reconcile_preview_with_final",
-        "commentary preview final reconciliation (one bubble per turn)",
+        "async def retract_preview_bubbles",
+        "commentary preview retraction beside the fresh final (option 2)",
     ),
     (
         "gateway/stream_consumer_preview_finalize.py",
-        "def preview_final_delivery_confirmed",
-        "commentary preview final-delivery short-circuit",
+        "not found",
+        "preview retraction treats an already-deleted bubble as success",
     ),
     (
         "gateway/commentary_preview.py",
