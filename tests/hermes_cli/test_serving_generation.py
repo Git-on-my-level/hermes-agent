@@ -321,3 +321,165 @@ raise SystemExit(0)
     assert 'Code updated!' not in result.stdout
     assert 'restart gateways separately' not in result.stdout
     assert sg.read_generation(root) is None
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_publish_binds_snapshot_venv_seam(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    assert seam.is_symlink()
+    expected = os.path.relpath(generation / "venv", seam.parent)
+    assert os.readlink(seam) == expected
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    # The published record still validates with the seam in place.
+    assert sg.read_generation(root) is not None
+    assert sg.serving_snapshot_python(root) == venv_python(generation / "venv")
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_ensure_snapshot_venv_seam_repairs_link_but_keeps_real_tree(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    expected = os.path.relpath(generation / "venv", seam.parent)
+    # A missing or wrong-target link is repaired to the committed environment.
+    for broken in (lambda: seam.unlink(),
+                   lambda: (seam.unlink(), seam.symlink_to("/nonexistent/target"))):
+        broken()
+        sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+        assert seam.is_symlink() and os.readlink(seam) == expected
+    # A real tree at the seam path is never replaced by a link.
+    seam.unlink()
+    seam.mkdir()
+    (seam / "keep").write_text("x", encoding="utf-8")
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+    assert seam.is_dir() and not seam.is_symlink()
+    assert (seam / "keep").is_file()
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_seam_binds_validated_environment_not_reread_selection(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    import shutil
+    import pm.environments as env_mod
+    from pm.environments import install_state_dir
+    install = install_state_dir(root)
+    newer = install / "environments" / "newer"
+    shutil.copytree(generation, newer, symlinks=True)
+    # The round-3 race: committed_venv answers the validated generation for
+    # publication's own validation, then a concurrent selection change makes
+    # it answer a NEWER generation at seam time. Binding must use the
+    # validated environment, never a reread.
+    calls = {"n": 0}
+    def flippy(project_root):
+        calls["n"] += 1
+        return generation / "venv" if calls["n"] == 1 else newer / "venv"
+    monkeypatch.setattr(env_mod, "committed_venv", flippy)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    seam = install / "serving-source" / "abc123" / "venv"
+    assert seam.is_symlink()
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    assert sg.read_generation(root) is not None
+    # Direct contract: an explicitly passed environment wins, whatever the
+    # current selection would answer.
+    seam.unlink()
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"}, generation / "venv")
+    assert Path(os.path.realpath(seam)) == (generation / "venv").resolve()
+    # Pinned-down default: a bare (standalone/repair) call binds the CURRENT
+    # selection — the publish path above never did, which is exactly the
+    # race this test guards.
+    seam.unlink()
+    sg.ensure_snapshot_venv_seam(root, {"commit": "abc123"})
+    assert Path(os.path.realpath(seam)) == (newer / "venv").resolve()
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_serving_snapshot_python_fallback_answers_none_on_doubt(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    facts = runtime_facts_path(root)
+    # Recorded environment outside this install's generations: refuse.
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(tmp_path / "elsewhere" / "venv")}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(root) is None
+    # Recorded environment without a real venv tree: refuse.
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(install_state_dir(root) / "environments" / "ghost" / "venv")}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(root) is None
+    # Garbage facts: refuse.
+    facts.write_bytes(b"{not json")
+    assert sg.serving_snapshot_python(root) is None
+    # Missing facts: refuse.
+    facts.unlink()
+    assert sg.serving_snapshot_python(root) is None
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_serving_snapshot_python_prefers_pinned_record_and_verifies_pair(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    import shutil
+    from pm.environments import install_state_dir
+    install = install_state_dir(root)
+    snapshot = Path(sg.read_generation(root)["source"])
+    # A newer environment recorded in mutable facts (dependency declarations
+    # differ) must not leak into the fallback while the record pins the pair.
+    newer = install / "environments" / "newer"
+    shutil.copytree(generation, newer, symlinks=True)
+    (newer / "workspace" / "pyproject.toml").write_text('[project]\nname="incompatible"\n', encoding="utf-8")
+    runtime_facts_path(root).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(newer / "venv")}}}), encoding="utf-8")
+    # Snapshot-rooted call: the pinned record wins over the advanced facts.
+    assert sg.serving_snapshot_python(snapshot) == venv_python(generation / "venv")
+    # Without a pinned record, an environment whose declared dependencies do
+    # not serve this source is refused even though its shape is valid.
+    (install / "serving-generation.json").unlink()
+    assert sg.serving_snapshot_python(snapshot) is None
+    # A foreign install's environment is refused despite a valid shape and
+    # matching declared dependencies — isolating the containment check (the
+    # written TOML uses real newlines; verified it parses with tomllib).
+    foreign = tmp_path / "foreign-install" / "environments" / "abc" / "venv"
+    foreign.mkdir(parents=True)
+    (foreign / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    foreign_ws = foreign.parent / "workspace"
+    foreign_ws.mkdir()
+    shutil.copy(root / "pyproject.toml", foreign_ws / "pyproject.toml")
+    runtime_facts_path(root).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(foreign)}}}), encoding="utf-8")
+    assert sg.serving_snapshot_python(snapshot) is None
+
+
+@pytest.mark.platforms("macos", "linux")
+def test_posix_cron_script_argv_falls_back_to_committed_python(tmp_path, monkeypatch):
+    root, generation = installed(tmp_path, monkeypatch)
+    assert sg.record_completed_generation(root, {"commit": "abc123", "dirty": False})
+    snapshot = Path(sg.read_generation(root)["source"])
+    # Pre-seam snapshot: publication predates the seam, or install state was wiped.
+    import shutil
+    import importlib.util
+    from pm.environments import install_state_dir
+    seam = install_state_dir(root) / "serving-source" / "abc123" / "venv"
+    seam.unlink()
+    assert not seam.exists()
+    # The scheduler derives repo from its own __file__, so load it from a copy
+    # inside the snapshot -- the way the gateway serves it -- while hermes_cli
+    # stays this checkout's (already imported above).
+    repo_root = Path(__file__).resolve().parents[2]
+    shutil.copytree(repo_root / "cron", snapshot / "cron")
+    spec = importlib.util.spec_from_file_location(
+        "scheduler_script_under_test", snapshot / "cron" / "scheduler_script.py")
+    ss = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ss)
+    store_python = tmp_path / "store" / "bin" / "python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda repo: store_python)
+    argv, env = ss._posix_cron_script_argv(Path("scripts") / "probe.py")
+    assert argv[0] == str(venv_python(generation / "venv"))
+    assert env == {"HERMES_DISABLE_LAZY_INSTALLS": "1"}
+    # The fallback is a kill-switchable last resort, not a policy change.
+    monkeypatch.setenv("HERMES_SNAPSHOT_VENV_FALLBACK", "0")
+    with pytest.raises(RuntimeError, match="interpreter is missing"):
+        ss._posix_cron_script_argv(Path("scripts") / "probe.py")

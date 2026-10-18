@@ -157,6 +157,16 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
     python = project_python(repo)
     if not python.is_file():
+        # A snapshot published without its venv seam must not page every script job as
+        # 'interpreter is missing': fall back to the committed generation this install
+        # already serves. Dependencies are identical when the seam was published for it;
+        # a wrong-guess import error on a genuinely stale tree beats certain failure.
+        if os.environ.get("HERMES_SNAPSHOT_VENV_FALLBACK") != "0":
+            from hermes_cli.serving_generation import serving_snapshot_python
+            fallback = serving_snapshot_python(repo)
+            if fallback is not None and fallback.is_file():
+                python = fallback
+    if not python.is_file():
         # The caller's interpreter is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
     return ([str(python), "-c", _POSIX_SCRIPT_BOOTSTRAP, str(repo), str(script)],

@@ -27,6 +27,18 @@ The floor applies even to old supervisors without launcher markers; the startup
 watchdog is disarmed for that intentional wait. Developer and packaged installs
 keep their ownership contracts. Serving never finishes an update itself.
 
+The published snapshot carries a **venv seam**. POSIX script jobs (cron `no_agent`)
+resolve their interpreter against their own source tree, which for a snapshot is
+`serving-source/<commit>/venv/bin/python` — a path publication never populates, so
+every script tick failed with `dependency environment interpreter is missing` until
+manual repair. Publication now binds that path to the committed generation's venv
+(relative symlink) once dependency declarations are proven equal; a real tree at
+the path is never replaced, and Windows is untouched (its jobs resolve the
+committed venv directly). As last resort the scheduler falls back to the recorded
+generation when the seam is missing; `HERMES_SNAPSHOT_VENV_FALLBACK=0` restores
+the strict missing-interpreter error. Snapshots published before this change gain
+the seam on their next successful update publication.
+
 Update completion treats a rejected generation publication as failure: it exits
 non-zero with the publication reason and does not advise restarting gateways.
 Bootstrap receipts are refreshed only after successful serving publication.

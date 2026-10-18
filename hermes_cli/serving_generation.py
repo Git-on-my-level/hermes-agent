@@ -190,9 +190,115 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
                 shutil.rmtree(staging)
     if not _complete_source(snapshot, stamp['commit']) or not _dependency_inputs_match(generation / 'workspace', snapshot):
         return False
+    try:
+        ensure_snapshot_venv_seam(root, stamp, generation / "venv")
+    except Exception as exc:
+        # Best effort: the scheduler fallback still resolves the committed
+        # generation, but flag the degraded publication for the update log.
+        print(f'hermes: serving venv seam not bound ({exc}); script jobs rely on the '
+              'scheduler fallback', file=sys.stderr, flush=True)
     atomic_json_write(record_path(root), {"schema": 1, "generation": str(generation),
                                         "source": str(snapshot), "commit": stamp["commit"]})
     return True
+
+
+def ensure_snapshot_venv_seam(root: Path, stamp: dict, environment: Path | None = None) -> None:
+    """Bind the published snapshot's expected interpreter path to the committed venv.
+
+    POSIX script jobs resolve ``project_python`` against their source tree
+    (#123044 isolation), which for a published snapshot is
+    ``serving-source/<commit>/venv/bin/python`` — a path publication never
+    populates, so every scheduled script tick failed until manual repair.
+    ``record_completed_generation`` has just proven the committed generation
+    serves this snapshot (dependency declarations match), so a relative
+    symlink at that path is the completion the design implies; it keeps the
+    install directory movable and the snapshot free of a copied venv.
+    Pass the *validated* environment explicitly: rereading ``committed_venv``
+    here would race a concurrent PM selection change and bind a generation
+    the published record does not pin.
+    """
+    if os.name == "nt":
+        return  # Windows script jobs resolve the committed venv directly.
+    commit = stamp.get("commit")
+    if not commit:
+        return
+    from pm.environments import committed_venv, install_state_dir
+    if environment is None:
+        environment = committed_venv(root)
+        if environment is None:
+            return
+    seam = install_state_dir(root) / "serving-source" / commit / "venv"
+    relative = os.path.relpath(environment, seam.parent)
+    if seam.is_symlink():
+        try:
+            if os.readlink(seam) == relative:
+                return  # Already bound exactly as intended.
+        except OSError:
+            pass
+        seam.unlink()
+    elif seam.exists():
+        return  # Never replace a real tree a previous layout may have built.
+    seam.symlink_to(relative)
+
+
+def serving_snapshot_python(root: Path) -> Path | None:
+    """The committed generation's interpreter for *root*, as a read-only fallback.
+
+    Script jobs running from a published snapshot reach here only when the
+    snapshot's own venv seam is missing (pre-seam publication or a wiped
+    install state). The gateway serves the snapshot as its repo, so PM state
+    for the snapshot-keyed install may not exist; when invoked inside
+    ``<install>/serving-source/`` the owning install's record answers instead.
+    Mirrors ``_recorded_venv``'s location and sanity checks without raising:
+    any doubt answers ``None`` and the caller keeps its precise
+    missing-interpreter error.
+    """
+    from pm.environments import runtime_facts_path, venv_python
+    root = Path(root).resolve()
+    facts = None
+    owner = None
+    snapshot_dir = None
+    prev = root
+    for ancestor in (root, *root.parents):
+        if ancestor.name == "serving-source":
+            # The owning install's PM state dir: its name is a hash of the
+            # project root, which cannot be recomputed here. Prefer the PINNED
+            # serving record over the mutable selection: facts.json can advance
+            # to a newer environment while this snapshot is still being served,
+            # and pairing the snapshot with an unverified venv breaks the
+            # validated source/dependency pair this resolver exists to protect.
+            owner = ancestor.parent
+            snapshot_dir = prev
+            facts = owner / "facts.json"
+            break
+        prev = ancestor
+    environment = None
+    if owner is not None:
+        try:
+            record = json.loads((owner / "serving-generation.json").read_text(encoding="utf-8-sig"))
+            environment = Path(record["generation"]).resolve() / "venv"
+        except (OSError, ValueError, KeyError, TypeError):
+            environment = None
+    if environment is None:
+        if facts is None:
+            facts = runtime_facts_path(root)
+        try:
+            data = json.loads(facts.read_text(encoding="utf-8-sig"))
+            environment = Path(data["packages"]["venv"]["environment"]).resolve()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+    # The record must name a generation venv inside an install's environments/
+    # directory — and, when discovered, inside THIS install (facts can name a
+    # foreign install's tree; a basename check alone would accept it).
+    if environment.parent.parent.name != "environments" or not (environment / "pyvenv.cfg").is_file():
+        return None
+    if owner is not None and not environment.is_relative_to(owner.resolve()):
+        return None
+    # Accepting any environment other than the pinned one requires its declared
+    # dependencies to serve this source; otherwise the pairing breaks silently.
+    if not _dependency_inputs_match(environment.parent / "workspace", snapshot_dir or root):
+        return None
+    return venv_python(environment)
 
 
 def serving_command(root: Path, argv: list[str]) -> list[str] | None:
