@@ -126,6 +126,30 @@ def test_gc_keeps_completed_pair_and_leased_superseded_source(tmp_path, monkeypa
     assert Path(sg.read_generation(root)["source"]).is_dir()
 
 
+def test_gc_keeps_legacy_source_whose_venv_symlink_still_serves(tmp_path, monkeypatch):
+    """Pre-2026-10-18 snapshots carry ``venv -> environments/<gen>/venv``; a process that
+    still resolves its interpreter through one (un-updated host, stale cache) holds no lease
+    file, so the collector must treat the link itself as held — removing the source would
+    strand that process's cron scripts on a missing interpreter. A dangling link (its target
+    generation already collected) pins nothing."""
+    from hermes_cli.runtime_state import collect_generations
+    root, generation = installed(tmp_path, monkeypatch)
+    (generation / ".lease-managed").touch()
+    assert sg.record_completed_generation(root, {"commit": "first", "dirty": False})
+    first = Path(sg.read_generation(root)["source"])
+    target = tmp_path / "elsewhere-venv"
+    target.mkdir()
+    (first / "venv").symlink_to(target, target_is_directory=True)
+    assert sg.record_completed_generation(root, {"commit": "second", "dirty": False})
+    removed = collect_generations(root, min_age_seconds=0)
+    assert first not in removed and first.is_dir()
+    # The guard is the link's liveness, not its name: a dangling link no longer serves any
+    # process's interpreter resolution, so the source is collected normally.
+    target.rmdir()
+    removed = collect_generations(root, min_age_seconds=0)
+    assert first in removed and not first.exists()
+
+
 def test_direct_gateway_and_profile_cli_use_completed_pair(tmp_path, monkeypatch):
     root, _ = installed(tmp_path, monkeypatch)
     monkeypatch.delenv("HERMES_SUPERVISED_CHILD")

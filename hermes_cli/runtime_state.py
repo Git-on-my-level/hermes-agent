@@ -219,6 +219,14 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
                         or not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds):
                     continue
                 if not leases_held(source):
+                    # A venv symlinked into environments/ (the pre-2026-10-18 snapshot layout)
+                    # keeps an un-updated process's selected_venv() resolvable through the
+                    # snapshot. Removing it under that process would strand its cron scripts
+                    # on "interpreter is missing"; treat a link whose target still lives as a
+                    # held lease. A dangling link (its generation was already collected) pins
+                    # nothing and the source is collected normally.
+                    if (source / "venv").is_symlink() and (source / "venv").exists():
+                        continue
                     shutil.rmtree(source)
                     removed.append(source)
     return removed
