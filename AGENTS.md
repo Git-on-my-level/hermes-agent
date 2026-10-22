@@ -7,7 +7,7 @@ and every root-to-area chain at 30k, so it loads whole on 128k+ models: long for
 
 **Never give up on the right solution.**
 
-Fork-only maintenance rules, when this tree is the Git-on-my-level fork, live in `FORK.md`.
+Fork-only maintenance rules: `FORK.md`.
 
 ## What Hermes Is
 
