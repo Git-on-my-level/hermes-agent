@@ -16,7 +16,7 @@ on:
     # origin/main) still runs Fork CI on the branch head. pull_request
     # workflows need a merge ref, which GitHub does not build while the
     # PR is dirty.
-    branches: [main, prod, sync/upstream-2026-10-04]
+    branches: [main, prod, sync/**]
 
 permissions:
   contents: read
