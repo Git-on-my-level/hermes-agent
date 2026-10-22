@@ -24,6 +24,11 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     """
     root = Path(root).resolve()
     info = _git_version_info(root, include_untracked=True)
+    dirty = bool(getattr(info, "dirty", False))
+    if dirty:
+        from hermes_cli.serving_generation import publisher_outputs_only
+        if publisher_outputs_only(root):
+            dirty = False
     if info.commit is None:
         with suppress(FileNotFoundError):
             (root / "install-stamp.json").unlink()
@@ -38,7 +43,7 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
         "commitDate": info.commit_date,
         "branch": info.branch,
         "builtAt": datetime.now(UTC).isoformat(),
-        "dirty": info.dirty,
+        "dirty": dirty,
         "source": "git",
         "distribution": None,
         "updateMechanism": "self",

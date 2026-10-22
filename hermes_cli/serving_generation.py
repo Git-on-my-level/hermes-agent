@@ -65,8 +65,36 @@ def _dependency_inputs_match(workspace: Path, source: Path) -> bool:
 
 
 # Files this publisher writes into the checkout. They are not user modifications, and a
-# status probe that runs after they land must not call the tree dirty.
-_PUBLISHER_OUTPUTS = frozenset({"install-stamp.json", ".hermes-bootstrap-complete"})
+# status probe that runs after they land must not call the tree dirty. The bytecode
+# fingerprint is gitignored in a real checkout and untracked in a bare fixture.
+_PUBLISHER_OUTPUTS = frozenset({
+    "install-stamp.json",
+    ".hermes-bootstrap-complete",
+    ".bytecode-fingerprint",
+    ".bytecode-fingerprint.tmp",
+})
+
+
+def _status_paths(root: Path) -> list[str] | None:
+    """Porcelain paths in *root*, or None when ``git status`` itself failed."""
+    import subprocess
+    status = subprocess.run(
+        ["git", "--no-optional-locks", "status", "--porcelain"],
+        cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, check=False,
+    )
+    if status.returncode != 0:
+        return None
+    paths = []
+    for line in (status.stdout or "").splitlines():
+        paths.append(line[3:].strip().strip('"') if len(line) > 3 else line.strip())
+    return paths
+
+
+def publisher_outputs_only(root: Path) -> bool:
+    """True when every status path is a file this publisher writes."""
+    paths = _status_paths(root)
+    return paths is not None and all(path in _PUBLISHER_OUTPUTS for path in paths)
 
 
 def _git_identity_drift(root: Path, stamp: dict) -> str | None:
@@ -76,21 +104,9 @@ def _git_identity_drift(root: Path, stamp: dict) -> str | None:
     commit = _run_git(Path(root), "rev-parse", str(stamp.get("commit") or ""))
     if not commit or info.commit != commit:
         return "Git identity is dirty/unknown or HEAD differs from the install stamp"
-    if not info.dirty:
+    if not info.dirty or publisher_outputs_only(root):
         return None
-    import subprocess
-    status = subprocess.run(
-        ["git", "--no-optional-locks", "status", "--porcelain"],
-        cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=120, check=False,
-    )
-    if status.returncode != 0:
-        return "Git identity is dirty/unknown or HEAD differs from the install stamp"
-    for line in (status.stdout or "").splitlines():
-        path = line[3:].strip().strip('"') if len(line) > 3 else line
-        if path not in _PUBLISHER_OUTPUTS:
-            return "Git identity is dirty/unknown or HEAD differs from the install stamp"
-    return None
+    return "Git identity is dirty/unknown or HEAD differs from the install stamp"
 
 
 class ServingGenerationPublishError(ValueError):

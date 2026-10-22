@@ -421,6 +421,12 @@ def _complete_selected(request: dict) -> bool:
         _report_desktop_build_owed(request, None, "the source-update tail did not run")
         record_followup("completion", reason)
         followups.append(("completion", reason))
+    # A failed serving publication is not a follow-up the restart advice may paper over.
+    # An unsafe SQLite verdict withholds success without a stamp follow-up and still exits 0.
+    if any(step == "stamp" for step, _reason in followups):
+        if request["gateway_mode"]:
+            update_cmd._write_gateway_update_exit_code(False)
+        raise SystemExit(1)
     tail_owed = any(step in TAIL_FOLLOWUPS for step, _ in followups)
     record_build_stage(followups)
     if not tail_owed:
