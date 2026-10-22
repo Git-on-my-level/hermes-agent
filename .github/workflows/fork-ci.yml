@@ -8,6 +8,14 @@ name: Fork CI
 #
 # Full upstream CI still runs on NousResearch/hermes-agent; this workflow
 # is a no-op there (see the job-level if).
+#
+# Blocking lint lanes are INLINED below (not called via lint.yml) on a public
+# runner: upstream lint.yml pins every job to blacksmith-4vcpu runners, which
+# sat queue-starved on this fork for hours (four runs stuck 2026-10-22), so a
+# push gate could never start. lint.yml stays the PR path — its PR-only
+# advisory lanes (lint-diff, code-health) still run there. These inlined jobs
+# mirror only lint.yml's blocking steps; keep them in sync when upstream
+# changes them.
 
 on:
   pull_request:
@@ -28,8 +36,10 @@ concurrency:
 
 jobs:
   lint:
-    name: Python lints
-    if: github.repository == 'Git-on-my-level/hermes-agent'
+    name: Python lints (PR advisory + blocking via upstream lint.yml)
+    # push events use the inlined blocking jobs below: lint.yml's Blacksmith
+    # runners starve, and a queued workflow_call job would hold the gate.
+    if: github.event_name == 'pull_request' && github.repository == 'Git-on-my-level/hermes-agent'
     uses: ./.github/workflows/lint.yml
     with:
       event_name: ${{ github.event_name }}
@@ -77,9 +87,81 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+  # Mirrors lint.yml#ruff-blocking (keep in sync; that file stays upstream's).
+  ruff-blocking:
+    name: Python lints / ruff enforcement (blocking)
+    if: github.repository == 'Git-on-my-level/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-pm
+        with:
+          cache-python: true
+          prune-python-cache: true
+
+      - name: Install ruff
+        run: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
+
+      - name: ruff check .
+        # No --exit-zero, no || true. Exit code propagates to the job,
+        # which propagates to the required-check gate.
+        run: ruff check .
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+
+  # Mirrors lint.yml#windows-footguns blocking steps (keep in sync).
+  windows-footguns:
+    name: Python lints / Windows footguns (blocking)
+    if: github.repository == 'Git-on-my-level/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-pm
+        with:
+          cache-python: true
+          prune-python-cache: true
+
+      - name: Run footgun checker
+        run: python scripts/check-windows-footguns.py --all
+
+      - name: Require portable Bash shebangs
+        run: python scripts/check_bash_shebangs.py
+
+      # /tmp is not portable (Termux has none, native Windows has none, macOS aliases it to
+      # /private/tmp, Linux mounts it as a small tmpfs). Production code resolves scratch space
+      # through the scratch-dir helper; skills, docs and prompts must not teach the model a
+      # literal /tmp either. `no-tmp: ok — <why>` marks a deliberate line; _BASELINE in the
+      # script is the burn-down list of pre-existing hits.
+      - name: Forbid literal /tmp paths outside the baseline
+        run: python scripts/check_no_tmp_literals.py
+
+      # config.yaml is hand-edited and commented; a PyYAML dump of it destroys every comment
+      # (#92554, regressed repeatedly). All writers go through the hermes_cli.config writer seam.
+      - name: Forbid config.yaml writers that bypass the comment-preserving writer
+        run: python scripts/check_config_yaml_writers.py
+
+      # The OS lanes import only files carrying the matching marker, so a test that fakes
+      # macOS (is_macos -> True, sys.platform -> "darwin") without `platforms("macos")` is green on
+      # Linux over a faked branch and never runs on macOS (#111866, tests/AGENTS.md § Don't fake the host OS).
+      - name: Forbid unmarked macOS fakes in tests
+        run: python scripts/ci/check_os_marker_fakes.py
+
+      # Every AGENTS.md from the git root down to the working directory loads as one
+      # project-context block (30,720 chars on a 128k window); chains are capped at 30k.
+      - name: Keep every AGENTS.md under its truncation cap
+        run: python scripts/ci/check_agents_md_size.py
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
+
   gate:
     name: All required checks pass
-    needs: [lint, tests]
+    needs: [lint, tests, ruff-blocking, windows-footguns]
     if: always() && github.repository == 'Git-on-my-level/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -88,7 +170,13 @@ jobs:
         env:
           LINT: ${{ needs.lint.result }}
           TESTS: ${{ needs.tests.result }}
+          RUFF: ${{ needs.ruff-blocking.result }}
+          FOOTGUNS: ${{ needs.windows-footguns.result }}
         run: |
-          echo "lint=$LINT tests=$TESTS"
-          test "$LINT" = success
+          echo "lint=$LINT tests=$TESTS ruff=$RUFF footguns=$FOOTGUNS"
+          # lint (upstream lint.yml) runs on pull_request only; skipped is
+          # expected on push events, where the inlined blocking jobs cover it.
+          case "$LINT" in success|skipped) ;; *) exit 1;; esac
           test "$TESTS" = success
+          test "$RUFF" = success
+          test "$FOOTGUNS" = success
