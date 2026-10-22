@@ -55,14 +55,35 @@ def test_foreign_owned_venv_file_refused_before_sync(tmp_path, monkeypatch):
 
 
 def test_completed_maintenance_survives_stamp_io_error(tmp_path, monkeypatch, capsys):
+    """Maintenance that already finished stays durable when the stamp cannot be written.
+
+    The checkout is not a successful update: no install stamp, no completion banner.
+    Returning true here would accept an update whose installed revision was not recorded.
+    """
     from hermes_cli import source_build, source_stamp, update_cmd_maint
+
+    maintenance = {"done": False}
+
+    def finished(**kwargs):
+        maintenance["done"] = True
+        return True
+
+    def unwritable(root):
+        assert maintenance["done"] is True
+        raise OSError("readonly")
 
     monkeypatch.setattr(venv_sync, "publish_launchers", lambda root: None)
     monkeypatch.setattr(source_build, "build_update_products", lambda root, *, desktop: None)
-    monkeypatch.setattr(update_cmd_maint, "_run_post_update_maintenance", lambda **kwargs: True)
-    monkeypatch.setattr(source_stamp, "write_source_stamp", lambda root: (_ for _ in ()).throw(OSError("readonly")))
-    assert source_completion.complete_source_checkout(tmp_path, desktop=False, assume_yes=True)
-    assert "completed, but the install stamp" in capsys.readouterr().err
+    monkeypatch.setattr(update_cmd_maint, "_run_post_update_maintenance", finished)
+    monkeypatch.setattr(source_stamp, "write_source_stamp", unwritable)
+    assert source_completion.complete_source_checkout(
+        tmp_path, desktop=False, assume_yes=True, announce="\n✓ Code updated!",
+    ) is False
+    captured = capsys.readouterr()
+    assert maintenance["done"] is True
+    assert "install stamp could not be written" in captured.err
+    assert "✓ Code updated!" not in captured.out
+    assert not (tmp_path / "install-stamp.json").exists()
 
 
 def test_sealed_stamp_reader_honors_external_install_root(tmp_path, monkeypatch):

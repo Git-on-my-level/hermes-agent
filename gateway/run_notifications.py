@@ -303,9 +303,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        from gateway.response_filters import is_intentional_silence_response
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
+                # Commentary-preview retraction (option 2): the fresh send below stands; retract
+                # the interim progress bubble first so it does not linger beside the final. A pure
+                # silence marker must not reach here at all (the queued-lane silence gate above the
+                # caller blanks it), but guard anyway: silent turns keep their progress bubble.
+                if (
+                    stream_consumer is not None
+                    and hasattr(stream_consumer, "retract_preview_bubbles")
+                    and not is_intentional_silence_response(text_content)
+                ):
+                    await stream_consumer.retract_preview_bubbles()
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
                 _reconciled = False
@@ -525,6 +536,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return
             try:
                 data = json.loads(path.read_text(encoding="utf-8-sig"))
+                if data.get("quiet"):
+                    # The shutdown side asked to stay quiet (drain marker with
+                    # suppress_notification=true): retire the marker, no broadcast.
+                    logger.info("Planned-restart online notice skipped: quiet drain restart")
+                    path.unlink(missing_ok=True)
+                    return
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.

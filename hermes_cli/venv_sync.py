@@ -301,6 +301,26 @@ def _is_tail_script(root: Path, argv0: str) -> bool:
     return script.name in _TAIL_SCRIPTS and script.resolve().parent == root / "hermes_cli"
 
 
+def _is_supervised_serving_gateway(argv: list[str]) -> bool:
+    """True for the process launchd/systemd restarts to serve, not for ``hermes update``.
+
+    A supervised ``gateway`` / ``gateway run`` must reach its loop without the product
+    tail. Other supervised commands still finish that tail in place.
+    """
+    if not _supervised_child():
+        return False
+    return _is_serving_gateway(argv)
+
+
+def _is_serving_gateway(argv: list[str]) -> bool:
+    from hermes_cli._parser import command_argv
+
+    cmd = command_argv(argv)
+    if not cmd or cmd[0] != "gateway":
+        return False
+    return len(cmd) == 1 or cmd[1] == "run"
+
+
 def _supervised_child() -> bool:
     """A launcher-marked child: booted by a manager, not a user's shell.
 
@@ -340,6 +360,11 @@ def _tree_matches_completed_stamp(root: Path) -> bool:
     return info.commit == commit and not info.dirty
 
 
+def _require_completed_serving_generation(root: Path) -> None:
+    from hermes_cli.serving_generation import ensure_first_serving_generation
+    ensure_first_serving_generation(root)
+
+
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
@@ -365,6 +390,15 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     from hermes_cli.steward import read_install_stamp
 
     command = command_argv(argv)
+    serving = _is_serving_gateway(argv) or Path(sys.argv[0]).resolve() == root / 'gateway' / 'run.py'
+    original_stamp = read_install_stamp(root)
+    if serving and not (_METADATA_FLAGS & set(argv)) and (
+            original_stamp.get('updateMechanism') == 'self'
+            or (not original_stamp and completion_pending_path(root).is_file())):
+        # Disabling lazy installs suppresses provisioning, not serving safety.
+        # A missing stamp during an owed tail must not be boot-time adopted.
+        _require_completed_serving_generation(root)
+
     if (command[:1] == ["pm"]
             or _METADATA_FLAGS & set(argv)
             # This is the recovery path shown by the Desktop when a pending update has
@@ -383,6 +417,12 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
         stamp = read_install_stamp(root)
     if stamp.get("updateMechanism") != "self":
         return None  # Developer checkouts and packaged runtimes retain their owner.
+
+    # A first boot on a legacy install may not yet have a completed snapshot.
+    # Even then serving must never enter a source update or wait for its lock.
+    if _is_serving_gateway(argv) or Path(sys.argv[0]).resolve() == root / "gateway" / "run.py":
+        _require_completed_serving_generation(root)  # Includes freshly adopted legacy installs.
+        return None  # Bootstrap immediately execs the validated serving pair.
 
     import pm
     from hermes_cli._launchers import resolve_store_python
@@ -430,6 +470,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                 if not pm.venv_is_current(project_root=root):
                     # Relaunching would land back here and sync again, forever.
                     raise RuntimeError("dependency sync left this install out of date")
+            elif _is_supervised_serving_gateway(argv) and not current:
+                # The serving process syncs dependencies under its own deadline and
+                # returns to the loop. Product builds and post-update maintenance stay
+                # owed to `hermes update`; they must not run before the gateway serves.
+                from hermes_cli.serving_recovery import recover_serving_dependencies
+
+                recover_serving_dependencies(root)
             else:
                 # The tail mutates the checkout: ACQUIRE its lock (R2), never sample it. A free
                 # marker over a held checkout lock is a killed update whose tree (its completion

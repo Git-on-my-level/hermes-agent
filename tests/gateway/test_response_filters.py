@@ -30,6 +30,17 @@ def test_translated_sentinel_is_silence_in_every_form_the_english_one_is():
     assert is_autonomous_silence_response("静默")
 
 
+def test_internal_agent_result_uses_the_autonomous_rule():
+    """The event flag selects the rule. A note on its own line is silence only when internal."""
+    note = "Checked: CI still running.\n\n[SILENT]"
+    buried = "the lane said [SILENT] mid-sentence and kept talking"
+    ok = {"failed": False}
+    assert is_intentional_silence_agent_result(ok, note, internal=True)
+    assert not is_intentional_silence_agent_result(ok, note)
+    assert not is_intentional_silence_agent_result(ok, buried, internal=True)
+    assert not is_intentional_silence_agent_result({"failed": True}, note, internal=True)
+
+
 def test_prose_mentioning_the_translated_sentinel_is_delivered():
     assert not is_intentional_silence_response("status: 静默 means the lane is quiet")
     assert not is_autonomous_silence_response("the lane said 静默 mid-sentence and kept talking")

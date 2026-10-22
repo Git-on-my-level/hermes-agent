@@ -72,7 +72,7 @@ def test_paused_job_run_override_remains_allowed(tmp_cron_dir):
     job = create_job("paused", "every 1h")
     from cron.jobs import pause_job
 
-    pause_job(job["id"])
+    pause_job(job["id"], reason="test")
     triggered = trigger_job(job["id"])
     assert triggered["state"] == "scheduled"
     assert triggered["enabled"] is True
@@ -213,7 +213,7 @@ class TestRecurringJobStuckInErrorStateIsRecoverable:
         job = create_job("recurring", "every 5m")
         self._force_error_state(job["id"])
 
-        paused = pause_job(job["id"])
+        paused = pause_job(job["id"], reason="test")
 
         assert paused is not None, "pause_job must not raise on state=error"
         assert paused["state"] == "paused"

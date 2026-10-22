@@ -305,6 +305,8 @@ class GatewayProfileReconcileMixin:
             result["removed"].append(name)
             added = [n for n in added if n != name]
         self._record_served_profiles(active, list(current.items()))
+        from gateway.status_async import flush_pending
+        await flush_pending()
         # ``_note_served_profiles`` fills a missing signature with the current one; that refill
         # would park a transiently-failed profile exactly like the config-error case above.
         for name in transient_failed:
@@ -552,6 +554,8 @@ def _profile_lifecycle_verb(runner, *, serve: bool):
                     return {"error": f"profile '{name}' is not served"}
                 await runner._unserve_profile(name, known.pop(name))
                 runner._record_served_profiles(active, list(known.items()))
+                from gateway.status_async import flush_pending
+                await flush_pending()
                 return {"unserved": name, "served_profiles": runner.served_profile_names()}
             installed = dict(profiles_to_serve(True, include_parked=True))
             if name not in installed:

@@ -17,6 +17,24 @@ def homebrew_dirs() -> tuple[str, ...]:
     return ("/opt/homebrew/bin", "/usr/local/bin") if sys.platform == "darwin" else ()
 
 
+def package_manager_dirs() -> tuple[str, ...]:
+    """Package-manager bin/sbin dirs a SERVICE PATH starts with (the caller liveness-checks
+    and drops absent ones). macOS composes from ``homebrew_dirs()`` so Homebrew entries keep
+    a single spelling here, each prefix contributing its ``bin`` then its ``sbin``; the
+    ``sbin`` companions are service-PATH specific (launchd/systemd daemons may need admin
+    tools, interactive resolution does not). Empty on Windows: services there are built from
+    absolute paths, not a PATH payload."""
+    if sys.platform == "darwin":
+        return tuple(
+            path
+            for bin_dir in homebrew_dirs()
+            for path in (bin_dir, bin_dir[:-3] + "sbin")
+        )
+    if _POSIX:
+        return ("/usr/local/sbin", "/usr/local/bin")
+    return ()
+
+
 def user_local_bin() -> tuple[str, ...]:
     return ("~/.local/bin",) if _POSIX else ("%USERPROFILE%/.local/bin",)
 

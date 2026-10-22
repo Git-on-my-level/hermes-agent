@@ -198,11 +198,11 @@ class TestFallbackTransportInit:
         transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
 
         assert transport._fallback_ips == ["149.154.167.220"]
-        # Fallback pools are now built lazily (#63311), so __init__ constructs
-        # only the primary transport. Force the fallback pool to materialize to
-        # observe its kwargs.
+        # Pools are built on first use, off the event loop. Materialize both so
+        # the primary and the fallback kwargs are visible.
         import asyncio
 
+        asyncio.run(transport._ensure_primary())
         asyncio.run(transport._get_fallback("149.154.167.220"))
         assert len(seen_kwargs) == 2
         assert all(kwargs["proxy"] == "http://proxy.example:8080" for kwargs in seen_kwargs)
@@ -223,9 +223,9 @@ class TestFallbackTransportInit:
         transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
 
         assert transport._fallback_ips == ["149.154.167.220"]
-        # Lazy fallback build (#63311): materialize the fallback pool.
         import asyncio
 
+        asyncio.run(transport._ensure_primary())
         asyncio.run(transport._get_fallback("149.154.167.220"))
         assert len(seen_kwargs) == 2
         assert all("proxy" not in kwargs for kwargs in seen_kwargs)
@@ -255,11 +255,9 @@ class TestFallbackTransportInit:
             ["149.154.167.220"], limits=custom_limits
         )
 
-        # Lazy fallback build (#63311): __init__ builds only the primary; the
-        # fallback pool is constructed on demand. Materialize it so both the
-        # primary and the fallback are observed.
         import asyncio
 
+        asyncio.run(transport._ensure_primary())
         asyncio.run(transport._get_fallback("149.154.167.220"))
         # 1 primary + 1 fallback = 2 AsyncHTTPTransport instances
         assert len(seen_kwargs) == 2
@@ -282,8 +280,7 @@ class TestFallbackTransportClose:
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
 
         transport = tnet.TelegramFallbackTransport(["149.154.167.220", "149.154.167.221"])
-        # Lazy fallback build (#63311): materialize both fallback pools so
-        # aclose() has something to tear down.
+        await transport._ensure_primary()
         await transport._get_fallback("149.154.167.220")
         await transport._get_fallback("149.154.167.221")
         await transport.aclose()
@@ -479,3 +476,64 @@ class TestDiscoverFallbackIps:
 
         assert ips == ["149.154.167.220"]
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+
+
+class TestTlsBuiltOffTheLoop:
+    @pytest.mark.asyncio
+    async def test_slow_tls_setup_does_not_stall_the_loop(self, monkeypatch):
+        """Fallback/reset must keep constructing transports off the event loop."""
+        import asyncio
+        import ssl
+        import threading
+        import time
+
+        loop = asyncio.get_running_loop()
+        loop_id = threading.get_ident()
+        built_on: list[int] = []
+        release = threading.Event()
+        context = ssl.create_default_context()
+
+        def slow_context():
+            built_on.append(threading.get_ident())
+            assert release.wait(2)
+            return context
+
+        def factory(**kwargs):
+            assert kwargs["verify"] is context
+            assert kwargs["verify"].check_hostname is True
+            assert kwargs["verify"].verify_mode == ssl.CERT_REQUIRED
+            assert kwargs["limits"].max_connections == 8
+            return FakeTransport([], {})
+
+        monkeypatch.setattr(tnet, "_telegram_ssl_context", slow_context)
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy", "TELEGRAM_PROXY", "NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(key, raising=False)
+
+        ticks: list[float] = []
+
+        async def ticker():
+            for _ in range(4):
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.05)
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        task = asyncio.create_task(ticker())
+        build = asyncio.create_task(transport._ensure_primary())
+        await asyncio.sleep(0.12)
+        assert len(ticks) >= 2, "the event loop did not run while TLS setup blocked"
+        release.set()
+        await build
+        await task
+        await transport.aclose()
+        assert built_on and all(ident != loop_id for ident in built_on)
+
+    def test_cached_context_keeps_hostname_verification(self, monkeypatch):
+        import ssl
+
+        monkeypatch.setattr(tnet, "_ssl_context", None)
+        first = tnet._telegram_ssl_context()
+        second = tnet._telegram_ssl_context()
+        assert first is second
+        assert first.check_hostname is True
+        assert first.verify_mode == ssl.CERT_REQUIRED

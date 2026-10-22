@@ -3452,6 +3452,7 @@ export const frOverrides = {
     pause: 'Mettre en pause le cron',
     resumeTitle: 'Reprendre',
     pauseTitle: 'Mettre en pause',
+    pauseReasonPrompt: 'Pourquoi cette tâche est-elle en pause ?',
     triggerNow: 'Déclencher maintenant',
     edit: 'Modifier le cron',
     deleteTitle: 'Supprimer la tâche cron ?',

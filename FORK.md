@@ -1,0 +1,252 @@
+# Fork maintenance
+
+These rules are mandatory for source, sync, and deployment work. They make the
+Hermes fork reviewable; they do **not** authorize a sync, deployment, or gateway
+restart.
+
+## Remote and overlay contract
+
+The maintained runtime checkout uses these names deliberately:
+
+- `origin` is the NousResearch `hermes-agent` upstream.
+- `fork` is the authoritative `Git-on-my-level/hermes-agent` fork.
+
+Do not rename remotes ad hoc. Existing automation and worktrees depend on this
+convention.
+
+Keep generic core changes upstreamable and minimal. Host-specific overlays
+belong outside the repository under `~/.hermes` and macOS LaunchAgents. Never
+commit credentials, bot tokens, config, sessions, logs, skills, cron state, or
+installed-source state to Git.
+
+**Thin fork content.** `fork/prod` is exact `origin/main` plus a handful of
+small additive commits. Product defaults (model slug, thinking effort, silent
+catalog default) live in host `config.yaml`, not in `hermes_cli/models.py`.
+
+**Do not edit files upstream rewrites weekly** unless there is no other hook:
+
+- `gateway/run.py`, `hermes_cli/models.py`, `hermes_cli/update_cmd.py`,
+  `website/static/api/model-catalog.json`
+
+Prefer: new file + one call site, transport-only alias, or host config.
+
+Do not add core model tools on the fork (`toolsets.py` / conversation loop).
+Use a skill or slash command until upstream owns the tool.
+
+## Before any sync or source integration
+
+1. Start with a clean worktree: `git status --short` must be empty. Never
+   mutate the live gateway checkout (`~/.hermes/hermes-agent`); use
+   `/Volumes/scratch/worktrees/…`.
+2. Record exact SHAs and divergence, not branch labels alone:
+
+   ```bash
+   git fetch origin main && git fetch fork prod main
+   git rev-parse origin/main fork/main fork/prod
+   git rev-list --left-right --count fork/prod...origin/main
+   git merge-tree --write-tree --messages fork/prod origin/main
+   ```
+
+3. Use `sync/upstream-YYYY-MM-DD` from **current `origin/main`**, then
+   cherry-pick only the keep-list. Do not merge 2k-commit histories.
+4. Do not commit directly to `fork/main`. Never use a blind `git pull`,
+   `git fetch --all --tags`, a destructive reset, or automatic conflict
+   resolution. Archive tips before any force-with-lease:
+
+   ```bash
+   git push fork fork/prod:refs/heads/archive/prod-pre-sync-YYYY-MM-DD
+   git push fork fork/main:refs/heads/archive/main-pre-sync-YYYY-MM-DD
+   ```
+
+5. Retention is part of the same sitting, not a someday cleanup — see
+   § Branch retention. Pushing the sync N snapshot pair is what makes the
+   pair from sync N−2 eligible to go; run the prune pass before closing the
+   sync.
+6. Sync weekly. A 10-day lag is thousands of commits but still ~20 conflict
+   files; waiting does not make `run.py` easier.
+
+## Keep-list policy
+
+Re-port a fork commit only if all hold:
+
+1. Upstream still lacks the behavior.
+2. The delta is a new file or a transport/platform-local hook.
+3. A focused test fails if the behavior regresses.
+
+Prefer porting a small **open upstream PR** over a fork-original change when
+it avoids the weekly-rewritten files and carries its tests. Record the upstream
+PR number in the commit and keep-list; drop the port once upstream merges an
+equivalent.
+
+Drop or move to `~/.hermes` when upstream landed an equivalent (GLM-5.3
+catalog, mcp 2.x HTTP, patient Z.AI 429s, curated-before-fuzzy).
+
+## Keep-list check
+
+After every upstream sync, before pushing `fork/prod`, run:
+
+```bash
+python3 scripts/check_fork_features.py
+```
+
+It asserts each keep-list file/symbol is still present (commentary preview
+mixin, interim_assistant_message_mode registration, resolver, plumb-throughs,
+contract tests). Exit 0 = intact; exit 1
+prints one line per missing item — re-port it before pushing.
+
+Open upstream goal ports (both automatic modes remain off by default):
+
+| Upstream PR | Carried behavior | Contract tests |
+| --- | --- | --- |
+| NousResearch/hermes-agent#134448 | Infer a goal from the agent's commitment (`goals.auto_infer`) | `tests/hermes_cli/test_goal_auto_infer.py` |
+| NousResearch/hermes-agent#114921 | Opt in to gateway goals (`goals.auto_start`); skip synthetic events and prevent double-arming with inference | `tests/gateway/test_auto_start_goal.py` |
+| NousResearch/hermes-agent#129380 | Continuations take a concrete action before replying | `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_gates.py` |
+| NousResearch/hermes-agent#117222 | Feed host-observed tool activity to the goal judge | `tests/hermes_cli/test_goals.py` |
+
+Fork-original self-drive additions (plugins are new files, opt-in per host through `plugins.enabled` and
+`plugins.entries.<id>.allow_gateway_injection: true`; upstream has no equivalent):
+
+| Addition | Carried behavior | Contract tests |
+| --- | --- | --- |
+| `plugins/goal-heartbeat/` | Every `interval_minutes` (default 50) of silence in a gateway session with an active goal, inject a check-in turn so the agent re-judges a parked wait; check `escalate_after` (default 3) asks it to tell the user what is stuck. Closes the gap where a parked goal resumes only on a waiter's exit notice. | `tests/plugins/test_goal_heartbeat_plugin.py` |
+| `gateway/run_goals.py` `_silent_internal_turn` + `hermes_cli/goals.py` `GoalManager.wait_barrier_live` | An internal turn (process notice, plugin injection) answered with a silence marker — exact, or a short note on its own first or last line — skips the goal judge while the goal's wait barrier still holds (read-only check; no age cap, no clearing). Without it the judge reads `[SILENT]` as not-waiting: clears a live barrier, spends a turn, posts a status line, enqueues a continuation. A lifted barrier (process exited) is still judged. A marker buried mid-sentence is still delivered and judged. | `tests/gateway/test_goal_silent_internal_turn.py` |
+| `gateway/response_filters.py` + `gateway/run_turn.py` internal silence | Internal turns use the autonomous silence rule for delivery (a note plus `[SILENT]` on its own line is not sent). User turns still require an exact marker. The per-wake suppression is logged at DEBUG (a coalesced drain emits once per batch at INFO under "Coalesced N queued internal follow-up(s)"). Only plugin-injected turns hold the reply until it is finished: a trailing marker is unknowable mid-stream, and progressive delivery would post the note (cron decides on the finished response). Process notices and goal wakeups still stream. | `tests/gateway/test_gateway_silence_tokens.py`, `tests/gateway/test_stream_consumer_silence.py`, `tests/e2e/test_goal_heartbeat_e2e.py` |
+| `hermes_cli/goals.py` inferred checklist drafting | Auto-inferred contracts use the actual exchange, preserve the assistant's promised checklist and verification, and include restrictions only when explicitly stated by the user. `/goal draft` retains its human-reviewed prompt; inference notices show the checklist. | `tests/hermes_cli/test_goal_auto_infer.py`, `tests/gateway/test_goal_verdict_send.py` |
+| `hermes_cli/goals.py` gap verdict | An incomplete completion claim gets one repair continuation with a single decision-request instruction; a second consecutive gap or BLOCKED pauses with “needs your input”. The persisted counter defaults to zero for old state and resets on non-gap decisions or resume. | `tests/hermes_cli/test_goal_judge_ux.py` |
+| `gateway/run_goals.py` notice levels + `goals.notices` | Default `important` notifies on pauses, silently posts inferred/done, and logs progress/retries/waits/gap continuations; `all` posts all levels, `off` posts only important. Quiet decisions remain inspectable with `/goal status`; slash replies are unaffected. | `tests/gateway/test_goal_status_notice.py`, `tests/gateway/test_goal_verdict_send.py`, `tests/hermes_cli/test_goal_judge_ux.py` |
+| `hermes_cli/goals.py` owner steering | The judge sees the user's own messages since the goal was set (last 6, 600 chars each; continuations, heartbeats and process notifications excluded) and treats them as newer than the stored goal/contract: added work counts, dropped work no longer counts, explicit permission lifts a constraint. Recorded by the gateway and CLI goal hooks, kept across waits, reset by a new goal. | `tests/hermes_cli/test_goal_owner_steering.py`, `tests/e2e/test_goal_owner_steering_e2e.py` |
+| `tui_gateway/prompt_turn.py` owner steering | A TUI user turn passes the prompt to the goal judge as `owner_message` only when the goal already existed. Goal continuations are not recorded. | `tests/tui_gateway/test_goal_command.py` |
+| `plugins/session-inject/` | `hermes inject <session> "msg"` queues a user turn that the gateway delivers through `ctx.inject_message` (resume a stalled session from a shell, cron, or another agent). | `tests/plugins/test_session_inject_plugin.py` |
+
+Fork-original service-reliability additions (upstream has no equivalent):
+
+| Addition | Carried behavior | Contract tests |
+| --- | --- | --- |
+| `hermes_cli/gateway_launchd.py` `_launchd_service_path` + `hermes_cli/gateway_service_path.py` `_service_tool_dirs`/`_service_system_dirs`/`_service_path_extra_dirs` (facade `hermes_cli/gateway.py` keeps the delegating seams) | The launchd plist and systemd unit PATH are a pure function of the host: `~/.local/bin`, existing package-manager dirs (`/opt/homebrew/*`, `/usr/local/*` on macOS), `gateway.service_path_extra` config extras, managed Node dirs, then system dirs last. The invoking shell's PATH is never consulted, so regeneration by `hermes update`/`ai.hermes.converge` under launchd's minimal PATH produces the same PATH as an SSH shell (converge once dropped `/opt/homebrew/bin` from the plist and blinded the prod monitors for a week). macOS only: installed-plist PATH entries that still exist are carried forward — regeneration never shrinks the plist PATH — with a WARNING when the caller env lacks them; `gateway install --reset-service-path` re-derives without carry-forward (the systemd unit never carried caller PATH, so it needs no carry-forward). `launchd_plist_is_current()`/`systemd_unit_is_current()` are therefore caller-independent. | `tests/hermes_cli/test_gateway_service_path_determinism.py` |
+
+## Branch retention
+
+Every sync added branches and nothing removed them: the fork reached 403
+remote branches, 92% of them with a tip older than 90 days (#36). The count
+only rises unless deletion is a step someone runs.
+
+`scripts/prune_fork_branches.py` keeps a branch only if one of these holds:
+
+1. It is `main` or `prod`, or the remote's default branch.
+2. It is the head of an open PR — fork-internal or fork → upstream.
+3. Its tip is newer than 90 days (the working set, and the escape hatch for
+   in-flight work).
+4. It is one of the newest 2 `archive/<channel>-pre-sync-<date>` dates —
+   enough to roll back the sync that just happened and the one before it.
+
+Rule 4 is date-only on purpose: a pre-sync snapshot's tip is just an old
+position of `main`/`prod`, so it is always as fresh as the sync that made it —
+if the 90-day rule could rescue snapshots, the archive set would grow forever.
+Manual archives (`archive/*-pre-sync-*` names excluded) are ordinary branches
+under rule 3.
+
+Everything else is deleted, in two passes — never one:
+
+```bash
+# Pass 1: fetch, evaluate the rules, write the delete list (name, tip SHA,
+# tip date). Commit it: the committed list is the recovery record —
+# `git push fork <sha>:refs/heads/<name>` resurrects any ref in it.
+python3 scripts/prune_fork_branches.py
+git add scripts/prune-lists/ && git commit -m "chore: fork branch prune list YYYY-MM-DD"
+
+# Pass 2: delete exactly what the committed list names. Every delete is
+# guarded by --force-with-lease=<ref>:<sha>, so a branch that moved since
+# the list was published is rejected, not deleted; channel branches and open
+# PR heads are re-checked at apply time and skipped.
+python3 scripts/prune_fork_branches.py --apply --list-file scripts/prune-lists/YYYY-MM-DD.txt
+```
+
+Before pass 2, confirm no host tracks a branch outside the keep list — that
+is the one deletion that would be user-visible. Runtime hosts pin
+`updates.branch: prod` (§ Deploy channel); `hermes update --check` on a host
+is the cheap confirmation.
+
+Run pass 1 quarterly even when no sync happened: rule 3 moves, so yesterday's
+fresh branch eventually becomes eligible. If a committed list has gone stale
+by apply time, pass 2 reports the moved refs and exits non-zero — regenerate
+rather than forcing.
+
+## Deploy channel (`hermes update` / `/update`)
+
+Runtime agents on this fork should track the reviewed deploy tip, not raw
+upstream `main`:
+
+```yaml
+# ~/.hermes/config.yaml  (host-local)
+updates:
+  remote: fork
+  branch: prod
+```
+
+With that set, `hermes update`, `hermes update --check`, and `/update` all
+fast-forward `fork/prod`. Upstream synchronization into the fork remains a
+separate maintainer step; agents never merge upstream themselves.
+
+Override for one shot: `hermes update --remote origin --branch main`.
+
+## Fork CI (keep-list)
+
+Upstream `ci.yaml` orchestrates 96-core Linux, Windows, macOS, nix, docker,
+and docs lanes. This fork does not have those runners — PRs sat queued on
+`ubuntu-latest-96-core` indefinitely.
+
+Do **not** patch `ci.yaml` (upstream rewrites it weekly). Instead:
+
+- Additive workflow: `.github/workflows/fork-ci.yml` (ruff + Linux pytest on
+  `ubuntu-latest`). No-op on `NousResearch/hermes-agent`.
+- GitHub-side disable of every other workflow, applied by
+  `scripts/fork_ci_apply.sh` (idempotent; re-run after each upstream sync
+  because GitHub auto-enables newly added workflow files).
+
+```bash
+scripts/fork_ci_apply.sh
+```
+
+Keep-list files: `fork-ci.yml`, `scripts/fork_ci_apply.sh`. Sync conflict
+surface is zero against `ci.yaml`.
+
+## Documentation verification
+
+```bash
+test -f FORK.md && rg -F 'FORK.md' AGENTS.md && git diff --check
+```
+
+## Recheck prod immediately before landing a sync
+
+Record `git rev-parse fork/prod` at sync start. Immediately before the final
+push/review handoff, from the clean sync worktree run:
+
+```bash
+python3 scripts/check_sync_prod_tip.py --baseline <recorded-prod-sha>
+python3 scripts/check_fork_features.py
+```
+
+The check fetches `fork/prod` again. One new linear commit is cherry-picked
+onto the sync branch when clean; an already represented patch is a no-op.
+A conflict is aborted without changing the sync tip. Multiple commits or a
+rebased prod tip stop for review of the new delta, not another full re-port.
+After absorption, rerun focused tests and record the new prod SHA. Repeat the
+check immediately before the coordinator lands the PR if prod moved again.
+The script never pushes; it does not eliminate the final fetch-to-merge race,
+so the coordinator must recheck at merge time too. Never force-push prod.
+
+## Assert the running release
+
+`hermes converge status` prints `checkout_sha`, `live_sha`, `target_sha`, and
+`match` independently of the scheduler's action/reason (a busy skip or a
+restart opt-out does not prove the runtime is current). For release verification:
+
+```bash
+hermes converge status --assert-current
+```
+
+This read-only assertion exits non-zero if either SHA is unknown or does not
+match the pin/configured tracking tip. It does not fetch or recycle gateways;
+refresh the configured tracking ref before checking an unpinned release.
+An explicit `hermes update --channel stable` selects the release feed for that
+run; git `--remote`/`--branch` selectors and `--sha` select the git target.

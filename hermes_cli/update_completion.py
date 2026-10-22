@@ -411,7 +411,9 @@ def _complete_selected(request: dict) -> bool:
             gateway_mode=request["gateway_mode"], pre_update_snapshot_id=request["snapshot_id"],
             pre_update_version=request["pre_update_version"],
             completion_message=request.get("completion_message"),
-            announce=None if request.get("completion_message") else "\n✓ Code updated!",
+            # The banner follows the receipt in _finish. Printing it here reported
+            # success while maintenance and the stamp were still ahead.
+            announce=None,
             followups=followups, before_build=lambda: _resume_paused_before_build(request))
     except (Exception, SystemExit) as exc:  # health: allow BLE001 -- e.g. the shared update lock refused the tail
         reason = str(exc) or type(exc).__name__
@@ -538,6 +540,10 @@ def _finish(request: dict, result_path: Path) -> int:
             _write_gateway_update_exit_code(False)
         if not terminal_receipt:
             code = code or 1  # the parent settles a lost result (settle_lost_completion)
+        # The banner follows the receipt. Printing it from the product build
+        # reported success while maintenance and the stamp were still ahead.
+        if code == 0 and terminal_receipt and not request.get("completion_message"):
+            print("\n✓ Code updated!")
         _write_json(result_path, {
             "schema": 1, "update_id": request["receipt"]["update_id"], "exit_code": code,
             "receipt": terminal_receipt, "windows_resume": request["windows_resume"],

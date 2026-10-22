@@ -3439,6 +3439,7 @@ export const esOverrides = {
     pause: 'Pausar cron',
     resumeTitle: 'Reanudar',
     pauseTitle: 'Pausar',
+    pauseReasonPrompt: '¿Por qué está en pausa este trabajo?',
     triggerNow: 'Ejecutar ahora',
     edit: 'Editar cron',
     deleteTitle: '¿Eliminar tarea cron?',

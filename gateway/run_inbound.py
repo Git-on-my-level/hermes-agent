@@ -756,6 +756,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return _result
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
+        if not self._draining:
+            await self._auto_start_goal_for_inbound_event(event)
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
             return None
 
@@ -1325,6 +1327,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
                 if _consumed:
                     return _consumer_reply
+            await self._auto_start_goal_for_inbound_event(event)
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
@@ -1343,6 +1346,22 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            # The turn handler already blanks a silent reply. This catches a handler that
+            # returned the raw text (a test double, or a path that skipped the inner filter)
+            # so an internal note-plus-marker never reaches adapter.send. The terminal turn's
+            # flag, when the handler set it, wins over the opener.
+            _silence_internal = getattr(event, "_silence_internal", is_internal)
+            if _silence_internal and isinstance(_agent_result, str):
+                from gateway.response_filters import (
+                    is_autonomous_silence_response, is_intentional_silence_response,
+                )
+                if is_autonomous_silence_response(_agent_result):
+                    if not is_intentional_silence_response(_agent_result):
+                        logger.info(
+                            "Suppressing internal reply under autonomous silence rule: session=%s",
+                            _quick_key or "unknown",
+                        )
+                    _agent_result = ""
             return _agent_result
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,

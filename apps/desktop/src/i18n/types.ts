@@ -2608,6 +2608,7 @@ catalog: CatalogTranslations
     pause: string
     resumeTitle: string
     pauseTitle: string
+    pauseReasonPrompt: string
     triggerNow: string
     edit: string
     deleteTitle: string

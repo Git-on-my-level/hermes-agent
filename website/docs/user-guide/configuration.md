@@ -1027,6 +1027,8 @@ compression:
   proactive_prune_tokens: 0                         # Opt-in tokens trigger for the no-LLM tool-result prune (0 = off; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
+  latency_pressure_threshold_seconds: 0             # Opt-in compaction trigger on observed slowness (0 = off; see below)
+  latency_pressure_min_context_tokens: 0            # Real prompt tokens a call must carry for its latency sample to count (0 = no floor)
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:
@@ -1069,6 +1071,8 @@ The value is the **first rung** of an escalating ladder, not a fixed interval: c
 `idle_compact_after_seconds` is an **opt-in, time-based** trigger that complements the size-based `threshold`. Default `0` (disabled). When set above 0, a session that resumes after at least that many seconds of inactivity compacts its accumulated history up front, before the first reply — so a long-lived thread (e.g. a Telegram conversation you come back to hours later) doesn't re-read its full stale context on every subsequent turn. It never fires when the context is already at or below the post-compression target (`threshold × target_ratio`), and it honors the same failure-cooldown, anti-thrash, and per-session lock guards as every automatic compaction. Example: `idle_compact_after_seconds: 1800` compacts after 30 minutes idle.
 
 `proactive_prune_tokens` enables a deterministic, no-LLM prune of old tool-result payloads that runs independently of `threshold`. On large-window models the `threshold` compaction (≈50% of the window) rarely fires, so bulky tool outputs (terminal dumps, file reads, web extracts) ride along in history and get re-sent on every subsequent turn. When re-sent history exceeds `proactive_prune_tokens` (default `0` = off; try `48000` to enable), the prune dedupes identical results and summarizes older oversized tool results, protecting the most recent `protect_last_n` messages and never calling the model. Tool-call arguments are execution records and are never rewritten by pruning; the summary model has a separate bounded serializer for copies included in its prompt. The pressure pass likewise demotes tool-result bodies only. During full semantic compaction the carried head/tail rows keep those tool-result demotions (so an oversized tail can still compress), while tool-call arguments stay byte-exact. The opt-in proactive prune still commits eligible tool-result-body demotions, so `proactive_prune_min_reclaim_tokens` (default `4096`) keeps those cache-breaking commits episodic; `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) sets the size below which a tool result is left untouched. This runs only under the built-in `compressor` engine; other context engines inherit a no-op.
+
+`latency_pressure_threshold_seconds` (default `0` = off) is a second, independent opt-in trigger for full compaction: **observed slowness**. Some serving setups crawl long before the token `threshold` fires — a huge effective context behind a provider whose advertised context window (and therefore the ratio threshold) is larger than what the endpoint serves comfortably. When set (e.g. `120`), the compressor keeps a rolling ~10-minute window of completed real-usage API calls (latency + real prompt count, minimum 3 samples); if the median sample latency reaches the threshold, the next turn-start preflight compacts even though `threshold` has not fired. Two guards keep this from misfiring: `latency_pressure_min_context_tokens` (default `0` = no floor) restricts samples to calls carrying at least that many real prompt tokens (so small-call latency noise cannot trigger it), and a model/provider switch clears the samples. Use it when a session's provider calls grow steadily slower while `/context` shows the token gauge far below the compaction line.
 
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.
@@ -1185,6 +1189,35 @@ re-run `hermes gateway install` so the unit picks up the new budget. Otherwise s
 gateway in the middle of its drain. launchd caps its stop timeout at 60 s, so on macOS the drain
 is limited to what fits inside that.
 :::
+
+## Gateway Service PATH
+
+The launchd plist (macOS) and systemd unit (Linux) are generated with a
+deterministic service `PATH`: `~/.local/bin`, the package-manager dirs that
+exist on the host (`/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`,
+`/usr/local/sbin` on macOS), any configured extras, managed Node dirs, and the
+system dirs last. The invoking shell's `PATH` is deliberately ignored, so
+regenerating a service definition from a cron job, SSH shell, or the
+`ai.hermes.converge` updater produces the same `PATH` every time.
+
+On macOS, entries present in the installed plist's `PATH` that still exist on
+disk are carried forward when regenerating, so an update can never shrink the
+service `PATH` (the systemd unit never carried caller `PATH`, so its
+regeneration is already stable without carry-forward).
+
+To add a non-standard directory, set `gateway.service_path_extra` instead of
+hand-editing the plist or unit:
+
+```yaml
+gateway:
+  service_path_extra:
+    - /opt/my-tools/bin
+    - ~/bin
+```
+
+`gateway install --reset-service-path` reinstalls the macOS service with a
+`PATH` derived purely from the current host state, dropping carried-forward
+entries.
 
 ## Session Stall Watchdog
 
@@ -1335,10 +1368,13 @@ When a standing goal is active, Hermes judges whether each assistant response sa
 
 ```yaml
 goals:
+  # Gateway only: ordinary external messages start or correct automatic goals.
+  # Slash commands and synthetic continuation turns are excluded. Default: false.
+  auto_start: false
   max_turns: 20   # Max continuation turns before Hermes auto-pauses the goal (default: 20)
 ```
 
-`max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
+`auto_start` is an opt-in gateway policy. With it enabled, ordinary external user messages start or correct automatic standing goals, including corrections during a running turn. Explicit `/goal` objectives and paused goals are preserved; slash commands, goal kickoffs and synthetic continuation events are excluded. It is intentionally off by default because even short questions invoke the goal judge after the response. `max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
 
 ### API Timeouts
 

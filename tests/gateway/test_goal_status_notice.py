@@ -80,3 +80,49 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["important", "all", "off"])
+@pytest.mark.parametrize("level", ["important", "info", "debug"])
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_goal_notice_modes_route_levels_and_notify(tmp_path, monkeypatch, mode, level, deferred, caplog):
+    """Read the real YAML setting and route through direct or post-delivery sends."""
+    import logging
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(f"goals:\n  notices: {mode}\n", encoding="utf-8")
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="channel", thread_id="thread", user_id="user")
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    message = f"goal notice {mode}/{level}"
+    send = runner._defer_goal_status_notice_after_delivery if deferred else runner._send_goal_status_notice
+    await send(source, message, notice_level=level)
+    expected_send = level == "important" or mode == "all" or (mode == "important" and level == "info")
+    if deferred:
+        assert adapter.calls == []
+        assert bool(adapter.callbacks) == expected_send
+        for _, callback in adapter.callbacks.values():
+            await callback()
+    assert len(adapter.calls) == int(expected_send)
+    if expected_send:
+        assert adapter.calls[0]["metadata"] == {"thread_id": "thread", **({"notify": True} if level == "important" else {})}
+    else:
+        assert message in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_default_goal_notice_mode_is_important(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = {"goals": {"max_turns": 3}}
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="channel", user_id="user")
+    await runner._send_goal_status_notice(source, "debug", notice_level="debug")
+    await runner._send_goal_status_notice(source, "info", notice_level="info")
+    await runner._send_goal_status_notice(source, "important", notice_level="important")
+    assert [call["content"] for call in adapter.calls] == ["info", "important"]
+    assert adapter.calls[0]["metadata"] == {}
+    assert adapter.calls[1]["metadata"] == {"notify": True}

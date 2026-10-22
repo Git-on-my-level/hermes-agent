@@ -50,6 +50,15 @@ def completion(tmp_path, monkeypatch):
     shutil.copytree(ROOT / "scripts/build", source / "scripts/build",
                     ignore=shutil.ignore_patterns("__pycache__"))
     _put(source, "pyproject.toml", '[project]\nname="takeover-fixture"\nversion="2.0"\n')
+    # A successful update now publishes a resource-complete serving archive.
+    shutil.copytree(ROOT / "scripts/bundles", source / "scripts/bundles",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(ROOT / "locales", source / "locales")
+    _put(source, "skills/fixture/SKILL.md", "Fixture serving skill\n")
+    _put(source, "uv.lock", "version = 1\n")
+    shutil.copy2(ROOT / ".gitignore", source / ".gitignore")
+    with (source / ".gitignore").open("a", encoding="utf-8") as handle:
+        handle.write("\n/build-environment.json\n/desktop-build.json\n/desktop-maintenance.json\n/restarted-plan.json\n/resumed-token.json\n")
     # Successful completion stamps the selected checkout's own git identity.
     git_env = {**os.environ, "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
@@ -64,7 +73,7 @@ def completion(tmp_path, monkeypatch):
     _put(tmp_path / "store", "facts.json", json.dumps({"packages": {"python": {"entry": "python"}}}))
     # A real venv: isolated build children (icon generation, npm lifecycle scripts) run on the
     # selected generation's own interpreter, not on the store Python that hosts the completion.
-    generation = install_state_dir(source) / "environments/prepared"
+    generation = install_state_dir(source) / "environments/prepared/venv"
     subprocess.run([str(python), "-m", "venv", "--without-pip", str(generation)],
                    check=True, capture_output=True)
     site = site_packages(generation)
@@ -75,8 +84,12 @@ def completion(tmp_path, monkeypatch):
     assert dependency_sites
     _put(site, "dependencies.pth", "\n".join(dependency_sites) + "\n")
     _put(site, "selected_dependency.py", "VALUE = 'selected generation'\n")
-    _put(runtime_facts_path(source).parent, "facts.json", json.dumps({
-        "packages": {"venv": {"environment": str(generation)}}}))
+    from pm.packages import Venv
+    from pm.workspace import _copy_core_inputs
+    _copy_core_inputs(source, generation.parent / "workspace")
+    _put(runtime_facts_path(source).parent, "facts.json", json.dumps({"schema": 1,
+        "packages": {"venv": {"environment": str(generation), "extras": [],
+                              "stamp": Venv(source).expected_stamp([], plugin_dirs=[])}}}))
     _put(home / ".hermes", "config.yaml",
          f"_config_version: {DEFAULT_CONFIG['_config_version'] - 1}\nmodel:\n  default: retained-model\n")
     env = {key: value for key, value in os.environ.items()
@@ -266,12 +279,12 @@ def test_failure_preserves_original_receipt_before_build(completion, fault):
     elif fault == "receipt":
         message = "cannot accept prepared receipt"
     request["receipt"]["steps"][0]["detail"] = "日本 café"
-    context.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8-sig")
+    context.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8-sig")  # windows-footgun: ok — deliberate BOM exercises the completion reader
     before = context.read_bytes()
     child = run(fault)
     assert child.returncode == 1, child.stdout + child.stderr
     assert message in child.stderr
-    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding='utf-8-sig'))
     assert receipt["update_id"] == request["update_id"]
     assert receipt["started_at"] == request["receipt"]["started_at"]
     assert receipt["pre_update"] == request["receipt"]["pre_update"]
@@ -280,8 +293,8 @@ def test_failure_preserves_original_receipt_before_build(completion, fault):
         assert receipt["pm_venv_rebuild"] == request["pm_receipt"]["venv_rebuild"]
     assert receipt["outcome"] == "failed"
     assert receipt["exit_code"] == child.returncode
-    assert json.loads(result.read_text())["receipt_handled"] is True
-    assert (home / ".update_exit_code").read_text().strip() == "1"
+    assert json.loads(result.read_text(encoding='utf-8-sig'))["receipt_handled"] is True
+    assert (home / ".update_exit_code").read_text(encoding='utf-8-sig').strip() == "1"
     assert context.read_bytes() == before
     assert not (source / "build-environment.json").exists()
 
@@ -365,10 +378,10 @@ def test_missing_desktop_observation_uses_installed_products(completion, capture
     before = context.read_bytes()
     child = run()
     assert child.returncode == 0, child.stdout + child.stderr
-    assert json.loads((source / "desktop-build.json").read_text()) is expected
-    assert json.loads((source / "desktop-maintenance.json").read_text()) is expected
+    assert json.loads((source / "desktop-build.json").read_text(encoding='utf-8-sig')) is expected
+    assert json.loads((source / "desktop-maintenance.json").read_text(encoding='utf-8-sig')) is expected
     assert context.read_bytes() == before
-    assert json.loads(result.read_text())["receipt_handled"] is True
+    assert json.loads(result.read_text(encoding='utf-8-sig'))["receipt_handled"] is True
 
 
 def _npm_graph(source):
@@ -444,33 +457,33 @@ def test_selected_child_builds_and_finalizes_under_parent_lock(completion):
         assert child.returncode == 0, child.stdout + child.stderr
         assert lock.path.read_bytes() == marker, "completion must not release its parent's lock"
     built = subprocess.run([node, str(source / "ui-tui/dist/entry.js")],
-                           capture_output=True, text=True, check=True)
+                           capture_output=True, text=True, check=True, encoding='utf-8')
     assert built.stdout.strip() == "compiled local graph"
     assert (source / "hermes_cli/web_dist/index.html").is_file()
-    assert any("compiled local graph" in p.read_text() for p in (source / "hermes_cli/web_dist/assets").glob("*.js"))
+    assert any("compiled local graph" in p.read_text(encoding='utf-8-sig') for p in (source / "hermes_cli/web_dist/assets").glob("*.js"))
     assert (source / "node_modules/.hermes-node-deps").is_file()
-    environment = json.loads((source / "build-environment.json").read_text())
+    environment = json.loads((source / "build-environment.json").read_text(encoding='utf-8-sig'))
     assert "repairing the recorded dependency environment" not in child.stderr
-    npm_python = json.loads((source / "npm-python.json").read_text())
+    npm_python = json.loads((source / "npm-python.json").read_text(encoding='utf-8-sig'))
     assert npm_python["python"] == npm_python["configured"] == environment["python"]
     assert environment["parent"] == os.getpid()
     assert environment["old_module"] is False
     assert environment["argv"] == [str(source / "hermes"), "update"]
     assert context.read_bytes() == before
-    assert json.loads((source / "restarted-plan.json").read_text())["expected_sha"] == "old-sha"
-    assert json.loads((source / "resumed-token.json").read_text()) == request["windows_resume"]
-    config = hermes_yaml.safe_load((home / "config.yaml").read_text())
+    assert json.loads((source / "restarted-plan.json").read_text(encoding='utf-8-sig'))["expected_sha"] == "old-sha"
+    assert json.loads((source / "resumed-token.json").read_text(encoding='utf-8-sig')) == request["windows_resume"]
+    config = hermes_yaml.safe_load((home / "config.yaml").read_text(encoding='utf-8-sig'))
     assert config["_config_version"] == DEFAULT_CONFIG["_config_version"], child.stdout + child.stderr
     assert config["model"]["default"] == "retained-model"
-    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding='utf-8-sig'))
     assert receipt["outcome"] == "success"
     assert receipt["update_id"] == request["update_id"]
     assert receipt["pre_update"] == request["receipt"]["pre_update"]
     assert receipt["steps"][0] == request["receipt"]["steps"][0]
     assert receipt["pm_venv_rebuild"] == request["pm_receipt"]["venv_rebuild"]
-    assert json.loads(result.read_text()) == {"resume_handled": True, "receipt_handled": True}
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
-    assert json.loads((source / "install-stamp.json").read_text())["commit"] == head
+    assert json.loads(result.read_text(encoding='utf-8-sig')) == {"resume_handled": True, "receipt_handled": True}
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True, encoding='utf-8').strip()
+    assert json.loads((source / "install-stamp.json").read_text(encoding='utf-8-sig'))["commit"] == head
 
 
 @pytest.mark.platforms("posix")
@@ -526,4 +539,4 @@ def test_pre_pull_restart_enters_current_cli_with_original_arguments(completion,
     output = child.stdout + child.stderr
     assert "usage:" in output and "update" in output
     assert not (source / "build-environment.json").exists()
-    assert json.loads(result.read_text()) == {"resume_handled": True, "receipt_handled": True}
+    assert json.loads(result.read_text(encoding='utf-8-sig')) == {"resume_handled": True, "receipt_handled": True}

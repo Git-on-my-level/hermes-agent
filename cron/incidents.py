@@ -93,6 +93,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     # Ledgers created before the alert-once gate lack ``alerted_at``; add it in place.
     add_column_if_missing(conn, "cron_incidents", "alerted_at", "alerted_at TEXT")
+    add_column_if_missing(conn, "cron_incidents", "resolution_reason", "resolution_reason TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job "
         "ON cron_incidents(job_id)"
@@ -155,15 +156,20 @@ def _classify_failure_type(error: str) -> str:
 
 def upsert_incident(
     job_id: str, error: str, *, job_name: Optional[str] = None, failure_type: Optional[str] = None,
-    output_file: Optional[str] = None,
+    output_file: Optional[str] = None, signature: Optional[str] = None,
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``; returns ``(incident_id,
     is_new)``. An existing row for the signature refreshes
     ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
-    ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
+    ``detected`` so the operator is alerted once more. A changed error text mints a new incident.
+
+    ``signature`` pins the dedup key (and therefore the incident id suffix) instead of hashing the
+    error text. Standing conditions such as a deleted workdir use a stable literal so one incident
+    covers every tick of the same condition.
+    """
     job_id = str(job_id or "")
-    sig = _error_signature(job_id, error)
+    sig = str(signature).strip() if signature else _error_signature(job_id, error)
     stored_error = _redact_error(error)
     incident_id = _incident_id(job_id, sig)
     now = _hermes_now().isoformat()
@@ -201,15 +207,27 @@ def set_incident_state(incident_id: str, state: str) -> bool:
     """Transition an incident's lifecycle state; return whether it changed. ``closed`` is terminal
     for that signature (re-open happens by a changed error minting a NEW incident). Unknown states
     are rejected (no-op, ``False``). ``alerted`` also stamps ``alerted_at`` — every time, so the
-    cooldown reminder (see ``cron.scheduler._upsert_incident_for_failure``) restarts its window."""
+    cooldown reminder (see ``cron.scheduler._upsert_incident_for_failure``) restarts its window.
+
+    A ``resolved`` row that already carries ``resolution_reason`` (job removed, retention sweep,
+    or a successful final run) does not walk back to ``alerted`` or ``detected`` here. A later
+    failure of the same signature reopens through ``upsert_incident``, which is the occurrence
+    that is allowed to.
+    """
     if state not in INCIDENT_STATES:
         return False
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT state FROM cron_incidents WHERE id=?", (incident_id,)
+            "SELECT state, resolution_reason FROM cron_incidents WHERE id=?", (incident_id,)
         ).fetchone()
         if row is None or row["state"] == "closed":
+            return False
+        if (
+            row["state"] == "resolved"
+            and str(row["resolution_reason"] or "").strip()
+            and state in {"alerted", "detected"}
+        ):
             return False
         if state == "alerted":
             conn.execute(
@@ -237,6 +255,55 @@ def set_incident_state(incident_id: str, state: str) -> bool:
 def ack_incident(incident_id: str) -> bool:
     """Acknowledge (close) an incident; ``False`` when missing or already closed."""
     return set_incident_state(incident_id, "closed")
+
+
+_OPEN_STATES = ("detected", "alerted")
+
+
+def resolve_open_incidents(job_id: str, reason: str) -> int:
+    """Mark every open incident for ``job_id`` ``resolved`` with ``resolution_reason``.
+
+    Operator ``closed`` rows stay closed. Already-``resolved`` rows are left alone so a later
+    recovery does not overwrite an earlier reason. Returns how many rows changed.
+    """
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE cron_incidents
+               SET state='resolved', closed_at=?, resolution_reason=?
+               WHERE job_id=? AND state IN ('detected', 'alerted')""",
+            (now, str(reason or "")[:200], str(job_id or "")),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def _ledger_exists() -> bool:
+    """True when the shared executions DB is already on disk. Read-only callers (doctor, a prune
+    plan) must not create it just to discover there is nothing to report."""
+    return _db_path().is_file()
+
+
+def list_open_orphan_incidents(known_job_ids) -> List[Dict[str, Any]]:
+    """Open incidents whose ``job_id`` is not in ``known_job_ids``. Empty when the ledger is absent."""
+    if not _ledger_exists():
+        return []
+    known = {str(job_id) for job_id in known_job_ids}
+    orphans = []
+    for row in list_incidents():
+        if row.get("state") not in _OPEN_STATES:
+            continue
+        if str(row.get("job_id") or "") not in known:
+            orphans.append(row)
+    return orphans
+
+
+def resolve_orphan_incidents(known_job_ids, reason: str) -> int:
+    """Resolve open incidents whose job no longer exists. Returns how many rows changed."""
+    orphans = list_open_orphan_incidents(known_job_ids)
+    changed = 0
+    for row in orphans:
+        changed += resolve_open_incidents(str(row.get("job_id") or ""), reason)
+    return changed
 
 
 def close_incidents_for_recovered_job(job_id: str) -> int:

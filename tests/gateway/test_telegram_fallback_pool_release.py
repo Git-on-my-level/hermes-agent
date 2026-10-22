@@ -138,11 +138,10 @@ async def test_failed_primary_pool_is_discarded_and_closed(monkeypatch):
         response = await transport.handle_async_request(_telegram_request())
         assert response.status_code == 200
         # IPv4-first (#87015): .220 succeeds on the first try, so the
-        # dual-stack hostname pool is never opened and never discarded.
-        # Instances: 1 primary (unused this request) + 1 fallback (.220).
-        assert len(instances) == 2
+        # dual-stack hostname pool is never opened. The primary pool is not
+        # constructed until that hostname path is needed.
+        assert len(instances) == 1
         assert not instances[0].closed
-        assert not instances[1].closed
         assert transport._sticky_ip == "149.154.167.220"
     finally:
         await transport.aclose()
@@ -164,6 +163,9 @@ def test_pool_default_limits_applied_when_caller_omits(monkeypatch):
     )
 
     transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+    import asyncio
+
+    asyncio.run(transport._ensure_primary())
     limits = kwargs_log[0]["limits"]
     assert isinstance(limits, httpx.Limits)
     assert limits is transport._POOL_LIMITS

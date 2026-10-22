@@ -1,0 +1,322 @@
+"""Policy tests for idle/after-turn SHA converge (no fleetctl)."""
+from __future__ import annotations
+
+from hermes_cli.update_converge import (
+    ConvergeSettings,
+    decide_converge,
+    load_converge_settings,
+    normalize_pin,
+    pin_age_seconds,
+    prefixes_match,
+    read_pin_file,
+)
+
+PIN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+PIN2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+SHORT = "aaaaaaaa"
+
+
+def _s(
+    enabled: bool = True,
+    pin: str = PIN,
+    interval: int = 1800,
+    busy_sla: float = 21600.0,
+    skip_gateway_restart: bool = False,
+) -> ConvergeSettings:
+    return ConvergeSettings(
+        enabled=enabled, pin=pin, interval=interval,
+        busy_sla=busy_sla, skip_gateway_restart=skip_gateway_restart,
+    )
+
+
+def test_normalize_pin_rejects_garbage():
+    assert normalize_pin("not-a-sha") == ""
+    assert normalize_pin("deadbeef") == "deadbeef"
+    assert normalize_pin("SHA:DEADBEEF\n") == "deadbeef"
+
+
+def test_prefixes_match_short_and_long():
+    assert prefixes_match(SHORT, PIN)
+    assert not prefixes_match(PIN, PIN2)
+
+
+def test_skip_when_disabled_or_unpinned():
+    d = decide_converge(settings=_s(enabled=False), checkout_sha="1", live_sha="", dirty=False, busy=False, pin_age_s=0)
+    assert d.action == "skip" and d.reason == "disabled"
+
+
+def test_empty_pin_follows_channel_tip():
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=False, pin_age_s=0)
+    assert d.action == "update" and d.reason == "channel_tip"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=True, busy=False, pin_age_s=0)
+    assert d.action == "skip" and d.reason == "dirty_tree"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=True, pin_age_s=10)
+    assert d.action == "skip" and d.reason == "busy"
+    d = decide_converge(settings=_s(pin=""), checkout_sha="1", live_sha="", dirty=False, busy=True, pin_age_s=21600)
+    assert d.action == "update" and d.reason == "channel_tip"
+
+
+def test_empty_pin_skips_when_already_on_tip():
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
+def test_empty_pin_restarts_stale_runtime():
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN2, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN,
+    )
+    assert d.action == "restart" and d.reason == "stale_runtime"
+
+
+def test_already_current_skips():
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
+def test_skip_restart_treats_checkout_match_as_current():
+    d = decide_converge(
+        settings=_s(skip_gateway_restart=True),
+        checkout_sha=PIN, live_sha="cccccccccccccccccccccccccccccccccccccccc",
+        dirty=False, busy=False, pin_age_s=0,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
+def test_stale_runtime_restarts():
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN, live_sha=PIN2, dirty=False, busy=False, pin_age_s=0,
+    )
+    assert d.action == "restart" and d.reason == "stale_runtime"
+
+
+def test_behind_updates():
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN2, live_sha=PIN2, dirty=False, busy=False, pin_age_s=0,
+    )
+    assert d.action == "update" and d.reason == "checkout_behind_pin"
+
+
+def test_dirty_blocks_update_not_restart():
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN2, live_sha=PIN2, dirty=True, busy=False, pin_age_s=0,
+    )
+    assert d.action == "skip" and d.reason == "dirty_tree"
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN, live_sha=PIN2, dirty=True, busy=False, pin_age_s=0,
+    )
+    assert d.action == "restart"
+
+
+def test_busy_skips_until_sla():
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN2, live_sha=PIN2, dirty=False, busy=True, pin_age_s=10,
+    )
+    assert d.action == "skip" and d.reason == "busy"
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN2, live_sha=PIN2, dirty=False, busy=True, pin_age_s=21600,
+    )
+    assert d.action == "update"
+
+
+def test_read_pin_file_and_config(tmp_path, monkeypatch):
+    pin_path = tmp_path / "updates.pin"
+    pin_path.write_text(PIN + "\n", encoding="utf-8")
+    assert read_pin_file(pin_path) == PIN
+    s = load_converge_settings({
+        "updates": {
+            "converge": True,
+            "pin": PIN2,
+            "converge_interval": 120,
+            "converge_busy_sla": 60,
+            "skip_gateway_restart": True,
+        }
+    })
+    assert s.enabled and s.pin == PIN2 and s.interval == 120 and s.busy_sla == 60 and s.skip_gateway_restart
+
+
+def test_pin_age_resets_on_new_pin(tmp_path):
+    first = pin_age_seconds(PIN, home=tmp_path, now=1000.0)
+    assert first == 0.0
+    aged = pin_age_seconds(PIN, home=tmp_path, now=1300.0)
+    assert aged == 300.0
+    reset = pin_age_seconds(PIN2, home=tmp_path, now=1400.0)
+    assert reset == 0.0
+
+
+def test_pin_age_channel_fallback_key_accumulates(tmp_path):
+    assert pin_age_seconds("channel", home=tmp_path, now=1000.0) == 0.0
+    assert pin_age_seconds("channel", home=tmp_path, now=1600.0) == 600.0
+
+
+def test_channel_mode_sla_clock_keyed_by_tip(tmp_path, monkeypatch):
+    from hermes_cli import update_converge as uc
+
+    monkeypatch.setattr(uc, "_state_path", lambda home=None: tmp_path / "converge_state.json")
+    tips = iter([PIN, PIN, PIN2])
+    clock = iter([1000.0, 1000.0 + 7200.0, 1000.0 + 7300.0])
+    monkeypatch.setattr(uc, "channel_tip_sha", lambda *a, **k: next(tips))
+    monkeypatch.setattr(uc.time, "time", lambda: next(clock))
+    monkeypatch.setattr(uc, "checkout_sha", lambda root: SHORT[:7] + "0" * 33)
+    monkeypatch.setattr(uc, "live_code_sha", lambda: "")
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda root: False)
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: True)
+    settings = _s(pin="", busy_sla=3600)
+    assert uc.decide_from_live(tmp_path, settings).reason == "busy"
+    # Same tip still busy after the SLA: converge proceeds instead of skipping forever.
+    assert uc.decide_from_live(tmp_path, settings).reason != "busy"
+    # A new tip restarts the grace period.
+    assert uc.decide_from_live(tmp_path, settings).reason == "busy"
+
+
+def test_legacy_channel_record_does_not_expire_busy_sla(tmp_path, monkeypatch):
+    import json
+    from hermes_cli import update_converge as uc
+
+    state = tmp_path / "converge_state.json"
+    state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}), encoding='utf-8')
+    monkeypatch.setattr(uc, "_state_path", lambda home=None: state)
+    monkeypatch.setattr(uc.time, "time", lambda: 100000.0)
+    monkeypatch.setattr(uc, "checkout_sha", lambda root: PIN)
+    monkeypatch.setattr(uc, "live_code_sha", lambda: "")
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda root: False)
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: True)
+    settings = _s(pin="", busy_sla=3600)
+    for tip in ("", PIN2):
+        state.write_text(json.dumps({"pin": "channel", "first_seen": 0.0}), encoding='utf-8')
+        monkeypatch.setattr(uc, "channel_tip_sha", lambda *a, _t=tip, **k: _t)
+        decision = uc.decide_from_live(tmp_path, settings)
+        assert (decision.action, decision.reason) == ("skip", "busy")
+
+
+def test_linux_timer_unit_text():
+    from hermes_cli.update_converge import generate_converge_systemd_timer
+
+    text = generate_converge_systemd_timer(_s(interval=120))
+    assert "OnUnitActiveSec=120" in text
+    assert "Unit=hermes-converge.service" in text
+    assert "WantedBy=timers.target" in text
+
+
+def test_linux_service_runs_converge_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.update_converge import generate_converge_systemd_service
+
+    text = generate_converge_systemd_service(_s())
+    assert "update --converge -y" in text
+    assert "Type=oneshot" in text
+    assert f"HERMES_HOME={tmp_path}" in text
+
+
+def test_failed_converge_is_alerted_even_when_busy(monkeypatch, caplog, capsys):
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt
+    import sys
+    main = SimpleNamespace(PROJECT_ROOT=__import__("pathlib").Path("/tmp/mock-hermes-source"), cmd_update=lambda a: None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "busy"))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "failed"})
+    monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(AssertionError("busy tick updated")))
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert "unfinished failed update" in caplog.text
+    assert "unfinished failed update" in capsys.readouterr().err
+
+
+def test_converge_nonzero_exit_alerts_and_clears_drain(monkeypatch, caplog):
+    import pytest
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt
+    import sys
+    main = SimpleNamespace(PROJECT_ROOT=__import__("pathlib").Path("/tmp/mock-hermes-source"), cmd_update=lambda a: None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
+    from gateway import drain_control
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("update", "behind", PIN))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: None)
+    monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(SystemExit(1)))
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
+    cleared = []
+    monkeypatch.setattr(drain_control, "clear_update_converge_drain", lambda: cleared.append(True))
+    with pytest.raises(SystemExit):
+        uc.cmd_converge_tick(SimpleNamespace())
+    assert cleared == [True]
+    assert "Converge update failed" in caplog.text
+
+
+def test_idle_tick_finishes_pending_tail_even_if_code_already_current(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    called = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "success"})
+    pending = tmp_path / "pending"
+    pending.touch()
+    monkeypatch.setattr(venv_sync, "completion_pending_path", lambda r: pending)
+    monkeypatch.setattr(venv_sync, "_tree_matches_completed_stamp", lambda r: False)
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert len(called) == 1 and called[0].sha == PIN
+
+
+def test_idle_tick_skips_leftover_pending_when_tree_already_matches_stamp(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    called = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
+    monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
+    monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
+    monkeypatch.setattr(uc, "_mark_planned_drain", lambda: (_ for _ in ()).throw(AssertionError("leftover pending drained")))
+    monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "success"})
+    pending = tmp_path / "pending"
+    pending.touch()
+    monkeypatch.setattr(venv_sync, "completion_pending_path", lambda r: pending)
+    monkeypatch.setattr(venv_sync, "_tree_matches_completed_stamp", lambda r: True)
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert called == []
+
+
+def test_sticky_completion_backoff_and_receipt_alert_survive_repeated_ticks(tmp_path, monkeypatch, caplog):
+    import sys
+    from types import SimpleNamespace
+    from hermes_cli import update_converge as uc, update_receipt, venv_sync
+    from gateway import drain_control
+    calls, drains = [], []
+    monkeypatch.setitem(sys.modules,'hermes_cli.main',SimpleNamespace(PROJECT_ROOT=tmp_path,cmd_update=lambda a:calls.append(a)))
+    monkeypatch.setattr(uc,'load_converge_settings',lambda:_s())
+    monkeypatch.setattr(uc,'decide_from_live',lambda *a:uc.ConvergeDecision('skip','already_current',PIN))
+    monkeypatch.setattr(uc,'gateway_is_busy',lambda:False)
+    monkeypatch.setattr(uc,'checkout_is_dirty',lambda r:False)
+    monkeypatch.setattr(uc,'_mark_planned_drain',lambda:drains.append(True))
+    monkeypatch.setattr(drain_control,'clear_update_converge_drain',lambda:None)
+    monkeypatch.setattr(update_receipt,'read_latest_receipt',lambda:{'outcome':'partial','update_id':'same-receipt'})
+    pending = tmp_path/'pending'
+    pending.touch()
+    monkeypatch.setattr(venv_sync,'completion_pending_path',lambda r:pending)
+    monkeypatch.setattr(venv_sync,'_tree_matches_completed_stamp',lambda r:False)
+    clock=[0]
+    monkeypatch.setattr(uc.time,'time',lambda:clock[0])
+    for tick in list(range(0, 20000, 1800)) + [86400, 172800]:
+        clock[0]=tick
+        uc.cmd_converge_tick(SimpleNamespace())
+    assert len(calls)==len(drains)==3
+    assert caplog.text.count('unfinished failed update')==1
+    assert caplog.text.count('completion marker remains unfinished')==1
+    pending.unlink()
+    uc.cmd_converge_tick(SimpleNamespace())
+    pending.touch()
+    uc.cmd_converge_tick(SimpleNamespace())
+    assert len(calls)==4  # A cleared obligation resets the retry budget.

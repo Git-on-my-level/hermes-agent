@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
+from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -45,6 +46,53 @@ class GatewayGoalsMixin:
             return int(goals_cfg.get("max_turns", 20) or 20)
         except Exception:
             return 20
+
+    def _auto_start_goals_enabled(self) -> bool:
+        """Whether normal external gateway messages should become standing goals.
+
+        The setting lives in the top-level config because ``GatewayConfig`` does
+        not model the generic goals block. Keep the default off: automatic Ralph
+        loops have a material token and control-flow cost.
+        """
+        try:
+            from hermes_cli.config import load_config
+
+            goals_cfg = (load_config() or {}).get("goals") or {}
+            return is_truthy_value(goals_cfg.get("auto_start"), default=False)
+        except Exception:
+            return False
+
+    async def _auto_start_goal_for_inbound_event(self, event: "MessageEvent") -> None:
+        """Start or correct an automatic goal; preserve explicit and paused goals.
+
+        Idle turns run this after command dispatch and FIFO rescue; busy turns
+        reuse it before steering or queueing. Synthetic events never reset the
+        goal they are advancing.
+        """
+        if (
+            not self._auto_start_goals_enabled()
+            or getattr(event, "_auto_start_goal_applied", False)
+            or not self._turn_is_user_authored(event)
+            or event.get_command()
+        ):
+            return
+        goal = (getattr(event, "text", "") or "").strip()
+        if not goal:
+            return
+        mgr, _session_entry = await self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return
+        state = mgr.state
+        if mgr.has_goal() and (state.source == "user" or state.status == "paused"):
+            return
+        try:
+            await self._run_in_executor_with_context(lambda: mgr.set(goal, source="auto_start"))
+            self._clear_goal_continuations(event, "auto-start")
+            # A queued busy follow-up later traverses the cold path with the same event.
+            event._auto_start_goal_applied = True
+        except Exception as exc:
+            # Failing to persist an optional goal must not reject the user's turn.
+            logger.debug("automatic goal start failed: %s", exc)
 
     async def _warm_goals_session_db(self, label: str) -> None:
         """Warm the goals SessionDB cache off-loop (best-effort): a cold cache runs the state.db
@@ -224,11 +272,32 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
-        """Send a /goal judge status line back to the originating chat/thread."""
+    def _goal_notice_is_visible(self, message: str, notice_level: Optional[str]) -> bool:
+        # /loop shares this delivery helper; only classified goal notices use goals.notices.
+        if notice_level is None or notice_level == "important":
+            return True
+        from hermes_cli.goals import _goals_setting
+
+        config = getattr(self, "config", None)
+        goals_cfg = (config.get("goals") if isinstance(config, dict) else getattr(config, "goals", None)) or {}
+        mode = goals_cfg.get("notices", _goals_setting("notices", "important"))
+        # YAML's unquoted `off` may be parsed as False.
+        mode = "off" if mode is False else str(mode).strip().lower()
+        if mode not in {"important", "all", "off"}:
+            mode = "important"
+        visible = mode == "all" or (mode == "important" and notice_level == "info")
+        if not visible:
+            logger.info("goal notice (%s): %s", notice_level, message)
+        return visible
+
+    async def _send_goal_status_notice(
+        self, source: Any, message: str, *, notice_level: Optional[str] = None,
+    ) -> None:
+        """Send a goal notice at its configured verbosity, preserving thread routing."""
+        if not self._goal_notice_is_visible(message, notice_level):
+            return
         if getattr(source, "platform", None) == Platform.LOCAL:
-            # The local adapter's send is a no-op (viewers read the event stream): main's TUI
-            # painted the verdict from ``status.update {kind: goal}``.
+            # The local adapter's send is a no-op (viewers read the event stream).
             from gateway.session_authorities import active_authority
             authority = active_authority(self)
             live = authority.sessions.get(source.chat_id) if authority is not None else None
@@ -236,31 +305,41 @@ class GatewayGoalsMixin:
                 live.event_stream.publish(source.chat_id, {"kind": "goal", "text": message},
                                           event_type="status.update")
             return
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        if notice_level is not None:
+            metadata = dict(metadata or {})
+            metadata.pop("notify", None)
+            if notice_level == "important":
+                metadata["notify"] = True
         result = await adapter.send(source.chat_id, message, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, notice_level: Optional[str] = None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
         its one-shot post-delivery callback when available, else deliver directly (never drop).
         """
+        if not self._goal_notice_is_visible(message, notice_level):
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, notice_level=notice_level)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -292,18 +371,59 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
+    @staticmethod
+    def _turn_is_user_authored(event: Any) -> bool:
+        """True for a real inbound user message; False for heartbeat ticks, goal/loop continuations
+        and internal synthetic events (those must never seed an inferred goal)."""
+        if event is None:
+            return False
+        if (getattr(event, "_heartbeat_session_id", None) or getattr(event, "internal", False)
+                or getattr(event, "_goal_kickoff", False)):
+            return False
+        text = str(getattr(event, "text", "") or "")
+        if text.startswith("[Continuing toward your standing goal") or text.startswith("[Heartbeat"):
+            return False
+        return True
+
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
+        quiet_internal: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+        ``quiet_internal``: the turn was internal and replied only with the silence marker."""
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
-        if mgr is None or not mgr.is_active():
+        if mgr is None:
+            return
+
+        # Steering for the judge: the user's own message, when this turn ran under a goal that already
+        # existed (a goal inferred from this very message was drafted from it).
+        owner_message = getattr(event, "text", None) if mgr.has_goal() and self._turn_is_user_authored(event) else None
+
+        # goals.auto_infer: a goal-less session whose reply commits to work gets an inferred goal
+        # (Muse/Dots pattern). Skipped for heartbeat / continuation / internal turns so the loop
+        # never feeds itself. Runs before the judge so this very reply gets judged against it.
+        if not mgr.has_goal() and self._turn_is_user_authored(event):
+            with suppress(Exception):
+                from hermes_cli.goals import auto_infer_enabled, maybe_infer_goal
+                if auto_infer_enabled():
+                    last_user = getattr(event, "text", None) or ""
+                    notice = await self._run_in_executor_with_context(
+                        lambda: maybe_infer_goal(mgr, last_user, final_response or ""),
+                    )
+                    if notice and source is not None:
+                        await self._defer_goal_status_notice_after_delivery(source, notice, notice_level="info")
+        if not mgr.is_active():
+            return
+        # A silent internal turn while the wait still holds reported "nothing changed": judging the
+        # bare marker reads as not-waiting, so it would clear a live barrier, spend a turn, post a
+        # status line and enqueue a continuation. A lifted barrier (the process exited) still judges.
+        if quiet_internal and await self._run_in_executor_with_context(mgr.wait_barrier_live):
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -320,15 +440,15 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, owner_message=owner_message,
             ),
         )
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, notice_level=decision["notice_level"])
         prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        if source is None:
             return
         if getattr(source, "platform", None) == Platform.LOCAL:
             # A local session's adapter FIFO has no reader: its turns are authority admissions.
@@ -339,12 +459,15 @@ class GatewayGoalsMixin:
             except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
                 logger.debug("goal continuation: local admission failed", exc_info=True)
             return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
+        # Background notifications can finish with an older continuation still queued. Replace
+        # only goal continuations, or remove them when the judge parks/pauses the objective.
         try:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                self._clear_goal_pending_continuations(_quick_key, adapter)
+                if decision.get("should_continue") and prompt:
+                    self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -371,7 +494,12 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                if label == "goal continuation":
+                    quiet = self._silent_internal_turn(is_internal, final_text)
+                    await hook(session_entry=session_entry, source=source, final_response=final_text, event=event,
+                               **({"quiet_internal": True} if quiet else {}))
+                else:
+                    await hook(session_entry=session_entry, source=source, final_response=final_text)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
         self._publish_local_control(source, only_if_present=True)
@@ -384,6 +512,17 @@ class GatewayGoalsMixin:
         from gateway.session_authorities import active_authority
         from gateway.session_control_actions import publish
         publish(active_authority(self), source.chat_id, only_if_present=only_if_present)
+
+    @staticmethod
+    def _silent_internal_turn(is_internal: bool, final_text: str) -> bool:
+        """An internal turn (process notice, plugin injection) whose reply is a silence marker,
+        including a short note on its own first or last line. The goal hook then skips judging
+        while the goal's wait barrier still holds. A marker buried mid-sentence is not silence.
+        ``is_internal`` is the event flag, never inferred from the text."""
+        if not is_internal:
+            return False
+        from gateway.response_filters import is_autonomous_silence_response
+        return is_autonomous_silence_response(final_text)
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
@@ -539,7 +678,9 @@ class GatewayGoalsMixin:
             # run the state.db init on the loop thread before the first read.
             await self._warm_goals_session_db("loop wakeup")
             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            # Housekeeping pool, not the turn executor: this scan is best-effort and
+            # must not start an OS thread while holding the turn executor lock on the loop.
+            active_loops = await self._run_housekeeping_in_executor(list_active_loops)
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
@@ -551,7 +692,7 @@ class GatewayGoalsMixin:
                 for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop. The root scan (None) is unscoped and stays cheap.
-                    if profile_home is not None and not await self._run_in_executor_with_context(
+                    if profile_home is not None and not await self._run_housekeeping_in_executor(
                             profile_has_active_loop, profile_home):
                         continue
                     async with _scope(profile_home):

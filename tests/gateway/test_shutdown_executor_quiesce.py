@@ -23,6 +23,7 @@ from contextlib import suppress
 import pytest
 
 import gateway.run as gw_mod
+from gateway.turn_executor import _UnboundedThreadExecutor
 
 class _FakeSessionDB:
     """Records when the gateway closed it, on a shared event log."""
@@ -211,6 +212,82 @@ async def test_stuck_worker_skips_the_session_db_close():
     release.set()
     future.result(timeout=5)
     assert "worker_write" in events, "worker never finished"
+
+
+def test_pending_start_cannot_write_after_quiesce_reports_no_live_workers(monkeypatch):
+    """A turn accepted but still inside ``Thread.start`` is invisible to ``_threads``.
+
+    The real quiesce path treats that as zero live workers and closes SessionDB.
+    ``cancel_futures`` has to drop the body, or the write lands after the close.
+    """
+    events = []
+    runner = GatewayRunnerStandIn(events)
+    executor = runner._executor
+    entered = threading.Event()
+    release = threading.Event()
+    real_start = executor._start_registered
+
+    def gated(thread, fut):
+        entered.set()
+        assert release.wait(2), "start gate was never released"
+        return real_start(thread, fut)
+
+    monkeypatch.setattr(executor, "_start_registered", gated)
+    future = executor.submit(lambda: events.append("worker_write"))
+    assert entered.wait(1), "dispatcher never reached the gated start"
+
+    ctx = gw_mod.GatewayRunner._StopContext(deferred_count=lambda: 0)
+    ctx.started_at = time.monotonic()
+    done = threading.Event()
+    failure: list[BaseException] = []
+
+    def quiesce() -> None:
+        try:
+            gw_mod.GatewayRunner._stop_quiesce_and_close_session_dbs(runner, 30.0, ctx)
+        except BaseException as exc:  # noqa: BLE001 - surface a join of an unstarted thread
+            failure.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=quiesce)
+    worker.start()
+    try:
+        assert done.wait(1), "quiesce blocked while Thread.start had not returned"
+        assert not failure, failure
+        assert future.cancelled()
+        assert runner._executor is None
+        assert len(executor._threads) == 0
+        assert "close:session_db" in events, events
+        assert "worker_write" not in events, events
+    finally:
+        release.set()
+        worker.join(2)
+
+    deadline = time.monotonic() + 2
+    while executor._inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert executor._inflight == 0
+    assert "worker_write" not in events, events
+    assert future.cancelled()
+
+
+class GatewayRunnerStandIn:
+    """Bare runner the real quiesce method can close without a full ``stop()``."""
+
+    def __init__(self, events):
+        self._executor_lock = threading.Lock()
+        self._executor_closing = False
+        self._executor = _UnboundedThreadExecutor(thread_name_prefix="hermes-gateway")
+        self._housekeeping_executor = None
+        self._session_db = _FakeSessionDB(events, "session_db")
+        self.session_store = None
+
+    def _active_cron_job_count(self):
+        return 0
+
+    def _active_api_worker_count(self):
+        return 0
+
 
 def _arm_cron(gw):
     gw._active_cron_job_count = lambda: 1

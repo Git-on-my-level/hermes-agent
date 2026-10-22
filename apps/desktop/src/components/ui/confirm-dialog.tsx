@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { ActionStatus } from '@/components/ui/action-status'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
@@ -18,7 +19,8 @@ interface ConfirmDialogProps {
   open: boolean
   onClose: () => void
   // Does the work. Throw to surface an inline error and keep the dialog open.
-  onConfirm: () => Promise<void> | void
+  // When `textInput` is set, the argument is the trimmed field value.
+  onConfirm: (value?: string) => Promise<void> | void
   title: ReactNode
   description?: ReactNode
   children?: ReactNode
@@ -32,6 +34,8 @@ interface ConfirmDialogProps {
   /** A third, non-destructive way out, shown between Cancel and Confirm (e.g.
    *  "Remove from sidebar" beside "Delete worktree"). Closes on click. */
   secondaryAction?: ConfirmSecondaryAction
+  /** Collect a short string before confirm. Empty submit stays open. */
+  textInput?: { placeholder?: string }
 }
 
 interface ConfirmSecondaryAction {
@@ -56,13 +60,16 @@ export function ConfirmDialog({
   cancelLabel,
   destructive = false,
   dismissOnConfirm = false,
-  secondaryAction
+  secondaryAction,
+  textInput
 }: ConfirmDialogProps) {
   const { t } = useI18n()
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const closeTimerRef = useRef<null | number>(null)
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
+  const [draft, setDraft] = useState('')
   const busy = status === 'saving' || status === 'done'
   const resolvedConfirmLabel = confirmLabel ?? t.common.confirm
   const resolvedBusyLabel = busyLabel ?? t.common.loading
@@ -73,6 +80,7 @@ export function ConfirmDialog({
     if (open) {
       setStatus('idle')
       setError(null)
+      setDraft('')
     }
   }, [open])
 
@@ -94,8 +102,11 @@ export function ConfirmDialog({
     }
   }, [])
 
+  const text = draft.trim()
+  const needsText = Boolean(textInput)
+
   async function run() {
-    if (busy) {
+    if (busy || (needsText && !text)) {
       return
     }
 
@@ -103,7 +114,7 @@ export function ConfirmDialog({
 
     if (dismissOnConfirm) {
       try {
-        await onConfirm()
+        await onConfirm(needsText ? text : undefined)
         onClose()
       } catch (err) {
         setError(err instanceof Error ? err.message : t.errors.genericFailure)
@@ -115,7 +126,7 @@ export function ConfirmDialog({
     setStatus('saving')
 
     try {
-      await onConfirm()
+      await onConfirm(needsText ? text : undefined)
       setStatus('done')
       closeTimerRef.current = window.setTimeout(() => {
         closeTimerRef.current = null
@@ -132,8 +143,17 @@ export function ConfirmDialog({
       <DialogContent
         className="max-w-md"
         onKeyDown={event => {
+          // A text field owns Space (it's a character) and only Enter submits,
+          // and only once the field has something in it. Without a field,
           // Enter/Space confirm regardless of which button holds focus
           // (preventDefault stops a focused Cancel from swallowing it).
+          if (needsText) {
+            if (event.key === 'Enter' && !busy && text) {
+              event.preventDefault()
+              void run()
+            }
+            return
+          }
           if ((event.key === 'Enter' || event.key === ' ') && !busy) {
             event.preventDefault()
             void run()
@@ -143,8 +163,13 @@ export function ConfirmDialog({
           // Focus must land inside the dialog or the handler above never sees
           // the key: it stays on whatever opened the dialog (a menu item, a
           // sidebar row) and Enter re-triggers that instead. Radix's default
-          // would take the X — confirm is the button Enter maps to.
+          // would take the X — confirm is the button Enter maps to, unless
+          // the dialog is collecting text, in which case the field is.
           event.preventDefault()
+          if (needsText) {
+            inputRef.current?.focus()
+            return
+          }
           confirmRef.current?.focus()
         }}
       >
@@ -155,6 +180,15 @@ export function ConfirmDialog({
           {description ? <DialogDescription className="whitespace-pre-line">{description}</DialogDescription> : null}
         </DialogHeader>
 
+        {textInput ? (
+          <Input
+            aria-label={textInput.placeholder || 'Reason'}
+            onChange={event => setDraft(event.target.value)}
+            placeholder={textInput.placeholder}
+            ref={inputRef}
+            value={draft}
+          />
+        ) : null}
         {children}
         {error && (
           <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -181,7 +215,7 @@ export function ConfirmDialog({
             </Button>
           )}
           <Button
-            disabled={busy}
+            disabled={busy || (needsText && !text)}
             onClick={() => void run()}
             ref={confirmRef}
             variant={destructive ? 'destructive' : 'default'}

@@ -1,0 +1,726 @@
+"""Idle/after-turn converge onto a locally pinned SHA.
+
+Generic: Hermes never talks to fleetctl. Anything may write ``updates.pin``
+or ``{HERMES_HOME}/updates.pin``. The tick is ``hermes update --converge``
+and must run *outside* the gateway process tree (LaunchAgent/systemd timer).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+_PIN_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_DEFAULT_INTERVAL = 1800
+_DEFAULT_BUSY_SLA = 21600.0  # 6h
+_STATE_NAME = "converge_state.json"
+_PIN_FILE_NAME = "updates.pin"
+
+
+@dataclass(frozen=True)
+class ConvergeSettings:
+    enabled: bool
+    pin: str
+    interval: int
+    busy_sla: float
+    skip_gateway_restart: bool
+    remote: str = ""
+    branch: str = ""
+
+
+@dataclass(frozen=True)
+class ConvergeDecision:
+    action: str  # skip | update | restart
+    reason: str
+    pin: str = ""
+
+
+def default_pin_path(home: Optional[Path] = None) -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(home if home is not None else get_hermes_home()) / _PIN_FILE_NAME
+
+
+def normalize_pin(raw: object) -> str:
+    """Return a lowercase hex SHA prefix, or '' if missing/malformed."""
+    text = str(raw or "").strip().split()[0] if raw else ""
+    text = text.lower().removeprefix("sha:")
+    return text if text and _PIN_RE.fullmatch(text) else ""
+
+
+def read_pin_file(path: Path) -> str:
+    try:
+        return normalize_pin(path.read_text(encoding="utf-8-sig").splitlines()[0] if path.is_file() else "")
+    except OSError:
+        return ""
+
+
+def load_converge_settings(cfg: Optional[dict[str, Any]] = None) -> ConvergeSettings:
+    if cfg is None:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    raw_updates = cfg.get("updates")
+    updates: dict[str, Any] = raw_updates if isinstance(raw_updates, dict) else {}
+    pin = normalize_pin(updates.get("pin"))
+    if not pin:
+        pin_file = str(updates.get("pin_file") or "").strip()
+        pin = read_pin_file(Path(pin_file).expanduser()) if pin_file else read_pin_file(default_pin_path())
+    try:
+        interval = int(updates.get("converge_interval") or _DEFAULT_INTERVAL)
+    except (TypeError, ValueError):
+        interval = _DEFAULT_INTERVAL
+    raw_sla = updates.get("converge_busy_sla")
+    try:
+        sla = _DEFAULT_BUSY_SLA if raw_sla in (None, "") else float(raw_sla)
+    except (TypeError, ValueError):
+        sla = _DEFAULT_BUSY_SLA
+    from hermes_cli.update_channel import git_update_target
+
+    remote, branch = git_update_target(cfg)
+    return ConvergeSettings(
+        enabled=bool(updates.get("converge")),
+        pin=pin,
+        interval=max(60, interval),
+        busy_sla=max(0.0, sla),
+        skip_gateway_restart=bool(updates.get("skip_gateway_restart")),
+        remote=remote,
+        branch=branch,
+    )
+
+
+def prefixes_match(left: str, right: str) -> bool:
+    """True when two SHA prefixes name the same commit (either may be short)."""
+    a, b = normalize_pin(left), normalize_pin(right)
+    if not a or not b:
+        return False
+    n = min(len(a), len(b))
+    return n >= 7 and a[:n] == b[:n]
+
+
+def decide_converge(
+    *,
+    settings: ConvergeSettings,
+    checkout_sha: str,
+    live_sha: str,
+    dirty: bool,
+    busy: bool,
+    pin_age_s: float,
+    target_sha: str = "",
+) -> ConvergeDecision:
+    """Pure policy. ``pin_age_s`` is how long this pin has been visible on the host.
+
+    ``target_sha`` is the channel-tip commit when ``settings.pin`` is empty.
+    Without it, channel-tip cannot prove already-current and must update.
+    """
+    if not settings.enabled:
+        return ConvergeDecision("skip", "disabled")
+    if not settings.pin:
+        if dirty:
+            return ConvergeDecision("skip", "dirty_tree")
+        desired = normalize_pin(target_sha)
+        if desired:
+            at_tip = prefixes_match(checkout_sha, desired)
+            live_at_tip = prefixes_match(live_sha, desired) if live_sha else at_tip
+            if at_tip and (live_at_tip or settings.skip_gateway_restart):
+                return ConvergeDecision("skip", "already_current")
+        if busy and pin_age_s < settings.busy_sla:
+            return ConvergeDecision("skip", "busy")
+        if desired and prefixes_match(checkout_sha, desired):
+            return ConvergeDecision("restart", "stale_runtime")
+        return ConvergeDecision("update", "channel_tip")
+    pin = settings.pin
+    if dirty and not prefixes_match(checkout_sha, pin):
+        return ConvergeDecision("skip", "dirty_tree", pin)
+    at_pin = prefixes_match(checkout_sha, pin)
+    live_at_pin = prefixes_match(live_sha, pin) if live_sha else at_pin
+    if at_pin and (live_at_pin or settings.skip_gateway_restart):
+        return ConvergeDecision("skip", "already_current", pin)
+    if busy and pin_age_s < settings.busy_sla:
+        return ConvergeDecision("skip", "busy", pin)
+    if at_pin:
+        return ConvergeDecision("restart", "stale_runtime", pin)
+    return ConvergeDecision("update", "checkout_behind_pin", pin)
+
+
+def _state_path(home: Optional[Path] = None) -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(home if home is not None else get_hermes_home()) / _STATE_NAME
+
+
+def pin_age_seconds(pin: str, home: Optional[Path] = None, *, now: Optional[float] = None) -> float:
+    """Age of the current pin on this host; first sighting starts the SLA clock."""
+    now = time.time() if now is None else now
+    path = _state_path(home)
+    body: dict[str, Any] = {}
+    try:
+        body = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
+        if not isinstance(body, dict):
+            body = {}
+    except (OSError, ValueError, TypeError):
+        body = {}
+    seen = str(body.get("pin") or "")
+    first = body.get("first_seen")
+    # Non-SHA keys (the "channel" fallback) never prefix-match, which used to
+    # restart the busy-SLA clock on every tick so a busy host never converged.
+    same = seen == pin or prefixes_match(seen, pin)
+    if not same or not isinstance(first, (int, float)):
+        body = {"pin": pin, "first_seen": now}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(body) + "\n", encoding="utf-8")
+        except OSError as e:
+            logger.debug("converge state write failed: %s", e)
+        return 0.0
+    return max(0.0, now - float(first))
+
+
+def checkout_sha(project_root: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
+        )
+        return normalize_pin(r.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def checkout_is_dirty(project_root: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain"],
+            capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
+        )
+        return bool(r.stdout.strip()) if r.returncode == 0 else True
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+
+def live_code_sha() -> str:
+    try:
+        from gateway.status import get_running_pid, read_runtime_status, runtime_status_pid_is_live
+
+        rec = read_runtime_status() or {}
+        pid = get_running_pid()
+        if pid is None or rec.get("pid") != pid or not runtime_status_pid_is_live(rec):
+            return ""
+        return normalize_pin(rec.get("code_sha"))
+    except Exception:
+        return ""
+
+
+def gateway_is_busy() -> bool:
+    try:
+        from gateway.status import derive_gateway_busy, get_running_pid, read_runtime_status
+
+        rec = read_runtime_status() or {}
+        return derive_gateway_busy(
+            gateway_running=get_running_pid() is not None,
+            gateway_state=rec.get("gateway_state"),
+            active_agents=rec.get("active_agents"),
+        )
+    except Exception:
+        return False
+
+
+def _log_tick(message: str) -> None:
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "logs" / "converge.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + message + "\n"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        logger.debug("converge log write failed", exc_info=True)
+
+
+def channel_tip_sha(project_root: Path, remote: str = "", branch: str = "") -> str:
+    """Best-effort tracking-ref SHA. Empty if git cannot resolve it."""
+    ref = f"{remote}/{branch}" if remote and branch else "@{u}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", ref],
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
+        )
+        return normalize_pin(r.stdout) if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") -> None:
+    """Refresh the tracking ref used by channel-tip. Failures are skip-safe."""
+    if not remote or not branch:
+        return
+    from hermes_cli.update_cmd_check import tracking_refspec
+
+    try:
+        subprocess.run(
+            ["git", "-C", str(project_root), "fetch", "--prune", remote, tracking_refspec(remote, branch)],
+            capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("channel-tip fetch failed: %s", e)
+
+
+def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = None) -> ConvergeDecision:
+    settings = settings or load_converge_settings()
+    pin = settings.pin
+    target = "" if pin else channel_tip_sha(project_root, settings.remote, settings.branch)
+    # Channel mode keys the SLA clock by the tip it is converging to, so a new
+    # tip starts a fresh grace period and an old one eventually expires.
+    # "channel-unresolved" (not legacy "channel") so a stale pre-fix record can
+    # never count as an expired SLA and restart a busy gateway immediately.
+    age = pin_age_seconds(pin or target or "channel-unresolved") if settings.enabled else 0.0
+    return decide_converge(
+        settings=settings,
+        checkout_sha=checkout_sha(project_root),
+        live_sha=live_code_sha(),
+        dirty=checkout_is_dirty(project_root),
+        busy=gateway_is_busy(),
+        pin_age_s=age,
+        target_sha=target,
+    )
+
+
+def _mark_planned_drain() -> None:
+    try:
+        from gateway.drain_control import write_drain_request
+
+        write_drain_request(principal="update-converge", suppress_notification=True)
+    except Exception as e:
+        logger.debug("drain marker write failed: %s", e)
+
+
+def _recovery_state(root: Path) -> tuple[Path, dict]:
+    from pm.environments import install_state_dir
+    path = install_state_dir(root) / 'converge-recovery.json'
+    try:
+        value = json.loads(path.read_text(encoding='utf-8-sig'))
+        return path, value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return path, {}
+
+
+def _save_recovery_state(path: Path, state: dict) -> None:
+    from utils import atomic_json_write
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, state)  # Failure refuses drain/update; never retry without recording it.
+
+
+def _alert_once(root: Path, key: str, message: str) -> None:
+    path, state = _recovery_state(root)
+    seen = state.get('alerts', [])
+    if not isinstance(seen, list):
+        seen = []
+    if key in seen:
+        return
+    state['alerts'] = [*seen[-255:], key]
+    _save_recovery_state(path, state)
+    logger.error(message)
+    _log_tick('ALERT ' + message)
+    print(message, file=sys.stderr, flush=True)
+
+
+def _alert_receipt(root: Path, receipt: dict | None) -> None:
+    if not receipt or receipt.get('outcome') not in {'failed', 'partial'}:
+        return
+    import hashlib
+    identity = str(receipt.get('update_id') or receipt.get('correlation_id') or
+                   hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
+    _alert_once(root, 'receipt:' + identity,
+                'Converge has an unfinished failed update; serving the completed generation; '
+                'repair will retry when idle. Inspect converge.log and the latest update receipt, or run `hermes update`.')
+
+
+def _reserve_completion_retry(root: Path, pin: str, interval: int) -> bool:
+    path, state = _recovery_state(root)
+    key = pin or checkout_sha(root)
+    debt: dict[str, Any] = state.get('completion_debt', {})
+    if not isinstance(debt, dict):
+        _alert_once(root, 'completion-state-invalid', 'Converge retry state is invalid; automatic repair refused; run `hermes update`.')
+        return False
+    if debt.get('key') != key:
+        debt = {'key': key, 'attempts': 0, 'next_retry': 0}
+    now = time.time()
+    try:
+        attempts = max(0, int(debt.get('attempts') or 0))
+        next_retry = float(debt.get('next_retry') or 0)
+    except (ValueError, TypeError):
+        _alert_once(root, 'completion-state-invalid', 'Converge retry state is invalid; automatic repair refused; run `hermes update`.')
+        return False
+    if attempts >= 3 or now < next_retry:
+        return False
+    debt['attempts'] = attempts + 1
+    debt['next_retry'] = now + max(3600, interval * 2) * (2 ** attempts)
+    state['completion_debt'] = debt
+    _save_recovery_state(path, state)  # Reserve before mutation, including crashes.
+    return True
+
+
+def cmd_converge_tick(args: Any) -> None:
+    """Entry for ``hermes update --converge`` / ``hermes converge run``. Quiet on skip."""
+    from hermes_cli.main import PROJECT_ROOT, cmd_update
+
+    settings = load_converge_settings()
+    if settings.enabled and not settings.pin:
+        fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
+    from hermes_cli.update_receipt import read_latest_receipt
+    _alert_receipt(PROJECT_ROOT, read_latest_receipt())
+    decision = decide_from_live(PROJECT_ROOT, settings)
+    # A checkout/runtime can already name the pin while its product tail is
+    # still owed. Do not let already_current permanently suppress repair.
+    # A pending marker older than install-stamp.json is leftover debt from a
+    # previous home/install, not an owed tail: rewriting that to update would
+    # drain-restart an idle host already on the pin every tick.
+    from hermes_cli.venv_sync import completion_pending_path, _tree_matches_completed_stamp
+    if (settings.enabled and decision.reason == "already_current"
+            and completion_pending_path(PROJECT_ROOT).is_file()
+            and not _tree_matches_completed_stamp(PROJECT_ROOT)
+            and not gateway_is_busy()
+            and not checkout_is_dirty(PROJECT_ROOT)):
+        if _reserve_completion_retry(PROJECT_ROOT, decision.pin, settings.interval):
+            decision = ConvergeDecision('update', 'unfinished_completion', decision.pin)
+        else:
+            decision = ConvergeDecision('skip', 'completion_backoff_or_exhausted', decision.pin)
+    if not completion_pending_path(PROJECT_ROOT).is_file():
+        path, state = _recovery_state(PROJECT_ROOT)
+        debt = state.pop('completion_debt', None)
+        if debt is not None:
+            state['alerts'] = [key for key in state.get('alerts', []) if not key.startswith('completion:')]
+            _save_recovery_state(path, state)
+    _log_tick(f"action={decision.action} reason={decision.reason} pin={decision.pin[:12]}")
+    if decision.action == "skip":
+        return
+    if settings.skip_gateway_restart and decision.action == "restart":
+        _log_tick("skip restart (updates.skip_gateway_restart)")
+        return
+    args.converge = False
+    args.yes = True
+    args.remote = settings.remote or "origin"
+    args.branch = settings.branch or "main"
+    args.channel = None
+    if decision.pin:
+        args.sha = decision.pin
+    elif decision.action == "update":
+        tip = channel_tip_sha(PROJECT_ROOT, settings.remote, settings.branch)
+        if tip:
+            args.sha = tip
+    if settings.skip_gateway_restart:
+        args.no_gateway_restart = True
+    _mark_planned_drain()
+    try:
+        if decision.action == "restart":
+            from hermes_cli.update_cmd_fleet import _restart_gateway_fleet_after_update
+
+            _restart_gateway_fleet_after_update(None, gateway_mode=False)
+            return
+        cmd_update(args)
+        _alert_receipt(PROJECT_ROOT, read_latest_receipt())
+    except BaseException as exc:
+        if not isinstance(exc, SystemExit) or exc.code not in (0, None):
+            logger.error("Converge update failed: %s; previous serving generation retained", exc)
+            _log_tick("ALERT converge update failed; operator attention required")
+        raise
+    finally:
+        try:
+            if decision.reason == 'unfinished_completion' and completion_pending_path(PROJECT_ROOT).is_file():
+                _alert_once(PROJECT_ROOT, 'completion:' + (decision.pin or checkout_sha(PROJECT_ROOT)),
+                            'Converge completion marker remains unfinished; retries are backed off and capped at three; '
+                            'operator attention required. Run `hermes update` explicitly to repair.')
+        except OSError:
+            logger.error('Could not persist completion alert; operator attention required', exc_info=True)
+        try:
+            from gateway.drain_control import clear_update_converge_drain
+
+            clear_update_converge_drain()
+        except Exception:
+            logger.debug("update-converge drain marker clear after tick failed", exc_info=True)
+
+
+def converge_label() -> str:
+    from hermes_cli.gateway import _profile_suffix
+
+    suffix = _profile_suffix()
+    return f"ai.hermes.converge-{suffix}" if suffix else "ai.hermes.converge"
+
+
+def converge_plist_path() -> Path:
+    import pwd
+
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    return home / "Library" / "LaunchAgents" / f"{converge_label()}.plist"
+
+
+def _service_venv_dir() -> str:
+    """Venv that owns the ``hermes`` launcher for the converge unit."""
+    from hermes_cli.gateway import PROJECT_ROOT, _pm_runtime_venv_dir
+
+    venv = _pm_runtime_venv_dir(PROJECT_ROOT)
+    if venv is not None:
+        return str(venv)
+    return str(Path(PROJECT_ROOT) / ".venv")
+
+
+def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[ConvergeSettings, str, str, str, Path]:
+    from hermes_constants import get_hermes_home
+
+    settings = settings or load_converge_settings()
+    hermes_home = str(get_hermes_home().resolve())
+    log_dir = get_hermes_home() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    venv_dir = _service_venv_dir()
+    hermes_bin = str(Path(venv_dir) / "bin" / "hermes")
+    return settings, hermes_home, venv_dir, hermes_bin, log_dir
+
+
+def generate_converge_plist(settings: Optional[ConvergeSettings] = None) -> str:
+    from hermes_cli.gateway import _stable_service_working_dir
+
+    settings, hermes_home, venv_dir, hermes_bin, log_dir = _converge_exec_env(settings)
+    label = converge_label()
+    working_dir = _stable_service_working_dir()
+    interval = settings.interval
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{hermes_bin}</string>
+        <string>update</string>
+        <string>--converge</string>
+        <string>-y</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HERMES_HOME</key>
+        <string>{hermes_home}</string>
+        <key>VIRTUAL_ENV</key>
+        <string>{venv_dir}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>{interval}</integer>
+    <key>StandardOutPath</key>
+    <string>{log_dir}/converge.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/converge.log</string>
+</dict>
+</plist>
+"""
+
+
+def _systemd_user_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def generate_converge_systemd_service(settings: Optional[ConvergeSettings] = None) -> str:
+    from hermes_cli.gateway import _stable_service_working_dir
+
+    settings, hermes_home, venv_dir, hermes_bin, log_dir = _converge_exec_env(settings)
+    working_dir = _stable_service_working_dir()
+    log_path = log_dir / "converge.log"
+    return f"""[Unit]
+Description=Hermes update converge tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={hermes_bin} update --converge -y
+WorkingDirectory={working_dir}
+Environment=HERMES_HOME={hermes_home}
+Environment=VIRTUAL_ENV={venv_dir}
+StandardOutput=append:{log_path}
+StandardError=append:{log_path}
+Nice=10
+"""
+
+
+def generate_converge_systemd_timer(settings: Optional[ConvergeSettings] = None) -> str:
+    settings = settings or load_converge_settings()
+    return f"""[Unit]
+Description=Hermes update converge timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={settings.interval}
+Persistent=true
+Unit=hermes-converge.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _install_linux_converge(settings: ConvergeSettings) -> int:
+    unit_dir = _systemd_user_dir()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    service_path = unit_dir / "hermes-converge.service"
+    timer_path = unit_dir / "hermes-converge.timer"
+    service_path.write_text(generate_converge_systemd_service(settings), encoding="utf-8")
+    timer_path.write_text(generate_converge_systemd_timer(settings), encoding="utf-8")
+    cmds = [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "hermes-converge.timer"],
+    ]
+    for cmd in cmds:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip().splitlines()
+            print(f"⚠ Wrote {timer_path} but `{' '.join(cmd)}` failed: {err[-1] if err else r.returncode}")
+            print("  Enable lingering if this host has no user systemd session: loginctl enable-linger $USER")
+            return 1
+    print(f"✓ Converge timer installed: hermes-converge.timer every {settings.interval}s")
+    print(f"  {timer_path}")
+    return 0
+
+
+def _uninstall_linux_converge() -> int:
+    subprocess.run(
+        ["systemctl", "--user", "disable", "--now", "hermes-converge.timer"],
+        capture_output=True, timeout=30, check=False,
+    )
+    unit_dir = _systemd_user_dir()
+    removed = False
+    for name in ("hermes-converge.timer", "hermes-converge.service"):
+        path = unit_dir / name
+        if path.exists():
+            path.unlink()
+            removed = True
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=30, check=False)
+    print("✓ Removed hermes-converge.timer" if removed else "converge timer was not installed")
+    return 0
+
+
+def _launchd_converge_domains() -> list[str]:
+    """Prefer Aqua ``gui/<uid>`` so SSH installs are not stuck in ``user/`` (bootstrap exit 5)."""
+    from hermes_cli.gateway import _launchd_domain
+
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper
+    ordered: list[str] = []
+    for domain in (f"gui/{uid}", f"user/{uid}", _launchd_domain()):
+        if domain and domain not in ordered:
+            ordered.append(domain)
+    return ordered
+
+
+def _install_macos_converge(settings: ConvergeSettings) -> int:
+    from hermes_cli.gateway import _launchctl_bootstrap, _refuse_temp_home_service_write
+
+    plist_path = converge_plist_path()
+    body = generate_converge_plist(settings)
+    if _refuse_temp_home_service_write(body, "converge launchd plist"):
+        return 1
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(body, encoding="utf-8")
+    label = converge_label()
+    last_err = ""
+    for domain in _launchd_converge_domains():
+        subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            check=False, timeout=30, capture_output=True,
+        )
+        try:
+            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
+            print(f"✓ Converge agent installed: {label} every {settings.interval}s ({domain})")
+            print(f"  {plist_path}")
+            return 0
+        except Exception as e:
+            last_err = str(e)
+            continue
+    print(f"⚠ Wrote {plist_path} but launchctl load failed: {last_err}")
+    return 1
+
+
+def install_converge_agent(*, force: bool = False) -> int:
+    """Install the out-of-tree converge ticker (LaunchAgent on macOS, systemd user timer on Linux)."""
+    settings = load_converge_settings()
+    if not settings.enabled and not force:
+        print("updates.converge is false — not installing (pass install --force to write the unit anyway).")
+        return 1
+    if sys.platform == "darwin":
+        return _install_macos_converge(settings)
+    if sys.platform.startswith("linux"):
+        return _install_linux_converge(settings)
+    print(f"converge agent install is not supported on {sys.platform}")
+    return 1
+
+
+def uninstall_converge_agent() -> int:
+    if sys.platform.startswith("linux"):
+        return _uninstall_linux_converge()
+    if sys.platform != "darwin":
+        return 0
+    plist_path = converge_plist_path()
+    label = converge_label()
+    for domain in _launchd_converge_domains():
+        subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            check=False, timeout=30, capture_output=True,
+        )
+    if plist_path.exists():
+        plist_path.unlink()
+        print(f"✓ Removed {plist_path}")
+    else:
+        print("converge agent was not installed")
+    return 0
+
+
+def maybe_install_converge_agent() -> None:
+    """Best-effort hook from ``hermes gateway install`` when converge is enabled."""
+    if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
+        return
+    if not load_converge_settings().enabled:
+        return
+    try:
+        install_converge_agent()
+    except Exception as e:
+        logger.warning("converge agent install skipped: %s", e)
+
+
+def cmd_converge(args: Any) -> None:
+    action = getattr(args, "converge_action", None) or "run"
+    if action == "install":
+        sys.exit(install_converge_agent(force=bool(getattr(args, "force", False))))
+    if action == "uninstall":
+        sys.exit(uninstall_converge_agent())
+    if action == "status":
+        settings = load_converge_settings()
+        from hermes_cli.main import PROJECT_ROOT
+
+        checkout = checkout_sha(PROJECT_ROOT)
+        live = live_code_sha()
+        target = settings.pin or channel_tip_sha(PROJECT_ROOT, settings.remote, settings.branch)
+        matches = prefixes_match(checkout, target) and prefixes_match(live, target)
+        d = decide_from_live(PROJECT_ROOT, settings)
+        print(f"checkout_sha={checkout or 'unknown'} live_sha={live or 'unknown'} target_sha={target or 'unknown'}")
+        print(f"match={'YES' if matches else 'NO'}")
+        print(f"enabled={settings.enabled} pin={settings.pin or '-'} skip_restart={settings.skip_gateway_restart}")
+        print(f"action={d.action} reason={d.reason}")
+        if sys.platform == "darwin":
+            print(f"plist={converge_plist_path()} exists={converge_plist_path().exists()}")
+        elif sys.platform.startswith("linux"):
+            timer = _systemd_user_dir() / "hermes-converge.timer"
+            print(f"timer={timer} exists={timer.exists()}")
+        if getattr(args, "assert_current", False) and not matches:
+            sys.exit(1)
+        return
+    cmd_converge_tick(args)

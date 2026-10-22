@@ -820,7 +820,33 @@ class CLILoopsMixin:
         via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
         mgr = self._get_goal_manager()
-        if mgr is None or not mgr.is_active():
+        if mgr is None:
+            return
+        # Steering for the judge: the last user message, if this turn ran under an existing goal
+        # (continuations are filtered out by evaluate_after_turn).
+        owner_message = None
+        if mgr.has_goal():
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "user":
+                    owner_message = msg.get("content") if isinstance(msg.get("content"), str) else None
+                    break
+        # goals.auto_infer (CLI): a goal-less turn whose reply commits to work seeds an inferred goal.
+        if not mgr.has_goal():
+            try:
+                from hermes_cli.goals import auto_infer_enabled, maybe_infer_goal
+                if auto_infer_enabled():
+                    reply = self._last_assistant_response_text()
+                    last_user = ""
+                    for msg in reversed(self.conversation_history or []):
+                        if msg.get("role") == "user":
+                            last_user = msg.get("content", "")
+                            break
+                    notice = maybe_infer_goal(mgr, last_user, reply)
+                    if notice:
+                        _cprint(f"{_DIM}{notice}{_RST}")
+            except Exception:
+                pass
+        if not mgr.is_active():
             return
 
         # Slash commands don't count as "real user messages": they're dispatched via
@@ -863,7 +889,8 @@ class CLILoopsMixin:
         except Exception:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+            owner_message=owner_message)
         _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

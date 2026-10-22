@@ -24,14 +24,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RoutineJob } from './types'
 
 const request = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@hermes/plugin-sdk', async importOriginal => {
   const sdk = await importOriginal<typeof HermesSdk>()
 
-  return { ...sdk, host: { ...sdk.host, request } }
+  return { ...sdk, host: { ...sdk.host, notifyError, request } }
 })
 
-const { loadRoutines } = await import('./cron')
+const { LEGACY_DELEGATED_PAUSE_REASON, loadRoutines } = await import('./cron')
 
 const LEGACY_PREFIX = 'You are running the scheduled routine "'
 
@@ -65,7 +66,15 @@ describe('the bot\u2019s own cron store', () => {
 
     expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
       ['cron.manage', { action: 'list', include_disabled: true, profile: 'research' }],
-      ['cron.manage', { action: 'pause', name: 'legacy', profile: 'research' }]
+      [
+        'cron.manage',
+        {
+          action: 'pause',
+          name: 'legacy',
+          profile: 'research',
+          reason: LEGACY_DELEGATED_PAUSE_REASON
+        }
+      ]
     ])
   })
 
@@ -98,7 +107,11 @@ describe('pausing a legacy delegated routine cannot fail the list', () => {
       }
 
       if (params.name === 'legacy-fails') {
-        throw new Error('gateway rejected the pause')
+        return { error: 'gateway rejected the pause', success: false }
+      }
+
+      if (params.reason !== LEGACY_DELEGATED_PAUSE_REASON) {
+        return { error: 'reason required', success: false }
       }
 
       return { success: true }
@@ -116,6 +129,7 @@ describe('pausing a legacy delegated routine cannot fail the list', () => {
     expect(byId['legacy-fails']).toMatchObject({ enabled: true, state: 'scheduled' })
     expect(byId['legacy-pauses']).toMatchObject({ enabled: false, state: 'paused' })
     expect(byId.normal.enabled).toBe(true)
+    expect(notifyError).toHaveBeenCalled()
 
     expect(callLog()).toEqual([
       ['list', undefined],

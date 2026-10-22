@@ -2147,7 +2147,7 @@ class BasePlatformAdapter(ABC):
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:
         """Publish runtime status; log preparation failures without disrupting the adapter."""
         try:
-            from gateway.status import publish_runtime_status
+            from gateway.status_async import publish_runtime_status
             # Multiplexed adapters share the status file; the runner stamps
             # ``<profile>:<platform>``.
             platform_key = getattr(self, "_runtime_status_platform_key", None) or self.platform.value

@@ -26,7 +26,8 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata,
+    display_kind_for_event, display_metadata_for_event, is_intentional_silence_response,
+    is_machinery_display_kind, reply_expected_metadata,
     silence_allowed,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -189,12 +190,23 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         return None
 
     @staticmethod
-    def _is_intentional_silence(agent_result, response) -> bool:
+    def _is_intentional_silence(agent_result, response, *, internal: bool = False) -> bool:
         try:
             from gateway.response_filters import is_intentional_silence_agent_result
-            return is_intentional_silence_agent_result(agent_result, response)
+            return is_intentional_silence_agent_result(agent_result, response, internal=internal)
         except Exception:
             return False
+
+    @staticmethod
+    def _log_autonomous_internal_silence(session_key, response) -> None:
+        """Log a note-plus-silent internal turn. The substring is a fork keep-list anchor."""
+        from gateway.response_filters import is_intentional_silence_response
+        if is_intentional_silence_response(response):
+            return
+        logger.info(
+            "Suppressing internal reply under autonomous silence rule: session=%s",
+            session_key or "unknown",
+        )
 
 
 
@@ -209,7 +221,6 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 await _typing_adapter._stop_typing_with_metadata(source.chat_id, self._event_thread_metadata(event, source))
             elif _typing_adapter and callable(getattr(_kind, "stop_typing", None)):
                 await _typing_adapter.stop_typing(source.chat_id)
-
 
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -280,6 +291,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                internal=bool(getattr(event, "internal", False)),
+                plugin_injected=bool(getattr(event, "plugin_injected", False)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -295,6 +308,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
+                event._silence_internal = bool(
+                    agent_result["queued_terminal_internal"]
+                    if "queued_terminal_internal" in agent_result
+                    else getattr(event, "internal", False)
+                )
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -307,6 +325,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
+                internal=bool(getattr(event, "internal", False)),
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
@@ -738,6 +757,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
     def _build_stream_consumer_config(
         self, source: SessionSource, scfg: Any, adapter: Any, *, on_missing_cursor: str,
+        commentary_mode: str = "separate", commentary_waiting_label: str = "",
     ) -> tuple[Any, Optional[Callable[[], None]]]:
         """Build the shared ``StreamConsumerConfig`` and optional Telegram pause-typing closure.
         For non-editing adapters ``on_missing_cursor="fallback"`` streams with an empty cursor;
@@ -770,6 +790,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            commentary_mode=commentary_mode,
+            commentary_waiting_label=commentary_waiting_label,
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -823,7 +845,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str | None = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, plugin_injected: bool = False,
     ) -> dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -877,8 +899,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
         _thread_metadata: Optional[dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        # Plugin-injected turns do not stream: a trailing silence marker is unknowable
+        # until the text is complete, so hold the reply when the event says so.
         _stream_consumer = (
-            None if scheduled_heartbeat
+            None if scheduled_heartbeat or plugin_injected
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
@@ -1709,6 +1733,24 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            # Coalesce an all-internal backlog into ONE follow-up turn: background-process watchers
+            # and other internal wakes enqueue one FIFO event each, and a long-running turn (multi-minute
+            # API calls on a big context) can finish with a dozen of them pending. Running each as its
+            # own turn re-sends the full context per event just for the model to answer another silence
+            # marker. Every event still runs — nothing is dropped or reordered — but compatible events
+            # merge into one batch the model answers once.
+            # Skip while draining (restart/shutdown): coalescing pops every compatible slot/overflow
+            # item onto the dequeued head, and the discard below would then drop the whole batch.
+            # Pre-coalesce, only the one event that would recurse was discarded so queue-mode persist
+            # could keep the rest.
+            if (
+                pending_event is not None
+                and bool(getattr(pending_event, "internal", False))
+                and not self._draining
+            ):
+                pending_event = self._coalesce_internal_followups(
+                    session_key, adapter, pending_event
+                )
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -1759,6 +1801,83 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             pending = None
         return pending_event, pending
 
+    # Internal-drain chain bound: coalescing bounds an EXISTING backlog, but a lane that
+    # starts a new watcher per turn (or receives internal injections continuously) would
+    # otherwise chain internal turns at unchanged interrupt depth forever, pinning every
+    # suspended caller. Each batch may recurse up to this many times before the next
+    # internal event is left queued for the normal post-turn promotion path.
+    _MAX_INTERNAL_DRAIN_DEPTH = 8
+
+    def _coalesce_internal_followups(
+        self, session_key: str, adapter: Any, head: Any
+    ) -> Any:
+        """Merge compatible internal follow-ups into ``head`` for one combined turn.
+
+        ``head`` is already dequeued and internal. The merge is FIFO-ordered (head → slot →
+        overflow; after ``_promote_queued_event`` the slot holds the NEXT event) and stops at
+        the first incompatible item:
+
+        - a non-internal event (human / plugin / external) keeps its own turn;
+        - an event with different delivery policy — ``plugin_injected``, or a different
+          diagnostic/notification muting category — is never absorbed (text-only merging
+          would drop the muting flags and could silence a visible completion or un-hold a
+          plugin's streaming contract).
+
+        When the slot is consumed and overflow remains, the overflow head is re-staged into
+        the slot (promotion parity, #28503) so later arrivals cannot jump the remaining
+        overflow while this turn runs.
+        """
+        overflow = self._overflow_queue(session_key)
+        merged: list[str] = []
+        if adapter is not None and hasattr(adapter, "_pending_messages"):
+            slot = adapter._pending_messages.get(session_key)
+            if slot is not None:
+                if not self._internal_events_batchable(head, slot):
+                    return head
+                adapter._pending_messages.pop(session_key, None)
+                merged.append(slot.text or "")
+        if overflow:
+            while overflow:
+                nxt = overflow[0]
+                if not self._internal_events_batchable(head, nxt):
+                    break
+                merged.append(overflow.pop(0).text or "")
+            # Slot must not stay empty while overflow remains: an arrival during this
+            # turn's delivery/preparation awaits would land in the slot and run ahead of
+            # the overflow (FIFO jump).
+            if overflow and adapter is not None and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages[session_key] = overflow.pop(0)
+        if not merged:
+            return head
+        head_text = (head.text or "").rstrip()
+        parts = [head_text] if head_text else []
+        parts.extend(text.rstrip() for text in merged if (text or "").strip())
+        head.text = "\n\n".join(parts)
+        logger.info(
+            "Coalesced %d queued internal follow-up(s) into one turn for session %s",
+            len(merged), session_key or "?",
+        )
+        return head
+
+    @staticmethod
+    def _internal_events_batchable(head: Any, candidate: Any) -> bool:
+        """True when ``candidate`` (already internal) may merge into ``head``'s turn.
+
+        Delivery policy must match: plugin-injected turns hold streaming until silence
+        detection, and diagnostic muting rides ``metadata['notification_category']`` —
+        text-only merging would drop whichever flag differs. Also rejects non-internal
+        candidates so callers can use it as the single gate.
+        """
+        if not bool(getattr(candidate, "internal", False)):
+            return False
+        if bool(getattr(candidate, "plugin_injected", False)) != bool(
+            getattr(head, "plugin_injected", False)
+        ):
+            return False
+        head_meta = getattr(head, "metadata", None) or {}
+        cand_meta = getattr(candidate, "metadata", None) or {}
+        return head_meta.get("notification_category") == cand_meta.get("notification_category")
+
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> None:
@@ -1779,12 +1898,19 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
+        _first_internal = bool(getattr(turn_ctx, "internal", False))
+        if self._is_intentional_silence(_delivery_result, first_response, internal=_first_internal):
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
-                logger.info(
-                    "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
-                    session_key or "?",
-                )
+                if _first_internal and not is_intentional_silence_response(first_response):
+                    logger.info(
+                        "Suppressing internal reply under autonomous silence rule: session=%s",
+                        session_key or "unknown",
+                    )
+                else:
+                    logger.debug(
+                        "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                        session_key or "?",
+                    )
                 first_response = ""
             else:
                 logger.warning(
@@ -1855,8 +1981,45 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _active[session_key].clear()
 
         # Cap recursion depth (user keeps sending while the agent keeps failing).
-        # (#816)
-        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+        # (#816) Internal completion drains are not interrupts — a busy-window with a dozen
+        # background-completion follow-ups must still drain, so exempt them from the cap.
+        # Their chain is bounded separately (_MAX_INTERNAL_DRAIN_DEPTH below): coalescing
+        # bounds an existing backlog, this bounds continuous arrivals.
+        _is_internal_followup = bool(getattr(pending_event, "internal", False))
+        if _is_internal_followup:
+            _internal_drain_depth = int(getattr(turn_ctx, "_internal_drain_depth", 0) or 0)
+            if _internal_drain_depth >= self._MAX_INTERNAL_DRAIN_DEPTH:
+                logger.warning(
+                    "Internal drain depth %d reached for session %s — leaving the queued "
+                    "internal follow-up for the post-turn promotion path.",
+                    _internal_drain_depth, session_key,
+                )
+                # Re-queue so nothing is dropped: the bounded event goes back to the SLOT
+                # (it is the oldest — it must run before anything staged after it), and a
+                # successor already staged in the slot moves to the overflow HEAD, ahead
+                # of its remaining siblings. The in-flight chain unwinds; the idle-session
+                # inbound path (orphan rescue / promotion) owns the rest.
+                if adapter is not None and hasattr(adapter, "_pending_messages"):
+                    _slot = adapter._pending_messages
+                    _staged = _slot.get(session_key)
+                    if _staged is not None:
+                        _overflow_q = self._overflow_queue(session_key)
+                        if _overflow_q is not None:
+                            _overflow_q.insert(0, _staged)
+                        else:
+                            # Degenerate (no session state): cannot stage the successor
+                            # behind the restored event — keep it with a loud warning.
+                            logger.warning(
+                                "Internal drain bound for session %s: no overflow storage; "
+                                "the staged successor %s may run out of order or be dropped.",
+                                session_key, getattr(_staged, "message_id", "?"),
+                            )
+                    _slot[session_key] = pending_event
+                return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+            _internal_drain_depth += 1
+        else:
+            _internal_drain_depth = 0
+        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH and not _is_internal_followup:
             logger.warning(
                 "Interrupt recursion depth %d reached for session %s — "
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
@@ -1965,7 +2128,16 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
-                run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                run_generation=run_generation,
+                # The interrupt cap (#816) bounds how many TIMES a runaway interrupt cycle re-enters
+                # _run_agent. A queued internal follow-up is not a new interrupt: it is this turn's
+                # own completion drain. Charging it to the cap let a long turn with a dozen watcher
+                # completions hit depth 3 and strand the rest of the queue one wake per busy-window.
+                _interrupt_depth=(
+                    _interrupt_depth if bool(getattr(pending_event, "internal", False))
+                    else _interrupt_depth + 1
+                ),
+                _internal_drain_depth=_internal_drain_depth,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
@@ -1974,6 +2146,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 persist_user_display_metadata={
                     **display_metadata_for_event(pending_event),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                internal=bool(getattr(pending_event, "internal", False)),
+                plugin_injected=bool(getattr(pending_event, "plugin_injected", False)),
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -1998,6 +2172,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_internal": bool(getattr(pending_event, "internal", False)),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -2105,9 +2280,28 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         _transformed = bool(response.get("response_transformed"))
         # Suppress the normal send only when the actual final reply reached the user.
         _streamed = self._run_agent_stream_confirmed_final_delivery(_sc, _final, previewed=_previewed)
+        from gateway.response_filters import is_intentional_silence_response
+        _is_silence_marker = is_intentional_silence_response(_final)
         if _is_empty_sentinel:
             return
         _sk = session_key or "?"
+        # Commentary-preview retraction (#commentary-scatter, option 2): the final goes out as its
+        # own fresh bubble, so the interim progress stack (and any waiting placeholder) must not
+        # linger beside it. A pure silence marker must NOT retract: that turn delivers nothing by
+        # design and the progress bubble is its only visible trace — and folding/leaking the
+        # literal marker is exactly the [SILENT]-bubble bug this guards against.
+        if (
+            not _streamed
+            and not _transformed
+            and not _is_silence_marker
+            and _sc is not None
+            and hasattr(_sc, "retract_preview_bubbles")
+        ):
+            if await _sc.retract_preview_bubbles():
+                logger.info(
+                    "Retracted commentary preview bubble for session %s (fresh final follows, len=%d).",
+                    _sk, len(_final),
+                )
         if not _transformed and (_streamed or _content_delivered):
             logger.info(
                 "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
@@ -2294,6 +2488,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str | None = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
+        _internal_drain_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
@@ -2302,6 +2497,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        internal: bool = False,
+        plugin_injected: bool = False,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2311,6 +2508,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                plugin_injected=plugin_injected,
             )
             # The remote turn is this admission's executed turn (``TurnRunner.run_sync`` records
             # the local one): without it a finite run would settle as a no-execution refusal.
@@ -2339,6 +2537,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
+            _internal_drain_depth=_internal_drain_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
@@ -2346,14 +2545,19 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
-            persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            persist_user_display_metadata=persist_user_display_metadata,
+            scheduled_heartbeat=scheduled_heartbeat,
+            internal=internal,
+            plugin_injected=plugin_injected,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
-        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
+        # Quiet until the reply is finished: a scheduled heartbeat, a plugin injection (a trailing
+        # silence marker is unknowable mid-stream), or a muted diagnostic wake. Other internal
+        # turns still speak as they work.
+        if not (scheduled_heartbeat or turn_ctx.plugin_injected or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )

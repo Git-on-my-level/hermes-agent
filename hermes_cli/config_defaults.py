@@ -627,6 +627,16 @@ DEFAULT_CONFIG = {
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
         # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
         "proactive_prune_tokens": 0,
+        # latency_pressure_threshold_seconds: opt-in compaction trigger on OBSERVED SLOWNESS.
+        # Some serving setups crawl long before the token threshold fires (huge effective
+        # contexts behind an oversized catalog window); when set (e.g. 120) and the median
+        # latency of the last ~10 minutes of completed real-usage calls (minimum 3) reaches
+        # this many seconds, the next turn-start preflight compacts even below `threshold`.
+        # 0 = off (default). Context floor below.
+        "latency_pressure_threshold_seconds": 0,
+        # latency_pressure_min_context_tokens: only samples from calls with at least this
+        # many real prompt tokens count toward latency pressure (0 = no floor).
+        "latency_pressure_min_context_tokens": 0,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,
@@ -1414,6 +1424,15 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
+        # important: notify for pauses, silently show inferred/done, log progress only.
+        # all: post every status; off: post only important pauses.
+        "notices": "important",
+        # Infer a goal from the agent's commitment after a real user turn (opt-in).
+        "auto_infer": False,
+        # Opt-in gateway behavior: start or replace the standing goal with each
+        # ordinary external user message. Slash commands and synthetic turns never
+        # activate it.
+        "auto_start": False,
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
@@ -1733,8 +1752,9 @@ DEFAULT_CONFIG = {
         "hook_callback_timeout": 30,
         # Deadline (seconds) for one plugin's import + register() at load. A plugin that overruns it is
         # skipped with the reason "load timed out" and the rest keep loading; the stuck worker thread is
-        # abandoned. 0 = no deadline (load inline). Max 600.
-        "load_timeout_seconds": 10,
+        # abandoned. Platform plugins keep waiting and log ERROR at this threshold instead.
+        # 0 = no optional-plugin deadline (platform warning after 120s). Max 600.
+        "load_timeout_seconds": 120,
         # Read-only plugin update-check cadence, hours (gateway tick; 0 disables). Applying stays
         # explicit: `hermes plugins update <name>`, or auto_apply below (git-class plugins only,
         # scan-gated by that same pipeline).
@@ -1893,6 +1913,10 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # Consecutive transient failures (provider unreachable, script timeout, idle timeout,
+        # empty cron output) before a notice. 1 alerts on the first failure — today's behavior.
+        # A job's transient_notify_after overrides this. The incident is still recorded immediately.
+        "transient_notify_after": 1,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
@@ -2114,6 +2138,14 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
+        # Extra directories prepended to the service definition's PATH (launchd plist /
+        # systemd unit), ahead of the deterministic host dirs' node segment and the system
+        # tail. Relative entries anchor to the service working directory; ``~`` expands
+        # against the service account's home. Lets hosts add tool dirs without hand-editing
+        # the plist/unit (see website/docs/user-guide/configuration.md, Gateway Service PATH).
+        "service_path_extra": [],
+        # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
+        # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,
         "service_install_choice": None,  # null | install | decline; never authorizes ordinary launch installation.
         # Durable delivery-obligation ledger: final responses are recorded in state.db around the
@@ -2387,6 +2419,18 @@ DEFAULT_CONFIG = {
         # merge origin/<target> INTO it after leaving a pre-update-<stamp> tag; a conflict stops the
         # update cleanly. `hermes update --switch-branch` overrides to switch for one run.
         "parked_branch_strategy": "switch",
+        # Git remote/branch ``hermes update`` and the banner behind-count track.
+        # Stock is origin/main. A maintained fork sets remote: fork, branch: prod
+        # in host config so the count is not the official origin/main shortcut.
+        "remote": "origin",
+        "branch": "main",
+        # Idle converge onto the update channel tip, or updates.pin if set. Off by default.
+        "converge": False,
+        "pin": "",
+        "pin_file": "",
+        "converge_interval": 1800,
+        "converge_busy_sla": 21600,
+        "skip_gateway_restart": False,
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,

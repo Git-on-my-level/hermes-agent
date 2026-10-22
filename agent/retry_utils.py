@@ -17,13 +17,13 @@ from typing import Any, Optional
 _jitter_counter = 0
 _jitter_lock = threading.Lock()
 
-# Z.AI Coding Plan's GLM-5.2 endpoint often returns 429 code 1305 ("service may be
-# temporarily overloaded"). Short retries hammer the same window, so after
+# Z.AI Coding Plan's GLM-5 family returns transient 429 rate limits and overloads.
+# Short retries hammer the same window, so after
 # ``_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS`` normal retries the wait widens progressively;
 # the cap stays interactive-friendly (a TUI message should fail visibly in minutes).
 # The short count is shared by ``adaptive_rate_limit_backoff`` and
 # ``zai_coding_overload_retry_ceiling`` so the two cannot silently desync.
-_ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
+_ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0, 180.0, 300.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
 
@@ -141,14 +141,22 @@ def _error_text(error: Any) -> str:
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
-    """True only for the narrow Z.AI Coding Plan overload shape (429 + code
-    1305 / "temporarily overloaded"), so ordinary quota 429s still fail fast."""
+    """Admit transient Z.AI Coding Plan GLM-5 rate limits and overloads;
+    quota-marked plan-window exhaustion still fails fast."""
     text = _error_text(error)
     return (
         getattr(error, "status_code", None) == 429
         and "api.z.ai/api/coding/paas/v4" in (base_url or "").lower()
-        and "glm-5.2" in (model or "").lower()
-        and ("1305" in text or "temporarily overloaded" in text)
+        and "glm-5" in (model or "").lower()
+        and not any(
+            rx.search(text)
+            # Singular+plural both valid: the shared parser accepts "reset in" too.
+            for rx in (_QUOTA_RESET_DELAY_RE, _RESETS_IN_RE, _RESETS_IN_SECONDS_FIELD_RE)
+        )
+        and any(
+            marker in text
+            for marker in ("1302", "1305", "rate limit", "rate_limit", "too many requests", "throttl", "temporarily overloaded")
+        )
     )
 
 
@@ -156,8 +164,8 @@ def adaptive_rate_limit_backoff(
     attempt: int, *, base_url: str | None, model: str | None, error: Any, default_wait: float,
     short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
 ) -> tuple[float, str | None]:
-    """``(wait_seconds, reason_label)``: ``default_wait`` for most providers; Z.AI Coding GLM-5.2 overloads keep
-    ``short_attempts`` short retries, then 30→60→90→120s with light jitter. ``attempt`` is 1-based."""
+    """``(wait_seconds, reason_label)``: ``default_wait`` for most providers; Z.AI Coding GLM-5 transient 429s keep
+    ``short_attempts`` short retries, then 30→60→90→120→180→300s with light jitter. ``attempt`` is 1-based."""
     if not is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
         return default_wait, None
     if attempt <= short_attempts:

@@ -16,6 +16,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -143,6 +144,19 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
         return False
 
 
+def clear_update_converge_drain(*, home: Optional[Path] = None) -> bool:
+    """Drop a leftover update-converge marker so a fresh gateway accepts turns.
+
+    On macOS ``epoch`` is empty (no /proc), so a marker survives SIGUSR1 restart
+    and the new process would stay in external drain until max-age (1h).
+    Dashboard drains (other principals) are left alone.
+    """
+    body = read_drain_request(home=home)
+    if not body or body.get("principal") != "update-converge":
+        return False
+    return clear_drain_request(home=home)
+
+
 def _marker_is_expired(body: dict[str, Any]) -> bool:
     """True iff ``requested_at`` parses AND is older than the max-age.
 
@@ -209,6 +223,20 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     """
     body = _active_drain_body(home)
     return bool(body and body.get("suppress_notification"))
+
+
+_EXTERNAL_SUPERVISOR_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def external_supervisor_shutdown_is_quiet() -> bool:
+    """True when this process is a launchd/supervisor child.
+
+    macOS ``kickstart -k`` has no ExecStop, so SIGTERM looks unplanned and the
+    home-channel shutdown broadcast fires. Linux units mark the stop first.
+    In-chat /restart does not set this env and is not this path.
+    """
+    raw = os.environ.get("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "")
+    return str(raw).strip().lower() in _EXTERNAL_SUPERVISOR_TRUTHY
 
 
 def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:

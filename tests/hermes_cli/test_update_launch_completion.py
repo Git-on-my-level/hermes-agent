@@ -19,6 +19,8 @@ def _no_tool_downloads(monkeypatch):
     import pm.client
 
     monkeypatch.setattr(pm.client, "ensure_tools_for_sync", lambda: None)
+    # Scratch trees model launch decisions, not complete serving installations.
+    monkeypatch.setattr('hermes_cli.serving_generation.publish_completed_generation', lambda *args: None)
 
 
 @pytest.fixture
@@ -50,8 +52,8 @@ def _self_checkout(tmp_path, monkeypatch):
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
-    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n", encoding='utf-8')
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}), encoding='utf-8')
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
@@ -70,8 +72,8 @@ def _committed_checkout(tmp_path, monkeypatch):
 
     root = tmp_path / "checkout"
     root.mkdir()
-    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
-    (root / ".gitignore").write_text("install-stamp.json\n")
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n", encoding='utf-8')
+    (root / ".gitignore").write_text("install-stamp.json\n", encoding='utf-8')
     for args in (["init"], ["config", "user.email", "test@example.com"],
                   ["config", "user.name", "test"], ["add", "-A"],
                   ["commit", "-m", "init"]):
@@ -112,7 +114,7 @@ def test_pristine_home_provisions_dependencies_without_rebuild(tmp_path, monkeyp
 
     root = _committed_checkout(tmp_path, monkeypatch)
     if edited:
-        (root / "pyproject.toml").write_text("[project]\nname='edited'\n")
+        (root / "pyproject.toml").write_text("[project]\nname='edited'\n", encoding='utf-8')
     assert not venv_sync.completion_pending_path(root).exists()
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
     syncs = []
@@ -139,7 +141,7 @@ def test_adoption_stamp_never_discharges_an_owed_tail(tmp_path, monkeypatch, com
     for _ in range(2):
         with pytest.raises(RuntimeError, match="completion failed"):
             venv_sync.prepare_launch(blessed, [])
-    assert "adoptedAt" in json.loads((blessed / "install-stamp.json").read_text())
+    assert "adoptedAt" in json.loads((blessed / "install-stamp.json").read_text(encoding='utf-8-sig'))
     assert len(completion_tail) == 2
     assert pending.exists()
 
@@ -168,7 +170,7 @@ def test_failed_completion_tail_is_retried_without_rebuilding_dependencies(tmp_p
     def sync(extras=None, **kwargs):
         syncs.append(extras)
         fact.parent.mkdir(parents=True, exist_ok=True)
-        fact.write_text(json.dumps({"packages": {"venv": {"stamp": "complete", "extras": ["all"]}}}))
+        fact.write_text(json.dumps({"packages": {"venv": {"stamp": "complete", "extras": ["all"]}}}), encoding='utf-8')
 
     monkeypatch.setattr(pm, "sync_venv", sync)
     completion_tail.exit_code = 1
@@ -255,9 +257,9 @@ def test_first_launch_syncs_without_marker_then_uses_completion_fact(tmp_path, m
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
-    (root / "uv.lock").write_text("lock\n")
-    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n", encoding='utf-8')
+    (root / "uv.lock").write_text("lock\n", encoding='utf-8')
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}), encoding='utf-8')
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
@@ -269,12 +271,12 @@ def test_first_launch_syncs_without_marker_then_uses_completion_fact(tmp_path, m
     def sync(extras=None, **kwargs):
         calls.append((extras, kwargs))
         fact.parent.mkdir(parents=True, exist_ok=True)
-        fact.write_text(json.dumps({"packages": {"venv": {"stamp": "complete", "extras": ["all"]}}}))
+        fact.write_text(json.dumps({"packages": {"venv": {"stamp": "complete", "extras": ["all"]}}}), encoding='utf-8')
 
     monkeypatch.setattr(pm, "sync_venv", sync)
     # A shipped updater may have written this before it reaches an inert shim.
     # It is obsolete after successful sync, not the trigger for that sync.
-    (root / ".update-incomplete").write_text("pid=-1\n")
+    (root / ".update-incomplete").write_text("pid=-1\n", encoding='utf-8')
     assert venv_sync.prepare_launch(root, []) == Path(sys.executable)
     assert calls == [(["all"], {"explicit": True, "project_root": root, "evict_incompatible_plugins": True})]
     assert not (root / ".update-incomplete").exists()
@@ -287,9 +289,9 @@ def test_first_launch_syncs_without_marker_then_uses_completion_fact(tmp_path, m
 def test_relaunch_keeps_invocation_and_checkout_imports(tmp_path, mode):
     root = tmp_path / "source"
     root.mkdir()
-    (root / "checkout_only.py").write_text("value = 'from checkout'\n")
+    (root / "checkout_only.py").write_text("value = 'from checkout'\n", encoding='utf-8')
     script = root / "entry.py"
-    script.write_text("import checkout_only, json, sys\nprint(json.dumps([checkout_only.value, sys.argv[1:]]))\n")
+    script.write_text("import checkout_only, json, sys\nprint(json.dumps([checkout_only.value, sys.argv[1:]]))\n", encoding='utf-8')
     argv = [str(script), "--profile", "name with spaces", "-c", "session"]
     orig = [sys.executable, *argv]
     module = None
@@ -311,9 +313,9 @@ def test_non_self_or_pm_launch_cannot_trigger_update(tmp_path, monkeypatch, owne
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\n")
+    (root / "pyproject.toml").write_text("[project]\n", encoding='utf-8')
     if owner:
-        (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": owner}))
+        (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": owner}), encoding='utf-8')
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -326,15 +328,15 @@ def test_failed_launch_keeps_previous_completion_and_retries(tmp_path, monkeypat
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\n")
-    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    (root / "pyproject.toml").write_text("[project]\n", encoding='utf-8')
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}), encoding='utf-8')
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     fact = runtime_facts_path(root)
     fact.parent.mkdir(parents=True)
     previous = '{"packages":{"venv":{"stamp":"previous","extras":["all","anthropic"]}}}'
-    fact.write_text(previous)
+    fact.write_text(previous, encoding='utf-8')
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
     calls = []
     def fail(extras, **kwargs):
@@ -344,7 +346,7 @@ def test_failed_launch_keeps_previous_completion_and_retries(tmp_path, monkeypat
     for _ in range(2):
         with pytest.raises(RuntimeError, match="network unavailable"):
             venv_sync.prepare_launch(root, [])
-        assert fact.read_text() == previous
+        assert fact.read_text(encoding='utf-8-sig') == previous
     assert calls == [None, None]
     assert not (root / ".update-incomplete").exists()
 
@@ -359,13 +361,13 @@ def test_blessed_legacy_install_is_adopted_before_sync(tmp_path, monkeypatch, co
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\n")
+    (root / "pyproject.toml").write_text("[project]\n", encoding='utf-8')
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
     calls = []
     monkeypatch.setattr(pm, "sync_venv", lambda *args, **kw: calls.append(args))
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: Path(sys.executable))
     assert venv_sync.prepare_launch(root, []) == Path(sys.executable)
-    assert json.loads((root / "install-stamp.json").read_text())["source"] == "adoption"
+    assert json.loads((root / "install-stamp.json").read_text(encoding='utf-8-sig'))["source"] == "adoption"
     assert calls == [(["all"],)]
 
 
@@ -386,10 +388,10 @@ def test_live_old_update_blocks_launch_sync(tmp_path, monkeypatch):
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
-    (root / "pyproject.toml").write_text("[project]\n")
-    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    (root / "pyproject.toml").write_text("[project]\n", encoding='utf-8')
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}), encoding='utf-8')
     marker = root / ".update-incomplete"
-    marker.write_text(f"pid={os.getpid()}\n")
+    marker.write_text(f"pid={os.getpid()}\n", encoding='utf-8')
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
     monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: pytest.fail("raced old updater"))
@@ -414,11 +416,11 @@ def test_launch_under_the_owning_update_does_not_run_the_tail_again(tmp_path, mo
     root = _self_checkout(tmp_path, monkeypatch)
     pending = venv_sync.completion_pending_path(root)
     pending.parent.mkdir(parents=True)
-    pending.write_text("owed\n")
+    pending.write_text("owed\n", encoding='utf-8')
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
     marker = update_marker_path()
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"{os.getppid()}\n{int(time.time())}\n")  # an ancestor holds the update
+    marker.write_text(f"{os.getppid()}\n{int(time.time())}\n", encoding='utf-8')  # an ancestor holds the update
 
     assert venv_sync.prepare_launch(root, []) is None
     assert completion_tail == []
@@ -451,8 +453,8 @@ def test_supervised_launch_leaves_a_pending_tail_to_the_cli(
 
     systemd/launchd/s6 restart the gateway under a policy; with a marker that never
     clears, each boot would rebuild the completion environment until the disk fills.
-    The obligation stays with `hermes update`. An off value (`0`/`false`) is not a
-    supervised launch and still repays the tail.
+    The obligation stays with `hermes update`. Even an unsupervised gateway
+    without a completed generation must refuse rather than repay it at startup.
     """
     import pm
     from hermes_cli import _launchers
@@ -460,34 +462,27 @@ def test_supervised_launch_leaves_a_pending_tail_to_the_cli(
     root = _self_checkout(tmp_path, monkeypatch)
     pending = venv_sync.completion_pending_path(root)
     pending.parent.mkdir(parents=True)
-    pending.write_text("owed\n")
+    pending.write_text("owed\n", encoding='utf-8')
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: Path(sys.executable))
     monkeypatch.delenv("HERMES_SUPERVISED_CHILD", raising=False)
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
     monkeypatch.setenv(marker, value)
 
-    assert venv_sync.prepare_launch(root, ["gateway", "run"]) is None
-    if owed_by_cli:
-        assert completion_tail == []
-        assert pending.is_file(), "a supervised child discharged an obligation the CLI still owes"
-        out, err = capsys.readouterr()
-        assert out == "" and err.count("run `hermes update`") == 1
-    else:
-        assert len(completion_tail) == 1
-        assert not pending.is_file()
+    with pytest.raises(RuntimeError, match='Refusing gateway startup'):
+        venv_sync.prepare_launch(root, ['gateway', 'run'])
+    assert completion_tail == []
+    assert pending.is_file(), 'serving discharged a CLI-owned update obligation'
 
 
 def test_supervised_launch_with_stale_dependencies_still_syncs(
     tmp_path, monkeypatch, completion_tail
 ):
-    """Stale dependencies stay one-shot for a supervised child (#123340 review).
+    """A supervised non-gateway command still syncs and finishes the tail (#123340).
 
-    A hand-run ``git pull`` leaves the tree's lockfile ahead of the installed
-    tools with no pending marker; a manager restart must still sync and finish
-    (pre-image behavior) instead of booting on the stale dependency graph — or
-    crash-looping under ``Restart=always`` with no sync at all. The sticky-tail
-    exemption above must not swallow this one-shot condition.
+    ``gateway run`` serves a completed generation and never runs a sync.
+    A hand-run ``git pull`` followed by a supervised ``hermes update`` must still
+    finish the product tail instead of booting on the stale graph.
     """
     import pm
     from hermes_cli import _launchers
@@ -499,7 +494,38 @@ def test_supervised_launch_with_stale_dependencies_still_syncs(
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: Path(sys.executable))
     monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
 
-    venv_sync.prepare_launch(root, ["gateway", "run"])
+    venv_sync.prepare_launch(root, ["update"])
     assert syncs, "a supervised child booted on a stale dependency graph without syncing"
     assert completion_tail, "the tail armed by that sync was never finished"
     assert not venv_sync.completion_pending_path(root).is_file()
+
+
+def test_supervised_gateway_without_completed_dependencies_refuses_without_sync(
+    tmp_path, monkeypatch, completion_tail
+):
+    """Serving must not provision an unfinished graph on watchdog restart."""
+    import pm
+    root = _self_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, 'sync_venv', lambda *a, **kw: pytest.fail('serving ran a dependency sync'))
+    monkeypatch.setenv('HERMES_SUPERVISED_CHILD', '1')
+    with pytest.raises(RuntimeError, match='Refusing gateway startup'):
+        venv_sync.prepare_launch(root, ['gateway', 'run'])
+    assert completion_tail == []
+    assert not venv_sync.completion_pending_path(root).is_file()
+
+
+def test_supervised_gateway_never_enters_bounded_sync_or_claims_maintenance_success(
+    tmp_path, monkeypatch, completion_tail
+):
+    """An unvalidated serving boot refuses before a sync phase can announce success."""
+    from hermes_cli.serving_recovery import maintenance_path
+    from gateway.application_readiness import receipt_path
+    root = _self_checkout(tmp_path, monkeypatch)
+    monkeypatch.setenv('HERMES_SUPERVISED_CHILD', '1')
+    monkeypatch.setattr('hermes_cli.serving_recovery.run_bounded_dependency_sync',
+                        lambda *a, **kw: pytest.fail('serving entered bounded sync'))
+    with pytest.raises(RuntimeError, match='Refusing gateway startup'):
+        venv_sync.prepare_launch(root, ['gateway', 'run'])
+    assert completion_tail == []
+    assert not maintenance_path().exists()
+    assert not receipt_path().exists()

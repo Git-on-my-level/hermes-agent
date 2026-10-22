@@ -69,6 +69,7 @@ from hermes_cli.setup import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_cli.gateway_profile_lifecycle import owned_gateway_pid as _owned_gateway_pid
+from hermes_cli import gateway_service_path as _service_path_module
 logger = logging.getLogger(__name__)
 
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
@@ -3051,26 +3052,46 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)  # Completely custom path (not under ~/.hermes) — keep as-is
 
 
-def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
-    """Build PATH directory list for service units, excluding non-existent dirs."""
-    if project_root is None:
-        project_root = PROJECT_ROOT
+# Operator escape hatch (gateway install --reset-service-path): when True, the next generated
+# launchd plist derives its PATH purely from this environment instead of carrying forward
+# entries from the installed plist. Reset to False after each install command.
+_reset_service_path: bool = False
 
-    def _is_dir(path: Path) -> bool:
-        try:
-            return path.is_dir()
-        except OSError:
-            return False
 
-    candidates = []
-    # Python and dependency executable paths are selected at boot, not persisted.
+# Service-PATH behaviour lives in the topical sibling hermes_cli/gateway_service_path.py
+# (AGENTS.md: never append new behaviour to a facade). These thin delegations are the
+# seam tests and backend modules bind to: they patch the names on this facade and the
+# sibling bodies call back through _gw(), so patching here still intercepts everything.
+def _expand_tilde(entry: str, home: Path) -> str:
+    return _service_path_module._expand_tilde(entry, home)
 
-    hermes_home = get_hermes_home()
-    extras = (project_root / "node_modules" / ".bin", hermes_home / "node" / "bin", hermes_home / "node_modules" / ".bin")
-    for extra in extras:
-        if _is_dir(extra):
-            candidates.append(str(extra))
-    return candidates
+
+def _resolve_service_path_entry(entry: str, home: Path | None = None) -> str:
+    return _service_path_module._resolve_service_path_entry(entry, home)
+
+
+def _service_path_extra_dirs(home: Path | None = None) -> list[str]:
+    return _service_path_module._service_path_extra_dirs(home)
+
+
+def _service_tool_dirs(home: Path | None = None) -> list[str]:
+    return _service_path_module._service_tool_dirs(home)
+
+
+def _service_system_dirs() -> list[str]:
+    return _service_path_module._service_system_dirs()
+
+
+def _normalize_service_path_entry(entry: str) -> str:
+    return _service_path_module._normalize_service_path_entry(entry)
+
+
+def _strip_canonical_system_dirs(entries: list[str], system_dirs: list[str]) -> list[str]:
+    return _service_path_module._strip_canonical_system_dirs(entries, system_dirs)
+
+
+def _build_service_path_dirs(project_root: Path | None = None, home: Path | None = None) -> list[str]:
+    return _service_path_module._build_service_path_dirs(project_root, home)
 
 
 def _stable_service_working_dir() -> str:
@@ -3200,7 +3221,23 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     working_dir = _stable_service_working_dir()
     project_root = PROJECT_ROOT
 
-    path_entries = _build_service_path_dirs()
+    if system:
+        # The service runs as the TARGET user: its head PATH segments (configured extras,
+        # tool dirs, hermes-home extras) must come from the TARGET user's hermes home /
+        # config, never from the invoking (sudo) caller's — read them under the target-home
+        # override, then restore, exactly like _systemd_watchdog_seconds does. The OS home
+        # (~/.local/bin probe, ~ expansion) is passed explicitly: Path.home()/$HOME stay the
+        # INSTALLER's under sudo and the override does not change them.
+        username, group_name, home_dir, uid = _system_service_identity(run_as_user)
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        target_hermes_home = _hermes_home_for_target_user(home_dir)
+        override_token = set_hermes_home_override(target_hermes_home)
+        try:
+            path_entries = _build_service_path_dirs(home=Path(home_dir))
+        finally:
+            reset_hermes_home_override(override_token)
+    else:
+        path_entries = _build_service_path_dirs()
     if not system:
         # System units add managed Node once the TARGET user's home is known (not the sudo caller's).
         _append_node_dir_for_service(path_entries)
@@ -3223,10 +3260,10 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         project_root = Path(_remap_path_for_user(str(project_root), home_dir))
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
-        # Managed Node for the TARGET user's tree, prepended so it outranks remapped shell-PATH entries.
-        _target_node_entries: list[str] = []
-        _append_node_dir_for_service(_target_node_entries, Path(hermes_home) if hermes_home else None)
-        path_entries = [e for e in _target_node_entries if e not in path_entries] + path_entries
+        # Managed Node for the TARGET user's tree (not the sudo caller's), appended so it
+        # ranks after ~/.local/bin and service_path_extra — same contract as user units.
+        # Prepending here used to outrank remapped caller-PATH entries; those are gone.
+        _append_node_dir_for_service(path_entries, Path(hermes_home) if hermes_home else None)
         user_home = Path(home_dir)
         identity_lines = f"User={username}\nGroup={group_name}\n"
         # Restart-safe cron/Kanban workers cross `systemd-run --user`, which needs this user's manager;
@@ -3253,8 +3290,23 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         systemd_type, systemd_watchdog_directives = "notify", f"NotifyAccess=main\nWatchdogSec={watchdog_seconds}s\n"
     path_entries.extend(_build_user_local_paths(user_home, path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
-    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
-    sane_path = ":".join(path_entries)
+    # Canonical system dirs live ONLY in the tail: strip equivalents (normalized spellings
+    # included) from the assembled head, dedupe, then append the tail once, last.
+    system_dirs = _service_system_dirs()
+    path_entries = _strip_canonical_system_dirs(path_entries, system_dirs)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for entry in path_entries:
+        norm = _normalize_service_path_entry(entry)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(entry)
+    deduped.extend(d for d in system_dirs if _normalize_service_path_entry(d) not in seen)
+    # _systemd_env_line escapes backslashes/quotes and doubles % specifiers; a raw f-string
+    # here would let a hostile dir name (service_path_extra, carried entries) corrupt or break
+    # the Environment= assignment.
+    sane_path_line = _systemd_env_line("PATH", ":".join(deduped)).strip()
     start = installation_command(project_root, [*shlex.split(profile_arg), "gateway", "run"],
                             python=python_path, home=hermes_home)
     cleanup = installation_command(project_root, module="gateway.cgroup_cleanup",
@@ -3271,7 +3323,7 @@ Wants=network-online.target
 Type={systemd_type}
 {systemd_watchdog_directives}{identity_lines}ExecStart={_systemd_command(start)}
 WorkingDirectory={working_dir}
-{env_lines}Environment="PATH={sane_path}"
+{env_lines}{sane_path_line}
 
 Environment="HERMES_HOME={hermes_home}"
 Environment="HERMES_SUPERVISED_CHILD=1"
@@ -3321,6 +3373,12 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
         r"(<key>PATH</key>\s*<string>)(.*?)(</string>)", r"\1__HERMES_PATH__\3",
         _normalize_service_definition(text), flags=re.DOTALL,
     )
+    """Normalize plist text for staleness checks. The PATH is kept: generation is deterministic
+    by construction (fixed tool/system dirs + config extras + carry-forward), so a PATH change
+    IS a definition change a caller without those dirs must not be able to veto. The carry-forward
+    segment makes regeneration converge, so the comparison stays caller-independent even when the
+    installed PATH carries dirs the invoking shell lacks."""
+    return _normalize_service_definition(text)
 
 
 def systemd_unit_is_current(system: bool = False) -> bool:
@@ -3338,6 +3396,10 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
     norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))
+    # The unit's PATH is deterministic (fixed tool/system dirs + config extras; the unit never
+    # carries caller PATH), so the byte-exact comparison is caller-independent. Ignore directives
+    # older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
+    norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))  # noqa: E731
     return norm(installed) == norm(expected)
 
 
@@ -5218,6 +5280,14 @@ def _cmd_install(args):
     elif backend == "launchd":
         launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
                         force_unit_path=getattr(args, "force_unit_path", False))
+        # Operator escape hatch: regeneration may otherwise carry forward entries from the
+        # installed plist forever; this one install derives the PATH from this environment.
+        global _reset_service_path
+        _reset_service_path = bool(getattr(args, "reset_service_path", False))
+        try:
+            launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+        finally:
+            _reset_service_path = False
     elif backend == "windows":
         _gw_windows().install(
             force=force,

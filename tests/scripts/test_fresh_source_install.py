@@ -79,18 +79,28 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
         shutil.copy2(ROOT / "agent" / name, source / "agent" / name)
     (source / "locales").mkdir()
     shutil.copy2(ROOT / "locales/en.yaml", source / "locales/en.yaml")
-    wheels = source / "wheels"
+    # Acquisition inputs live outside the Git source: removing them for the
+    # offline rerun must not turn a completed checkout into a dirty generation.
+    wheels = tmp_path / "wheels"
     wheels.mkdir()
     _wheel(wheels, "installer_probe", "1.0")
-    recipe = tomllib.loads((source / "pm/pyproject.toml").read_text())
+    recipe = tomllib.loads((source / "pm/pyproject.toml").read_text(encoding='utf-8-sig'))
     yaml_dep = next(d for d in recipe["project"]["dependencies"] if d.startswith("ruamel.yaml"))
     (source / "pyproject.toml").write_text(
         '[project]\nname="installer-fixture"\nversion="1"\nrequires-python=">=3.14"\n'
         f'dependencies=["installer-probe==1.0",{json.dumps(yaml_dep)}]\n'
         '[project.optional-dependencies]\nall=[]\n[dependency-groups]\ndev=[]\ntest=[]\n'
         '[tool.uv]\npackage=false\n'
-        '[tool.uv.sources]\ninstaller-probe={path="wheels/installer_probe-1.0-py3-none-any.whl"}\n',
+        '[tool.uv.sources]\ninstaller-probe={path='
+        + json.dumps(str(wheels / "installer_probe-1.0-py3-none-any.whl")) + '}\n',
         encoding="utf-8")
+    # Completion must produce a validated serving archive, even in this tiny
+    # application fixture; retained source resources are part of that contract.
+    shutil.copytree(ROOT / "scripts/bundles", source / "scripts/bundles")
+    (source / "skills/fixture").mkdir(parents=True)
+    (source / "skills/fixture/SKILL.md").write_text("Fixture serving skill\n", encoding="utf-8")
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8-sig")
+    (source / ".gitignore").write_text(ignored, encoding="utf-8")
     run([uv, "lock", "--python", str(python)], cwd=source)
     # Only the application is a fixture; the shell, PM, bootstrap and writer run unchanged.
     # Completion still imports the CLI's checkout root during post-install maintenance.
@@ -135,13 +145,13 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
         assert not (install / ".hermes-bootstrap-complete").exists()
         assert not (home / ".local/bin/hermes").exists()
         for facts in (home / ".hermes/installs").glob("*/facts.json"):
-            assert "venv" not in json.loads(facts.read_text())["packages"]
+            assert "venv" not in json.loads(facts.read_text(encoding='utf-8-sig'))["packages"]
         assert '"stage":"python-deps"' in result.stdout
         return
     assert '"stage":"python-deps"' in result.stdout
-    assert json.loads((install / ".hermes-bootstrap-complete").read_text())["pinnedCommit"] == commit
+    assert json.loads((install / ".hermes-bootstrap-complete").read_text(encoding='utf-8-sig'))["pinnedCommit"] == commit
     facts = next((home / ".hermes/installs").glob("*/facts.json"))
-    selection = json.loads(facts.read_text())["packages"]["venv"]
+    selection = json.loads(facts.read_text(encoding='utf-8-sig'))["packages"]["venv"]
     launcher = home / ".local/bin/hermes"
     child = json.loads(run([str(launcher), "from elsewhere"]).stdout)
     assert child["argv"] == ["from elsewhere"]
@@ -153,7 +163,8 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
     assert json.loads(run([str(launcher), "from setup"]).stdout)["argv"] == ["from setup"]
     # Warm path publication must work with all acquisition inputs unavailable.
     shutil.rmtree(docroot)
-    shutil.rmtree(install / "wheels")
+    shutil.rmtree(wheels)
+    assert not run(["git", "status", "--porcelain"], cwd=install).stdout.strip()
     env["UV_OFFLINE"] = "1"
     # A completed bootstrap can be read-only. Finding it must not reinstall it.
     marker = bootstrap / f"lib/python{minor}/EXTERNALLY-MANAGED"

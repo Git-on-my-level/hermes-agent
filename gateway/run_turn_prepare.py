@@ -117,6 +117,9 @@ class GatewayTurnPrepareMixin:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        if skey and (not override or override.get("route_policy")):
+            from agent.route_policy import apply_gateway_policy
+            override = apply_gateway_policy(self, skey, source, user_config)
         if override:
             override_model = override.get("model", model)
             override_runtime = {

@@ -144,7 +144,7 @@ class TestHonestRunSkipMessages:
         job = create_job(name="paused job", schedule="0 7 * * *", prompt="x")
         from cron.jobs import pause_job
 
-        pause_job(job["id"])
+        pause_job(job["id"], reason="test")
         res = _execute_job_now(get_job(job["id"]))
         assert res["claimed"] is False
         assert "paused" in (res["error"] or "").lower()

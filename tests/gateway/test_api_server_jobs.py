@@ -282,12 +282,13 @@ class TestPauseJob:
             ), patch(
                 f"{_MOD}._cron_pause", mock_pause
             ):
-                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/pause", json={"reason": "maintenance"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == paused_job
                 assert data["job"]["enabled"] is False
-                mock_pause.assert_called_once_with(VALID_JOB_ID)
+                mock_pause.assert_called_once_with(VALID_JOB_ID, reason="maintenance")
 
 
 # ---------------------------------------------------------------------------
@@ -456,19 +457,24 @@ class TestCronUnavailable:
         app = _create_app(adapter)
         captured = {}
 
-        def _plain_pause(job_id):
+        def _plain_pause(job_id, reason=None, review_after=None):
             captured["job_id"] = job_id
+            captured["reason"] = reason
             return SAMPLE_JOB
 
         async with TestClient(TestServer(app)) as cli:
             with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
                 f"{_MOD}._cron_pause", _plain_pause
             ):
-                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                refused = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
+                assert refused.status == 400
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/pause", json={"reason": "maintenance"})
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == SAMPLE_JOB
                 assert captured["job_id"] == VALID_JOB_ID
+                assert captured["reason"] == "maintenance"
 
     @pytest.mark.asyncio
     async def test_list_handler_no_self_binding(self, adapter):

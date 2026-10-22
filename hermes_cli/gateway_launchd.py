@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import contextlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -160,19 +161,37 @@ def _launchctl_label_supervising_process(label: str) -> bool:
     return _gw()._launchctl_supervised_pid(label) is not None
 
 
+def _launchctl_domain_supervising_process(domain: str, label: str) -> bool:
+    """True when launchd registers ``domain/label`` AND runs a process for it.
+
+    ``launchctl list <label>`` is not domain-scoped: it resolves the label from the caller's
+    execution context, so mid-reload it can report a stale same-label job in *another* launchd
+    domain while the domain we just booted out is still unloaded. ``launchctl print
+    <domain>/<label>`` names that exact pair; a positive pid is still required, because print
+    also succeeds for a registered-but-not-running definition.
+    """
+    try:
+        loaded, pid = _gw()._launchd_print_service_pid(domain, label)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return loaded and pid is not None
+
+
 def _retry_launchctl_bootstrap_until_registered(
     domain: str, plist_path, label: str, *, deadline: float
 ) -> bool:
-    """Retry ``_launchctl_bootstrap`` until the label supervises a process or ``deadline`` passes. Under
-    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short."""
+    """Retry ``_launchctl_bootstrap`` until ``domain/label`` supervises a process or ``deadline``
+    passes. Under load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is
+    too short. The confirmation is domain-scoped so a stale same-label job in another launchd domain
+    cannot end the retry loop on a job this reload is not managing."""
     attempt = 0
     while True:
         attempt += 1
         try:
             _gw()._launchctl_bootstrap(domain, plist_path, label, timeout=30)
-            if _gw()._launchctl_label_supervising_process(label):
+            if _launchctl_domain_supervising_process(domain, label):
                 return True
-            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
+            outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl print)"
         except subprocess.CalledProcessError as exc:
             outcome = f"failed (rc={exc.returncode}) for {domain}/{label}"
         except subprocess.TimeoutExpired:
@@ -356,6 +375,133 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+def _installed_plist_path_dirs(plist_path: Path) -> list[str]:
+    """PATH entries baked into the installed plist at *plist_path*; ``[]`` when absent/unreadable
+    or malformed (fail-open: generation must be able to derive a replacement PATH)."""
+    try:
+        import plistlib
+        with plist_path.open("rb") as fh:
+            installed = plistlib.load(fh)
+        raw = (installed.get("EnvironmentVariables") or {}).get("PATH") or ""
+        if not isinstance(raw, str):
+            return []
+        return [entry for entry in raw.split(":") if entry]
+    except Exception:
+        return []
+
+
+def _launchd_service_path(priority_dirs: list[str], plist_path: Path) -> str:
+    """Assemble the launchd service PATH: a pure function of the host, not of the caller.
+
+    Segments, in order: ``priority_dirs`` (managed node dirs + host tool dirs + config extras),
+    then every entry of the INSTALLED plist's PATH that still exists on disk — regeneration
+    never shrinks the service PATH (a converge-driven regeneration once dropped
+    /opt/homebrew/bin and blinded the prod monitors for a week) — then the system dirs last.
+    The invoking shell's PATH is deliberately NOT consulted: whichever process regenerates the
+    plist (an SSH shell, ``hermes update``, the ai.hermes.converge launchd job under launchd's
+    minimal PATH) must produce the same PATH, and ``launchd_plist_is_current()`` must answer
+    identically for all of them. A caller-supplied entry would make the comparison
+    caller-dependent again and re-introduce this drift class. Hosts needing a non-standard dir
+    set ``gateway.service_path_extra``; ``gateway install --reset-service-path`` re-derives the
+    PATH without carry-forward. Entries missing on disk are dropped in every segment: launchd
+    runs before any per-shell rcfile exists, so a dead dir is pure dead weight."""
+    # Read through the facade so tests and the CLI flag share one seam (see AGENTS.md).
+    reset_service_path = bool(getattr(_gw(), "_reset_service_path", False))
+    system_dirs = _gw()._service_system_dirs()
+    normalize, strip_system = _gw()._normalize_service_path_entry, _gw()._strip_canonical_system_dirs
+
+    segments: list[str] = list(priority_dirs)
+
+    def _add_existing(entries: list[str]) -> None:
+        seen = {normalize(e) for e in segments}
+        for entry in entries:
+            norm = normalize(entry)
+            if norm in seen:
+                continue
+            try:
+                if os.path.isdir(entry):
+                    segments.append(entry)
+                    seen.add(norm)
+            except OSError:
+                continue
+
+    def _resolve_entry(entry: str) -> str:
+        # Shared resolver: relative entries anchor to the service's stable working directory
+        # (never the REGENERATING process's cwd), and ``..`` components resolve through the
+        # filesystem (realpath), because ``link/../bin`` must keep following the symlink —
+        # a lexical collapse would rewrite it to a sibling that may not exist.
+        return _gw()._resolve_service_path_entry(entry)
+
+    # Canonical system dirs never sit in mid-PATH segments — not in the tool/config head either
+    # (an operator CAN list /usr/bin in service_path_extra), in any spelling (/usr/bin/ counts):
+    # strip them, dedupe lexically, and append the tail once, last, so executable precedence is
+    # stable across regenerations.
+    segments = strip_system(segments, system_dirs)
+    seen_norm: set[str] = set()
+    deduped_segments: list[str] = []
+    for entry in segments:
+        norm = normalize(entry)
+        if norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        deduped_segments.append(entry)
+    segments = deduped_segments
+
+    caller_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
+    carried: list[str] = []
+    system_set = {normalize(d) for d in system_dirs}
+    if plist_path.exists():
+        carried = [normalize(_resolve_entry(e)) for e in _installed_plist_path_dirs(plist_path)]
+        # Snapshot the host-derived head before carry-forward so the warning names only
+        # dirs the installed plist actually rescued — not Homebrew/~/.local/bin that
+        # generation re-derives on every run (a converge under launchd's minimal PATH
+        # would otherwise log those as "carried" on every no-op regeneration).
+        pre_carry_set = {normalize(e) for e in segments}
+        if not reset_service_path:
+            for entry in carried:
+                if normalize(entry) not in system_set:
+                    _add_existing([entry])
+        caller_set = {normalize(e) for e in caller_entries}
+        segments_set = {normalize(e) for e in segments}
+        caller_lacking_carried = sorted(
+            e for e in carried
+            if normalize(e) not in caller_set and normalize(e) in segments_set
+            and normalize(e) not in system_set
+            and normalize(e) not in pre_carry_set
+        )
+        if caller_lacking_carried:
+            # The task-spec warning: the caller env lacks an entry the installed plist has.
+            logging.getLogger(__name__).warning(
+                "Installed service PATH has entries the caller PATH lacks; carried forward from "
+                "the installed plist: %s", ", ".join(caller_lacking_carried),
+            )
+        if reset_service_path:
+            intentionally_dropped = sorted(
+                e for e in carried
+                if normalize(e) not in segments_set and normalize(e) not in system_set
+            )
+            if intentionally_dropped:
+                logging.getLogger(__name__).warning(
+                    "--reset-service-path: dropped installed service PATH entries not derived "
+                    "from this environment: %s", ", ".join(intentionally_dropped),
+                )
+
+    segments.extend(d for d in system_dirs if normalize(d) not in {normalize(e) for e in segments})
+
+    if carried and not reset_service_path:
+        # Warnings are computed against the FINAL PATH: carried system dirs land in the tail
+        # above, so anything still listed here is truly absent from the service PATH.
+        final_set = {normalize(e) for e in segments}
+        dead = sorted({e for e in carried if normalize(e) not in final_set})
+        if dead:
+            logging.getLogger(__name__).warning(
+                "Dropping dead service PATH entries no longer present on disk: %s",
+                ", ".join(dead),
+            )
+
+    return ":".join(dict.fromkeys(segments))
+
+
 def generate_launchd_plist() -> str:
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
@@ -365,11 +511,16 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _gw().get_launchd_label()
 
-    # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
-    # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
+    # launchd's default PATH misses Homebrew, nvm, cargo…; the service PATH is assembled
+    # deterministically (node dirs, host tool dirs, config extras, carry-forward from the
+    # installed plist, system dirs last) so regeneration never depends on who ran it
+    # (see _launchd_service_path).
     priority_dirs = _gw()._build_service_path_dirs()
     _gw()._append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
+    # XML-escape the whole payload: it interpolates into the plist template below, and dir names
+    # are host-controlled (`gateway.service_path_extra`, carried-forward installed entries) — a
+    # literal '&' in a dir name must round-trip as &amp; or launchd rejects the whole plist.
+    sane_path = escape(_launchd_service_path(priority_dirs, _gw().get_launchd_plist_path()))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
@@ -381,6 +532,11 @@ def generate_launchd_plist() -> str:
 
     # Persist the configured RLIMIT_NOFILE floor: launchd defaults to soft 256, and every plist
     # rewrite would otherwise strip a manual limit and reintroduce EMFILE crashes.
+    # HardResourceLimits is the ceiling the soft limit is clamped to: launchd applies the soft
+    # value only up to the job's hard limit, so a raised floor without a matching ceiling is
+    # silently truncated on hosts whose inherited hard NumberOfFiles sits below it. Publish
+    # headroom (2x) so the gateway can also raise its own soft limit at runtime
+    # (``apply_nofile_soft_limit`` clamps to the hard limit) without a plist rewrite.
     nofile_block = ""
     try:
         from hermes_cli.resource_limits import configured_nofile_soft_limit
@@ -393,6 +549,12 @@ def generate_launchd_plist() -> str:
     <dict>
         <key>NumberOfFiles</key>
         <integer>{nofile_target}</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{nofile_target * 2}</integer>
     </dict>
 """
 
@@ -480,7 +642,7 @@ def _spawn_deferred_launchd_reload(
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    until ``launchctl print <domain>/<label>`` shows a positive pid or the drain budget elapses."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,11 +651,14 @@ def _spawn_deferred_launchd_reload(
     _gw()._append_launchd_reload_log(f"Launchd reload helper started for {target}")
 
     _reload_budget = int(_launchd_reload_budget())
-    q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
+    q_target, q_log = shlex.quote(target), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
-    # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
-    # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    # Probe the EXACT domain/label pair being bootstrapped: `launchctl list <label>` resolves the
+    # label from the caller's execution context, so a stale same-label job in another launchd domain
+    # would end the retry loop while the target domain is still unloaded. Require a POSITIVE pid too —
+    # `launchctl print` also exits 0 for a registered-but-not-running definition
+    # (mirrors _launchd_print_service_pid).
+    supervised = f"launchctl print {q_target} 2>/dev/null | grep -qE '^[[:space:]]*pid = [1-9][0-9]*[[:space:]]*$'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -507,10 +672,10 @@ def _spawn_deferred_launchd_reload(
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
         f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-        f"  if {listed}; then break; fi; "
+        f"  if {supervised}; then break; fi; "
         f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
         f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
+        f"if ! {supervised}; then "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
         f"fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
@@ -674,6 +839,11 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     print()
     print("✓ Service installed and loaded!")
     _gw()._clear_launchd_unsupported_marker()
+    try:
+        from hermes_cli.update_converge import maybe_install_converge_agent
+        maybe_install_converge_agent()
+    except Exception:
+        pass
     print()
     print("Next steps:")
     print("  hermes gateway status             # Check status")

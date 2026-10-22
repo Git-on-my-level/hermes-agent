@@ -1093,6 +1093,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
+            from gateway.drain_control import external_supervisor_shutdown_is_quiet
+            if external_supervisor_shutdown_is_quiet() and not self._restart_requested:
+                logger.info(
+                    "Home-channel shutdown broadcast suppressed: external supervisor recycle"
+                )
+                return
         # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
         # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
         # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
@@ -2126,12 +2132,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                from gateway.drain_control import drain_notification_suppressed
                 atomic_json_write(
                     _planned_restart_notification_path(),
                     {
                         "requested_at": time.time(),
                         "via_service": bool(self._restart_via_service),
                         "detached": bool(self._restart_detached),
+                        # A quiet drain stays quiet across the restart: the booting gateway
+                        # skips the "Gateway online" broadcast when this is set.
+                        "quiet": drain_notification_suppressed(),
                     },
                     indent=None,
                 )

@@ -134,6 +134,20 @@ def _cleanup_oneshot_runtime() -> None:
             pass
 
 
+def _emit_uncaught_oneshot_failure(message: str, exit_code: int) -> None:
+    """One failure record when json mode died before ``run_oneshot`` wrote one."""
+    from hermes_cli.oneshot_result import build_oneshot_result_record, write_oneshot_result_line
+
+    # Called from except handlers ahead of the hard exit: a failed write
+    # (broken pipe) must not escape into interpreter teardown.
+    try:
+        write_oneshot_result_line(sys.stdout, build_oneshot_result_record(
+            response=None, result={}, exit_code=exit_code, failure=message,
+        ))
+    except Exception:
+        pass
+
+
 def _run_and_exit_oneshot(
     prompt: str,
     *,
@@ -144,7 +158,9 @@ def _run_and_exit_oneshot(
     usage_file: object = None,
     resume: object = None,
     reasoning: object = None,
+    output_format: object = None,
 ) -> None:
+    json_mode = output_format == "json"
     try:
         from hermes_cli.oneshot import run_oneshot
 
@@ -157,16 +173,22 @@ def _run_and_exit_oneshot(
             usage_file=usage_file,
             resume=resume,
             reasoning=reasoning,
+            output_format=output_format if isinstance(output_format, str) else None,
         )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         rc = 130
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            _emit_uncaught_oneshot_failure("Interrupted", 130)
     except SystemExit as exc:
         if exc.code is not None and not isinstance(exc.code, int):
             print(exc.code, file=sys.stderr)
             rc = 1
         else:
             rc = exc.code
-    except BaseException:
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            detail = exc.code if isinstance(exc.code, str) and exc.code.strip() else "hermes -z exited"
+            _emit_uncaught_oneshot_failure(detail, rc if isinstance(rc, int) and rc != 0 else 1)
+    except BaseException as exc:
         # ``run_oneshot`` already maps agent failures to an int rc; anything
         # still escaping means it malfunctioned. Print it but never fall
         # through to interpreter teardown (the SIGABRT path this routine fixes).
@@ -176,6 +198,8 @@ def _run_and_exit_oneshot(
         except Exception:
             pass
         rc = 1
+        if json_mode and not getattr(exc, "oneshot_record_written", False):
+            _emit_uncaught_oneshot_failure(str(exc) or "hermes -z failed", 1)
     try:
         _cleanup_oneshot_runtime()
     finally:
@@ -374,6 +398,7 @@ from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.converge import build_converge_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
 from hermes_cli.subcommands.gui import build_gui_parser
@@ -430,25 +455,16 @@ _startup_fast.ensure_project_root_on_path()
 # cache HERMES_HOME at import time. --profile/-p is pre-parsed from sys.argv,
 # HERMES_HOME set, and the flag stripped so argparse never sees it. Falls back
 # to ~/.hermes/active_profile for the sticky default.
-_PROFILE_NAME_RE = r"^[a-z0-9][a-z0-9_-]{0,63}$"  # mirrors hermes_cli.profiles._PROFILE_ID_RE
 # Set only when -p/--profile was on argv. Sticky active_profile must not count:
 # `hermes desktop` with no flag must not overwrite Desktop's stored profile.
 _explicit_cli_profile: str | None = None
 
 
 def _inside_mcp_add_args(argv: list, index: int) -> bool:
-    """True once argv reaches `hermes mcp add ... --args <command argv>`.
+    """True once argv reaches `hermes mcp add ... --args <command argv>`."""
+    from hermes_cli.profile_argv import inside_mcp_add_args
 
-    ``mcp add --args`` is command-argv passthrough. Flags after that point
-    belong to the child MCP command (for example Docker MCP Toolkit's
-    ``--profile``), not to Hermes' own profile selector.
-    """
-    try:
-        mcp_index = argv.index("mcp", 0, index)
-        argv.index("add", mcp_index + 1, index)
-    except ValueError:
-        return False
-    return True
+    return inside_mcp_add_args(argv, index)
 
 
 def _looks_like_hermes_invocation() -> bool:
@@ -468,53 +484,30 @@ def _exit_invalid_profile_name(value: str) -> None:
     sys.exit(2)
 
 
-def _looks_like_option_value(value: str) -> bool:
-    """A ``-p`` value that clearly belongs to some other tool (pytest's ``-p no:xdist``, a
-    third-party ``-p --flag``), never a mistyped profile name."""
-    return value.startswith("-") or ":" in value
-
-
 def _scan_profile_flag(argv: list) -> tuple:
     """Find -p/--profile/--profile= in argv -> (name, tokens_consumed, index).
 
-    Historically the flag worked even after the subcommand (`hermes chat -p
-    coder`), so scan broadly; stop at ``--`` and at the `mcp add --args`
-    passthrough region. The value is normalised (strip + casefold, matching
-    ``profiles.normalize_profile_name``) before validation so ``-p Work`` selects
-    ``work``. A value that cannot be a profile name is rejected so
-    resolve_profile_env never sys.exits on it; the rejection is explained (exit 2)
-    only when the flag comes BEFORE the first subcommand token under a real
-    ``hermes`` run — after a subcommand, ``-p`` may belong to that subcommand or a
-    plugin (`hermes kanban ... -p 8080`), and option-looking values (``no:xdist``,
-    ``--flag``) are always a silent skip.
+    The walk lives in ``hermes_cli.profile_argv`` so read-only health uses the same
+    rules. Flag sets still come from the live parser here. A value that cannot be a
+    profile name is rejected (exit 2) only when the flag comes BEFORE the first
+    subcommand token under a real ``hermes`` run — after a subcommand, ``-p`` may
+    belong to that subcommand or a plugin, and option-looking values are a silent skip.
     """
     from hermes_cli._parser import top_level_value_flag_sets
+    from hermes_cli.profile_argv import scan_profile_flag
 
     value_flags, optional_value_flags = top_level_value_flag_sets()
-    i = 0
-    saw_subcommand = False
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--" or (arg == "--args" and _inside_mcp_add_args(argv, i)):
-            break
-        if arg in {"--profile", "-p"} and i + 1 < len(argv):
-            raw = argv[i + 1]
-            value = raw.strip().casefold()
-            if re.match(_PROFILE_NAME_RE, value):
-                return value, 2, i
-            if not saw_subcommand and not _looks_like_option_value(raw) and _looks_like_hermes_invocation():
-                _exit_invalid_profile_name(raw)
-            break
-        if arg.startswith("--profile="):
-            return arg.split("=", 1)[1].strip().casefold(), 1, i
-        takes_value = "=" not in arg and i + 1 < len(argv) and (
-            arg in value_flags
-            or (arg in optional_value_flags and not argv[i + 1].startswith("-"))
-        )
-        if not takes_value and not arg.startswith("-"):
-            saw_subcommand = True
-        i += 2 if takes_value else 1
-    return None, 0, None
+    found = scan_profile_flag(argv, value_flags, optional_value_flags)
+    if (
+        found.rejected
+        and not found.saw_subcommand
+        and not found.option_looking
+        and _looks_like_hermes_invocation()
+    ):
+        _exit_invalid_profile_name(found.rejected)
+    if found.name is None:
+        return None, 0, None
+    return found.name, found.consume, found.index
 
 
 def _resolve_sudo_user_profile_env(name: str) -> str | None:
@@ -555,14 +548,9 @@ def _under_gateway_supervisor(argv: list) -> bool:
     opt-in). XPC_SERVICE_NAME is deliberately NOT consulted: interactive macOS
     terminals set it too.
     """
-    if os.environ.get("HERMES_SUPERVISED_CHILD") or os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
-        return True
-    is_gateway_cmd = next((a for a in argv if not a.startswith("-")), None) == "gateway"
-    if is_gateway_cmd and os.environ.get("INVOCATION_ID"):
-        return True
-    return os.environ.get(
-        "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    from hermes_cli.profile_argv import under_gateway_supervisor
+
+    return under_gateway_supervisor(argv)
 
 
 def _s6_supervised_gateway_run(argv: list) -> bool:
@@ -574,13 +562,9 @@ def _s6_supervised_gateway_run(argv: list) -> bool:
     registered down, because a started named slot is a second gateway beside the multiplexer.
     ``--no-supervise`` keeps the foreground run, which follows ``active_profile`` as before (#22502).
     """
-    words = [a for a in argv if not a.startswith("-")]
-    if words[:2] != ["gateway", "run"] or "--no-supervise" in argv:
-        return False
-    if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in ("1", "true", "yes"):
-        return False
-    from hermes_cli.service_manager import _s6_running
-    return _s6_running()
+    from hermes_cli.profile_argv import s6_supervised_gateway_run
+
+    return s6_supervised_gateway_run(argv)
 
 
 def explicit_cli_profile() -> str | None:
@@ -2338,6 +2322,7 @@ def _update_preflight_handled(args) -> bool:
         _cmd_update_check(
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),
+            **({"remote": args.remote} if getattr(args, "remote", None) else {}),
             **({"channel": args.channel} if getattr(args, "channel", None) else {}),
         )
         return True
@@ -2350,6 +2335,11 @@ from hermes_cli.update_receipt import update_receipt_scope
 @update_receipt_scope()
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
+    if getattr(args, "converge", False):
+        from hermes_cli.update_converge import cmd_converge_tick
+
+        cmd_converge_tick(args)
+        return
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
@@ -2428,6 +2418,11 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def cmd_converge(args):
+    from hermes_cli.update_converge import cmd_converge as _cmd_converge
+
+    _cmd_converge(args)
+
 
 def _coalesce_session_name_args(argv: list) -> list:
     """Join unquoted multi-word session names after -c/--continue and -r/--resume.
@@ -2438,7 +2433,7 @@ def _coalesce_session_name_args(argv: list) -> list:
     _SUBCOMMANDS = {
         "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
         "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
-        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve",
+        "sessions", "insights", "update", "converge", "uninstall", "profile", "dashboard", "serve",
         "desktop", "gui", "honcho", "claw", "plugins", "security", "acp", "webhook", "peer",
         "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
     }
@@ -2771,7 +2766,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "tools", "uninstall", "update", "converge",
         "usage", "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -3024,6 +3019,22 @@ def _run_oneshot_from_args(args) -> None:
 
     Bypasses cli.py entirely; the transport launcher never returns.
     """
+    output_format = getattr(args, "oneshot_output_format", None)
+    if output_format == "json":
+        _confirm_startup_expensive_model_override(args)
+        # -z honors --resume/-c/--in exactly like chat: normalize BEFORE the oneshot path.
+        _resolve_chat_session_args(args, use_tui=False)
+        _run_and_exit_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
+            usage_file=getattr(args, "usage_file", None),
+            resume=getattr(args, "resume", None),
+            reasoning=getattr(args, "reasoning", None),
+            output_format=output_format,
+        )
     from hermes_cli.gateway_chat_startup import launch_gateway_chat
     sys.exit(launch_gateway_chat(args))
 
@@ -3378,6 +3389,7 @@ def _build_cli_parser():
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
     build_vault_parser(subparsers)
     build_update_parser(subparsers, cmd_update=cmd_update)
+    build_converge_parser(subparsers, cmd_converge=cmd_converge)
     build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
     build_acp_parser(subparsers, cmd_acp=cmd_acp)
     build_profile_parser(subparsers, cmd_profile=cmd_profile)

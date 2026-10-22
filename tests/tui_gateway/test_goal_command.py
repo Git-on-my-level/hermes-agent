@@ -593,3 +593,72 @@ def test_goal_draft_uses_session_profile_without_blocking_rpc_reader(
         assert state.max_turns == 37 and state.contract.verification == "tests pass"
     result = next(frame["result"] for frame in frames if frame.get("id") == "draft")
     assert result["type"] == "send" and result["message"] == state.goal
+
+
+def _judge_json(verdicts):
+    import json
+    prompts = []
+    remaining = list(verdicts)
+
+    def judge(_call_llm, _system, prompt, _timeout):
+        prompts.append(prompt)
+        verdict = remaining.pop(0) if remaining else "done"
+        return json.dumps({"verdict": verdict, "reason": "r"})
+
+    return prompts, judge
+
+
+def test_user_turn_under_an_active_goal_is_owner_steering(server, turn_env, monkeypatch):
+    """A TUI user turn under a goal that already existed is steering; the continuation is not."""
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    goals._DB_CACHE.clear()
+    session_key = "tui-owner-steering"
+    user_text = "merge once CI is green"
+    GoalManager(session_key).set("ship the release")
+    prompts, judge = _judge_json(["continue", "done"])
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", judge)
+
+    def run_conversation(message, **_kwargs):
+        return {"final_response": "worked the turn", "completed": True, "failed": False}
+
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None,
+    )
+    server._run_prompt_submit("rid", "sid", _turn_session(agent, session_key), user_text)
+
+    state = GoalManager(session_key).state
+    texts = [m["text"] for m in state.owner_messages]
+    assert texts == [user_text]
+    assert user_text in prompts[0]
+    assert "Messages the user sent after this goal was set" in prompts[0]
+    assert len(prompts) == 2
+    assert all("[Continuing toward your standing goal" not in text for text in texts)
+    goals._DB_CACHE.clear()
+
+
+def test_goal_created_during_the_turn_is_not_seeded_from_that_message(server, turn_env, monkeypatch):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    goals._DB_CACHE.clear()
+    session_key = "tui-owner-steering-new"
+    user_text = "please ship the release"
+    prompts, judge = _judge_json(["done"])
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", judge)
+
+    def run_conversation(message, **_kwargs):
+        GoalManager(session_key).set("watch the release")
+        return {"final_response": "watching", "completed": True, "failed": False}
+
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None,
+    )
+    server._run_prompt_submit("rid", "sid", _turn_session(agent, session_key), user_text)
+
+    state = GoalManager(session_key).state
+    assert state.owner_messages == []
+    assert user_text not in prompts[0]
+    assert "Messages the user sent" not in prompts[0]
+    goals._DB_CACHE.clear()

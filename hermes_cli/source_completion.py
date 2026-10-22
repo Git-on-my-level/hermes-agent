@@ -124,8 +124,6 @@ def _complete_locked(
     if before_build is not None:
         before_build()  # never raises: a failed restart stays owed and is retried after the build
     step("build", lambda: build_update_products(root, desktop=desktop))
-    if announce:
-        print(announce)
     verdict: list[bool] = []
     step("maintenance", lambda: verdict.append(_run_post_update_maintenance(
         assume_yes=assume_yes,
@@ -137,19 +135,33 @@ def _complete_locked(
         followups=owed,
     )))
     tail_done = not owed
-    if tail_done:
-        from hermes_cli.source_stamp import write_source_stamp
+    if tail_done and all(verdict):
+        def _publish_stamp() -> None:
+            from hermes_cli.source_stamp import write_source_stamp
 
-        try:
-            write_source_stamp(root)
-        except (OSError, ValueError) as exc:
-            print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
-                  file=sys.stderr)
+            try:
+                if write_source_stamp(root) is None:
+                    raise ValueError(
+                        "completed source identity could not be read; update remains unfinished")
+            except (OSError, ValueError) as exc:
+                print(
+                    "⚠ Source update maintenance finished, but the install stamp could not be "
+                    f"written or the serving generation could not be published: {exc}",
+                    file=sys.stderr,
+                )
+                raise
+
+        step("stamp", _publish_stamp)
+        tail_done = not owed
     if followups is not None:
         followups.extend(owed)
     # The SQLite verdict is not tail work (re-running the tail cannot fix the interpreter); it
     # is reported by the maintenance step itself and only withholds an install's success.
-    return tail_done and all(verdict)
+    # Success is the stamp, not the product build that preceded maintenance.
+    success = tail_done and all(verdict)
+    if success and announce:
+        print(announce)
+    return success
 
 
 def _bootstrap_command(root: Path, argv: list[str]) -> list[str]:

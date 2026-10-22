@@ -193,11 +193,16 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             return removed  # maintenance: another process owns the install, skip rather than queue
         recover_publication(project)
         selected = selected_venv(project).parent.resolve()
+        serving = None
+        if (root / "serving-generation.json").is_file():
+            from hermes_cli.serving_generation import read_generation
+            serving = read_generation(project)
+        pinned = Path(serving["generation"]).resolve() if serving else None
         generations = root / "environments"
         if not generations.is_dir():
             return removed
         for generation in generations.iterdir():
-            if generation.is_symlink() or not generation.is_dir() or generation.resolve() == selected:
+            if generation.is_symlink() or not generation.is_dir() or generation.resolve() in (selected, pinned):
                 continue
             marker = generation / ".lease-managed"
             if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
@@ -205,6 +210,25 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             if not leases_held(generation):
                 shutil.rmtree(generation)
                 removed.append(generation)
+        sources = root / "serving-source"
+        pinned_source = Path(serving["source"]).resolve() if serving else None
+        if sources.is_dir():
+            for source in sources.iterdir():
+                marker = source / ".lease-managed"
+                if (source.is_symlink() or not source.is_dir() or source.resolve() == pinned_source
+                        or not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds):
+                    continue
+                if not leases_held(source):
+                    # A venv symlinked into environments/ (the pre-2026-10-18 snapshot layout)
+                    # keeps an un-updated process's selected_venv() resolvable through the
+                    # snapshot. Removing it under that process would strand its cron scripts
+                    # on "interpreter is missing"; treat a link whose target still lives as a
+                    # held lease. A dangling link (its generation was already collected) pins
+                    # nothing and the source is collected normally.
+                    if (source / "venv").is_symlink() and (source / "venv").exists():
+                        continue
+                    shutil.rmtree(source)
+                    removed.append(source)
     return removed
 
 

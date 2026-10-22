@@ -59,6 +59,7 @@ class GatewayTurnPersistenceMixin:
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        internal: bool = False,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -73,7 +74,12 @@ class GatewayTurnPersistenceMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # A queued chain's terminal turn owns the flag; a single turn uses the event's.
+        if isinstance(agent_result, dict) and "queued_terminal_internal" in agent_result:
+            internal = bool(agent_result.get("queued_terminal_internal"))
+        _intentional_silence = self._is_intentional_silence(agent_result, response, internal=internal)
+        if _intentional_silence and internal:
+            self._log_autonomous_internal_silence(session_key, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.

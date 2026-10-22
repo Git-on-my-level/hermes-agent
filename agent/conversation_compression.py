@@ -90,8 +90,27 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
     return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
+def reset_ui_delivery_state_after_compaction(agent: Any) -> None:
+    """Re-open mid-turn UI delivery after a successful compaction boundary.
+
+    Compaction is a phase break inside one user turn. Pre-boundary interim
+    commentary is recorded so identical phrases are not re-bubbled. After the
+    transcript is rewritten that set (and the stream-delivery tracker) must
+    clear, or Telegram commentary preview stays frozen until the final answer.
+    """
+    try:
+        agent._delivered_interim_texts = set()
+    except Exception:
+        logger.debug("could not clear delivered interim texts after compaction", exc_info=True)
+    reset = getattr(agent, "_reset_stream_delivery_tracking", None)
+    if callable(reset):
+        with _swallow("could not reset stream delivery tracking after compaction", exc_info=True):
+            reset()
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
+    reset_ui_delivery_state_after_compaction(agent)
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
@@ -3457,6 +3476,10 @@ def _finish_compaction_boundary(
         else:
             compressor._verify_compaction_cleared_threshold = True
     _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+    if session_commit_succeeded and compression_made_progress:
+        from agent.route_policy import apply_compaction_policy
+        with _swallow('route policy at compaction boundary failed: %s'):
+            apply_compaction_policy(agent, old_session_id=_old_sid)
     return _compressed_est
 
 
@@ -4440,5 +4463,6 @@ __all__ = [
     "is_compaction_progress_status",
     "replay_compression_warning",
     "revalidate_compression_feasibility",
+    "reset_ui_delivery_state_after_compaction",
     "try_shrink_image_parts_in_messages",
 ]

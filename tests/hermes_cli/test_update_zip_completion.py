@@ -77,7 +77,7 @@ def zip_update(tmp_path, monkeypatch, isolated_source_completion):
 
     def prepare(selected, *, desktop):
         assert selected == root and desktop is False
-        assert (root / "payload.txt").read_text() == "new"
+        assert (root / "payload.txt").read_text(encoding='utf-8-sig') == "new"
         events.append("prepare")
         # The pre-update snapshot must reach the real cron-loss safety net.
         jobs.write_text('{"jobs": []}', encoding="utf-8")
@@ -140,19 +140,19 @@ def test_zip_command_migrates_profiles_recovers_snapshot_and_verifies_fleet(
     update_cmd._cmd_update_impl(SimpleNamespace(branch="main", yes=True), gateway_mode)
 
     for profile in (state.active, state.sibling):
-        config = hermes_yaml.safe_load((profile / "config.yaml").read_text())
+        config = hermes_yaml.safe_load((profile / "config.yaml").read_text(encoding='utf-8-sig'))
         assert config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert config["model"]["default"] == "retained-model"
     assert (state.sibling / ".env").read_bytes() == (state.active / ".env").read_bytes()
-    assert json.loads(state.jobs.read_text()) == state.original_jobs
-    assert (state.root / "payload.txt").read_text() == "new"
+    assert json.loads(state.jobs.read_text(encoding='utf-8-sig')) == state.original_jobs
+    assert (state.root / "payload.txt").read_text(encoding='utf-8-sig') == "new"
     for name in ("tools/code.py", "apps/desktop/source.js", "new-entry/data"):
-        assert (state.root / name).read_text(encoding="utf-8") == "new"
+        assert (state.root / name).read_text(encoding="utf-8-sig") == "new"
     for name in ("apps/desktop/release/Hermes.exe", "venv/keep", "node_modules/keep", ".env"):
-        assert (state.root / name).read_text(encoding="utf-8") == "retained"
+        assert (state.root / name).read_text(encoding="utf-8-sig") == "retained"
     assert state.events == ["prepare", *([("marker", True)] if gateway_mode else []),
                             "restart", "resume", "finalize"]
-    receipt = json.loads((state.active / "logs/update_receipts/latest.json").read_text())
+    receipt = json.loads((state.active / "logs/update_receipts/latest.json").read_text(encoding='utf-8-sig'))
     assert receipt["outcome"] == "success"
     assert receipt["runtime_outcomes"][0]["outcome"] == "restarted"
     assert update_receipt._current.get() is None
@@ -236,7 +236,7 @@ def test_zip_failure_recovers_pause_without_completion_mutations(zip_update, mon
         assert raised.value.code == 1
         assert len(installed) == (5 if failure == "late-swap" else 2)
         assert (state.root / "pyproject.toml").read_bytes() == old_project
-        assert (state.root / "payload.txt").read_text() == "old"
+        assert (state.root / "payload.txt").read_text(encoding='utf-8-sig') == "old"
     if failure != "preparation":
         assert {p.relative_to(state.root): p.read_bytes() for p in state.root.rglob("*")
                 if p.is_file() and p.name != ".hermes-update-zip-swap.lock"} == original_tree

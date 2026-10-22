@@ -138,6 +138,20 @@ exec(code, main.__dict__)
 """
 
 
+def _serving_fallback_python() -> Optional[Path]:
+    """This process's own dependency-venv interpreter, or ``None`` on a bare interpreter.
+
+    A gateway dispatched from a serving snapshot execs onto the generation venv its boot
+    validated and leased, so ``sys.executable`` is always an interpreter a script may share.
+    Never answers with a bare store Python: that is the #123044/#123440 ABI mix this venv
+    launch exists to prevent.
+    """
+    if sys.prefix == sys.base_prefix:
+        return None
+    python = Path(sys.executable)
+    return python if python.is_absolute() else python.resolve()
+
+
 def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     """POSIX managed-store installs run cron ``.py`` scripts on the selected dependency venv's
     interpreter: the store Python has the repo and managed site-packages only on its in-process
@@ -146,7 +160,11 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     extensions (#123440). The venv resolves Hermes from its generation's workspace snapshot,
     rebuilt only on a dependency change, so the bootstrap puts the live checkout first.
     Lazy installs are off for the script's process tree: a script importing ``hermes_bootstrap``
-    could otherwise complete a source update and ``execv`` itself onto the bare store Python."""
+    could otherwise complete a source update and ``execv`` itself onto the bare store Python.
+    When the selection does not resolve (a serving snapshot has no ``<snapshot>/venv`` — the
+    selection record is keyed on the real checkout — and only legacy snapshots carry the
+    symlink), the process's own generation interpreter serves instead: generation switches
+    must not fail every managed-store cron script (2026-10-18 outage)."""
     from hermes_cli._launchers import resolve_store_python
     from pm.environments import project_python
 
@@ -156,6 +174,8 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     # project_python, not committed_venv as on Windows: a pre-PM venv selected before the first
     # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
     python = project_python(repo)
+    if not python.is_file():
+        python = _serving_fallback_python() or python
     if not python.is_file():
         # The caller's interpreter is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")

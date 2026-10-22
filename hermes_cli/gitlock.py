@@ -659,7 +659,7 @@ _TAG_REFRESH_TIMEOUT_SECONDS = 30
 _HISTORY_FETCH_TIMEOUT_SECONDS = 900
 
 
-def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs) -> bool:
+def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, remote: str = "origin", **run_kwargs) -> bool:
     """Refresh release tags and fill shallow history before publishing identity.
 
     A full commit graph does not imply current tags, especially after a --no-tags
@@ -689,7 +689,7 @@ def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs)
         run_git(
             ["git"], ["fetch", "--quiet", *(["--unshallow"] if shallow else []),
              *([f"--filter={fetch_filter}"] if fetch_filter else []),
-             "--no-tags", "origin", "refs/tags/v*:refs/tags/v*", *extra_refspecs],
+             "--no-tags", remote, "refs/tags/v*:refs/tags/v*", *extra_refspecs],
             cwd=str(repo_root), check=True, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=_HISTORY_FETCH_TIMEOUT_SECONDS if shallow else _TAG_REFRESH_TIMEOUT_SECONDS, **run_kwargs,

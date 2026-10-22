@@ -208,9 +208,41 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             publish_api_tool_event(authority, session_id, generation, event_type,
                                    str(call_id or ""), str(tool_name or "tool"), args, result)
 
+    def _rearm_activity_after_compaction(self, ctx) -> None:
+        """Resume typing after a mid-turn compaction boundary (Telegram clears it on status)."""
+        adapter = ctx._status_adapter
+        chat_id = ctx._status_chat_id
+        if not adapter or not chat_id or not ctx._run_still_current():
+            return
+        metadata = ctx._status_thread_metadata
+
+        async def _rearm_coro() -> None:
+            try:
+                resume = getattr(adapter, "resume_typing_for_chat", None)
+                if callable(resume):
+                    resume(chat_id)
+            except Exception:
+                pass
+            try:
+                cooldown = getattr(adapter, "_telegram_typing_cooldown_until", None)
+                if isinstance(cooldown, dict):
+                    cooldown.pop(str(chat_id), None)
+            except Exception:
+                pass
+            try:
+                send_typing = getattr(adapter, "send_typing", None)
+                if callable(send_typing):
+                    result = send_typing(chat_id, metadata=metadata)
+                    if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                        await result
+            except Exception:
+                logger.debug("post-compaction typing re-arm failed", exc_info=True)
+
+        self._schedule(_rearm_coro(), "post-compaction typing re-arm scheduling error")
+
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
-    def _setup_stream_consumer(self, platform_key):
+    def _setup_stream_consumer(self, platform_key, *, model=None, provider=None, reasoning_config=None):
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
@@ -224,17 +256,42 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        # Plugin-injected turns do not stream the reply: a trailing silence marker is unknowable
+        # until the text is complete. Cron decides on the finished response; progressive
+        # delivery, native streams, and tool-boundary segment finalizes would post the note.
+        # Other internal turns (process notices, goal wakeups) still stream their real work.
         # A finite (`-z`, `chat -q`) viewer prints only the terminal reply, like the classic quiet
         # CLI that never wired commentary. Commentary it cannot see must not be recorded as a
         # delivery, or a final that arrives as commentary (codex app-server) suppresses the reply.
-        want_interim_messages = (bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
-                                 and not _finite_viewer_turn())
+        quiet_until_final = ctx.scheduled_heartbeat or bool(ctx.plugin_injected)
+        want_stream_deltas = not quiet_until_final and scfg.enabled_for(plat_streaming)
+        want_interim_messages = (
+            bool(ctx.interim_assistant_messages_enabled) and not quiet_until_final
+            and not _finite_viewer_turn()
+        )
         if want_stream_deltas or want_interim_messages:
             try:
+                from gateway.commentary_preview import telegram_preview_channel
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._delivery_adapter_for(ctx.source)
                 if adapter:
+                    preview = False
+                    if (
+                        ctx.source.platform == Platform.TELEGRAM
+                        and ctx.interim_assistant_messages_enabled
+                        and callable(ctx.resolve_display_setting)
+                    ):
+                        raw = ctx.resolve_display_setting(
+                            ctx.user_config, platform_key, "interim_assistant_message_mode", "separate",
+                        )
+                        preview = str(raw or "").strip().lower() == "preview"
+                    commentary_mode, waiting_label = telegram_preview_channel(
+                        platform=ctx.source.platform,
+                        preview=preview,
+                        provider=provider,
+                        model=model,
+                        reasoning_config=reasoning_config,
+                    )
                     supports_incremental_stream = (
                         getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
                         or bool(getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False))
@@ -246,6 +303,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         # consumer records what reached non-editable platforms, so an interim
                         # callback carrying the final answer participates in final-send dedup.
                         on_missing_cursor="fallback" if want_interim_messages else "raise",
+                        commentary_mode=commentary_mode,
+                        commentary_waiting_label=waiting_label,
                     )
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
@@ -255,6 +314,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        quiet_until_final=bool(ctx.plugin_injected), session_key=ctx.session_key,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
@@ -1233,6 +1293,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.
             from gateway.session_cli_turn import one_turn_route
             model, runtime_kwargs = one_turn_route(self, policy, model, runtime_kwargs)
+            state = runner._peek_session_state(ctx.session_key)
+            if state and state.conversation.route_policy_notice:
+                policy_notice = state.conversation.route_policy_notice
+                state.conversation.route_policy_notice = None
+                pending_fallback_notice = ([pending_fallback_notice, policy_notice]
+                                           if pending_fallback_notice else policy_notice)
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -1267,7 +1333,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if tier is not _REQUEST_OPTION_MISSING:
                 runner._service_tier = tier
         runner._reasoning_config = reasoning_config
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(
+            platform_key,
+            model=model,
+            provider=runtime_kwargs.get("provider"),
+            reasoning_config=reasoning_config,
+        )
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,

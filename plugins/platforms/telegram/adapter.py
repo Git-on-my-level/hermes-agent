@@ -141,6 +141,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
 from agent.i18n import get_language, t
+from plugins.platforms.telegram.inbound_split import chunk_len as _inbound_chunk_len, is_near_split
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
@@ -631,6 +632,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Flushes past their pop, by (family, key): a newer chunk must not cancel them (teardown still does).
         self._committed_flush_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._pending_photo_batches: Dict[str, MessageEvent] = {}
+        self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._media_group_events: Dict[str, MessageEvent] = {}
+        self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        # Downloads still in flight for an album/burst. The quiet-window flush must not
+        # dispatch until these hit zero — the window starts when the first download
+        # finishes, and a slower sibling would otherwise become a queued follow-up.
+        self._media_collect_inflight: Dict[str, int] = {}
+        self._media_collect_idle: Dict[str, asyncio.Event] = {}
         # Aggregate client-side splits of long messages into one MessageEvent; bounds are conservative
         # for Telegram's ~1 edit/s flood envelope.
         self._text_batch_delay_seconds = self._env_float_clamped(
@@ -703,6 +713,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # Watcher reconnects always preserve the queue regardless of this setting.
         self._drop_pending_on_cold_boot: bool = self._coerce_bool_extra("drop_pending_on_cold_boot", True)
         self._dm_topics_config: list[dict[str, Any]] = extra.get("dm_topics", [])
+        # Offline messages are user input. Keep the legacy knob only to warn
+        # operators who configured dropping; polling and webhooks preserve all
+        # updates and durable update_id admission prevents duplicate dispatch.
+        self._drop_pending_on_cold_boot: bool = self._coerce_bool_extra("drop_pending_on_cold_boot", False)
+        self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -1180,7 +1195,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         reply_to_message_id: Optional[int], media_label: str, reset_media: Optional[Any] = None) -> Any:
         """Retry stale private-topic media replies once without the topic anchor. Serialized per chat with
         ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
-        async with self._chat_send_lock(send_kwargs.get("chat_id")):
+        async with self._chat_send_lock(send_kwargs.get("chat_id"), metadata):
             try:
                 return await _await_with_thread_deadline(
                     send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
@@ -1614,11 +1629,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             # initialize() only rebuilds the client when ``client.is_closed``; an abandoned aclose()
             # leaves it false, so start_polling would reuse the CLOSE-WAIT socket (alive but deaf).
             # Swap in a fresh client before initialize(). See #87057.
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
         if await self._bounded_request_step(polling_req.initialize(), "Polling request re-initialize failed/timed out (non-fatal)"):
             logger.debug("[%s] Polling request pool drained before reconnect", self.name)
         else:
-            self._orphan_and_rebuild_polling_client(polling_req)
+            await self._orphan_and_rebuild_polling_client(polling_req)
 
     async def _bounded_request_step(self, awaitable, failure_msg: str) -> bool:
         """Await a request shutdown()/initialize() under ``_DRAIN_TIMEOUT``; False (debug-logged) on failure."""
@@ -1629,7 +1644,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.debug("[%s] " + failure_msg, self.name, exc_info=True)
             return False
 
-    def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
+    async def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
         """Replace a wedged HTTPXRequest client after a hung aclose(): swap in a fresh client and close
         the old one in a detached, bounded task so it can't block the reconnect ladder.
 
@@ -1643,6 +1658,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         try:
             polling_req._client = build()
+            rebuild = getattr(type(polling_req), 'rebuild_client', None)
+            if callable(rebuild):
+                old = await rebuild(polling_req)
+            else:
+                polling_req._client = await asyncio.to_thread(build)  # noqa: SLF001
         except Exception:
             logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
             return
@@ -1654,7 +1674,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if not callable(aclose):
                     return
                 # Same cancellation-swallowing httpcore scope as shutdown(): wall-clock deadline.
-                await _await_with_thread_deadline(aclose(), timeout=_DRAIN_TIMEOUT)
+                close_on_owner = getattr(type(polling_req), 'close_client', None)
+                closing = close_on_owner(polling_req, old) if callable(close_on_owner) else aclose()
+                await _await_with_thread_deadline(closing, timeout=_DRAIN_TIMEOUT)
             except Exception:
                 logger.debug("[%s] Orphan polling client aclose failed (non-fatal)", self.name, exc_info=True)
 
@@ -1756,6 +1778,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         (#64482). It only appeared to work on Python 3.12, where those instances still had a ``__dict__``.
         """
         adapter = self
+        owner_loop = asyncio.get_running_loop()
 
         class _InstrumentedPollingRequest(type(request)):
             __slots__ = ()
@@ -1763,7 +1786,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             async def do_request(self, *args, **kwargs):
                 generation = _POLLING_GENERATION_CONTEXT.get()
                 result = await super().do_request(*args, **kwargs)
-                adapter._observe_polling_request_result(self, generation, result)
+                if asyncio.get_running_loop() is owner_loop:
+                    adapter._observe_polling_request_result(self, generation, result)
+                else:
+                    owner_loop.call_soon_threadsafe(adapter._observe_polling_request_result, self, generation, result)
                 return result
 
         request.__class__ = _InstrumentedPollingRequest
@@ -2211,6 +2237,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._polling_pending_stuck_count = 0
             return
         if not getattr(updater, "running", False):
+            if self._polling_is_backpressured():
+                self._polling_pending_stuck_count = self._polling_not_running_count = 0
+                self._check_backpressure_consumer()
+                return
             # Long-poll task gone, general-path calls still succeed, so no error_callback/probe ever
             # fires. Debounced over two probes so a just-starting updater never trips it.
             self._polling_pending_stuck_count = 0
@@ -2237,6 +2267,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
         except (TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
+        # A server queue is expected while durable acceptance is paused. Check
+        # after the await too: pressure may have appeared during the probe.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
+            return
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
             self._polling_pending_stuck_count = 0
@@ -2255,8 +2291,44 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Second consecutive stuck probe: restart polling via the network-error ladder (unless tearing down)."""
         if self._teardown_started:
             return
+        # Last guard against pressure appearing between a probe and escalation.
+        if self._polling_is_backpressured():
+            self._polling_pending_stuck_count = self._polling_not_running_count = 0
+            self._check_backpressure_consumer()
+            return
         logger.warning(log_message, self.name)
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
+
+    def _polling_is_backpressured(self) -> bool:
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        check = getattr(updater, "polling_backpressured", None)
+        return callable(check) and check() is True
+
+    def _check_backpressure_consumer(self) -> None:
+        """Alert on stalled completion without destroying the durable backlog."""
+        now = time.monotonic()
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        progress = getattr(updater, "consumer_progress", None)
+        completed = progress() if callable(progress) else 0
+        if not self._polling_is_backpressured():
+            self._pressure_since = None
+            self._pressure_completed = completed
+            return
+        since = getattr(self, "_pressure_since", None)
+        if since is None or completed != getattr(self, "_pressure_completed", None):
+            self._pressure_since = now
+            self._pressure_completed = completed
+            return
+        threshold = max(1, float(self.config.extra.get("backpressure_stall_seconds", 300)))
+        if now - since < threshold or now - getattr(self, "_pressure_alert_at", float("-inf")) < 300:
+            return
+        self._pressure_alert_at = now
+        message = ("Telegram consumer made no completion progress for %.0fs while backpressured; "
+                   "durable input retained, acceptance pauses at inbox limits. Check wedged handlers; "
+                   "Telegram retains unacknowledged input for about 24h." % (now - since))
+        logger.error("[%s] %s", self.name, message)
+        self._write_runtime_status_safe("consumer_backpressure", needs_attention=True,
+                                        error_code="telegram_consumer_stalled", error_message=message)
 
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
@@ -2268,6 +2340,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         per stall (``_PollingStallError``: an in-place restart keeps the wedged dispatcher); re-arms on progress.
         """
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
+            return
+        self._check_backpressure_consumer()
+        if self._polling_is_backpressured():
+            self._ingress_stalled_heartbeats = 0
             return
         received = getattr(self, "_updates_received_total", 0)
         dispatched = getattr(self, "_updates_dispatched_total", 0)
@@ -2301,6 +2377,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
         now = time.monotonic()
+        self._check_backpressure_consumer()
+        if self._polling_is_backpressured():
+            # Queue pressure / an outstanding durable commit is not a dead
+            # socket. Resume the stall clock only after acceptance can progress.
+            self._polling_last_progress_monotonic = now
+            return
         last_progress = getattr(self, "_polling_last_progress_monotonic", None)
         generation_started = getattr(self, "_polling_generation_started_monotonic", None)
         if last_progress is not None:
@@ -2378,6 +2460,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         updater = getattr(self._app, "updater", None) if self._app else None
         if updater is None:
             return
+        disarm = getattr(type(updater), "disarm_polling", None)
+        if callable(disarm):
+            disarm(updater)
+            return
         for attr in ("_Updater__polling_task_stop_event", "_polling_task_stop_event"):
             stop_event = getattr(updater, attr, None)
             if isinstance(stop_event, asyncio.Event):
@@ -2426,15 +2512,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
+            # Polling generations are drained above. Preserve queued updates when
+            # replacing the session: conflict recovery must never discard input.
             self._polling_conflict_recovery_generation = expected_generation
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -2943,6 +3025,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
+        from .telegram_io import io_loop
+        io = io_loop()
         # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
         request_kwargs = {
             "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
@@ -2999,13 +3083,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url(
+        proxy_url = await io.build(resolve_proxy_url,
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
             return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **general_httpx}),
                     HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **updates_httpx}))
+            from .telegram_network import _telegram_ssl_context
+            general_httpx.setdefault("verify", _telegram_ssl_context())
+            updates_httpx.setdefault("verify", _telegram_ssl_context())
+            return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
+                    HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
 
         if fallback_ips and not proxy_url and not disable_fallback:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
@@ -3021,17 +3110,23 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             _updates_transport_kwargs = dict(_transport_kwargs)
             if _updates_limits is not None:
                 _updates_transport_kwargs["limits"] = _updates_limits
-            request, get_updates_request = _pair(
-                {"transport": TelegramFallbackTransport(fallback_ips, **_transport_kwargs)},
-                {"transport": TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs)})
+            from .telegram_request import build_fallback_request
+
+            request = await io.build(build_fallback_request,
+                HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_transport_kwargs),
+                **request_kwargs)
+            get_updates_request = await io.build(build_fallback_request,
+                HTTPXRequest, transport_factory=lambda: TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs),
+                **request_kwargs)
         elif proxy_url:
             logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
         else:
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
-        return request, self._instrument_polling_request(get_updates_request)
+            request, get_updates_request = await io.build(_pair, _with_limits(), {"limits": _updates_limits})
+        from .telegram_io import isolate_request
+        return isolate_request(request), self._instrument_polling_request(isolate_request(get_updates_request))
 
     async def _initialize_app_with_retries(self, builder) -> None:
         """``app.initialize()`` with a bounded retry ladder; rebuilds ``self._app``/``self._bot`` from
@@ -3088,6 +3183,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if rebuild_app and _attempt < _max_connect - 1:
                     old_app = self._app
                     self._app = builder.build()
+                    from .telegram_io import isolate_updater
+                    isolate_updater(self._app)
                     self._bot = self._app.bot
                     # Same order as connect(): plugin handlers first (the wired-set is keyed per app, so
                     # the rebuilt app gets them again), then core and the observer in lockstep.
@@ -3099,17 +3196,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _cold_boot_drop_pending(self, *, is_reconnect: bool) -> bool:
         """Whether THIS connection asks Telegram to discard its queued updates.
 
-        A watcher reconnect always preserves them (#46621); a cold boot follows
-        ``platforms.telegram.extra.drop_pending_on_cold_boot`` (default true). The decision is logged
-        on every cold boot — a command that never ran is otherwise invisible (#71811)."""
-        drop_pending = self._drop_pending_on_cold_boot if not is_reconnect else False
+        Cold boots and reconnects always preserve input. The old destructive
+        option is deprecated and explicitly warned about when still configured."""
         if not is_reconnect:
-            logger.info(
-                "[%s] Cold boot: %s Telegram updates queued while offline "
-                "(platforms.telegram.extra.drop_pending_on_cold_boot: %s)",
-                self.name, "dropping" if drop_pending else "preserving",
-                "true" if self._drop_pending_on_cold_boot else "false")
-        return drop_pending
+            if self._drop_pending_on_cold_boot:
+                logger.warning("[%s] Ignoring drop_pending_on_cold_boot=true: preserving offline user input; "
+                               "duplicate update_ids are filtered by durable admission", self.name)
+            logger.info("[%s] Cold boot: preserving Telegram updates queued while offline", self.name)
+        return False
 
     async def _start_webhook_mode(self, webhook_url: str, *, is_reconnect: bool) -> None:
         """Start PTB's webhook server (Telegram pushes updates; lets cloud platforms auto-wake suspended
@@ -3172,9 +3266,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect via long polling, or a webhook server if ``TELEGRAM_WEBHOOK_URL`` is set.
 
-        ``is_reconnect``: False = cold boot (drop the Bot API queue unless
-        ``extra.drop_pending_on_cold_boot`` is false); True = watcher reconnect (preserve
-        queued updates, else every message sent during the outage is lost). Webhook env:
+        ``is_reconnect``: False = cold boot; True = watcher reconnect. Both preserve
+        queued user input, including when the legacy drop option is enabled. Webhook env:
         TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_PORT (8443), TELEGRAM_WEBHOOK_HOST,
         TELEGRAM_WEBHOOK_SECRET."""
         # Explicit connect() is the only operation allowed to reopen polling after a completed teardown.
@@ -3211,6 +3304,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             # connect-retry rebuild in _initialize_app_with_retries gets it too.
             builder = builder.concurrent_updates(build_update_processor(self.config.extra, self.name))
             self._app = builder.build()
+            from .telegram_io import isolate_updater
+            isolate_updater(self._app)
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
@@ -3337,6 +3432,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._media_group_tasks, self._media_group_events, self._pending_photo_batch_tasks,
             self._pending_photo_batches, self._pending_text_batch_tasks, self._pending_text_batches):
             d.clear()
+        # Partial test adapters build via object.__new__ and never run __init__.
+        idle_map = getattr(self, "_media_collect_idle", None)
+        if idle_map:
+            for idle in idle_map.values():
+                idle.set()
+            idle_map.clear()
+        inflight = getattr(self, "_media_collect_inflight", None)
+        if inflight is not None:
+            inflight.clear()
         self._clear_task_attrs_except(
             current_task, "_polling_error_task", "_polling_progress_verifier_task", "_held_inbound_redispatch_task")
 
@@ -3656,7 +3760,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return SendResult(success=True, message_id=None)
         # One chat at a time (held only around the API calls, never across the reconnect wait above), so
         # two concurrent split replies to one chat cannot interleave their chunks (#114396).
-        async with self._chat_send_lock(chat_id):
+        async with self._chat_send_lock(chat_id, metadata):
             return await self._send_text_locked(chat_id, content, reply_to, metadata)
 
     async def _send_text_locked(
@@ -3775,7 +3879,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return None
         delivered = list(raw.get("delivered_message_ids") or ())
         prior = len(delivered)
-        async with self._chat_send_lock(chat_id):
+        async with self._chat_send_lock(chat_id, metadata):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
@@ -3844,7 +3948,25 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         silently nor fail (the consumer would re-send a duplicate): edit with the first chunk, send the rest as
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            # Dead adapter after a supervisor rebuild: edit the live replacement
+            # instead of success=False (silent commentary scatter). send() already
+            # delegates; an in-flight consumer still holds the old instance whose
+            # _bot stays None, and a silent False here makes every later commentary
+            # item a fresh send.
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+                return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+            live = self._replacement_telegram_adapter()
+            if not self._bot and live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if not self._bot:
+                return SendResult(success=False, error="Not connected", retryable=True)
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
         # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
         # control. A final edit is never gated (the completed answer is always delivered). Sends wait for
@@ -5509,13 +5631,27 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     # ``object.__new__()`` (no __init__).
 
     @contextlib.asynccontextmanager
-    async def _chat_send_lock(self, chat_id: Any):
-        """FIFO per-chat gate around outgoing API calls, reentrant within one asyncio task (media paths
-        nest: send_voice → send_document, and ``super().send_*`` fallbacks reach ``send()``; a plain
-        ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends for good)."""
+    async def _chat_send_lock(self, chat_id: Any, metadata: Optional[Dict[str, Any]] = None):
+        """FIFO per-conversation-stream gate around outgoing API calls, reentrant within one asyncio
+        task (media paths nest: send_voice → send_document, and ``super().send_*`` fallbacks reach
+        ``send()``; a plain ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends
+        for good).
+
+        Keyed by chat plus topic, not chat alone. A chat-only lock serializes a forum group's
+        independent topic streams behind each other. Topic ids partition those views, so same-stream
+        ordering stays intact while cross-topic sends run in parallel. Sends without topic metadata
+        AND Telegram's General topic (thread 1) share the bare chat FIFO, because both render in the
+        same view. General is omitted by ``_message_thread_id_for_send`` (sendMessage rejects
+        ``message_thread_id=1``), so the lock uses that same Bot-API-normalized thread id.
+        """
+        thread_id = self._message_thread_id_for_send(self._metadata_thread_id(metadata))
         key = str(normalize_telegram_chat_id(chat_id))
         locks: dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
         owners: dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
+        if thread_id:
+            key = f"{key}:{thread_id}"
+        locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
+        owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
         task = asyncio.current_task()
         if owners.get(key) is task:
             yield
@@ -6508,9 +6644,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
-        # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
+        # A >4096 UTF-16 command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
-        if len(event.text or "") >= self._SPLIT_THRESHOLD:
+        if is_near_split(event.text):
             self._enqueue_text_event(event)
             return
         await self.handle_message(event)
@@ -6561,11 +6697,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._hold_inbound_event(event, where="text-enqueue")
             return
         super()._enqueue_text_event(event)
+        # Base stores Python len(); Telegram splits on UTF-16.
+        pending = self._pending_text_batches.get(self._text_batch_key(event))
+        if pending is not None:
+            pending._last_chunk_len = _inbound_chunk_len(event.text)  # type: ignore[attr-defined]
         self._accept_update()
 
-    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
+    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None, collect_token: Optional[str] = None) -> None:
         """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
-        the pop but before durable dispatch re-holds the event (never lose it)."""
+        the pop but before durable dispatch re-holds the event (never lose it).
+
+        ``collect_token`` holds the pop while a sibling attachment for that album/burst is still
+        downloading. The quiet window starts when the first item is enqueued, which is after its
+        download; without the hold a slower sibling misses the window and is queued as the next turn.
+        """
         current_task = asyncio.current_task()
         committed = self.__dict__.setdefault("_committed_flush_tasks", {})
         event = None
@@ -6573,8 +6718,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await asyncio.sleep(delay)
             # Superseded flush (a newer chunk re-armed the timer while our sleep was already done):
             # CancelledError only lands at the next await, so check synchronously before the pop.
-            owner = tasks.get(key)
-            if owner is not None and owner is not current_task:
+            if not self._flush_still_owner(tasks, key, current_task):
+                return
+            if collect_token and not await self._wait_media_collect_idle(collect_token, tasks, key, current_task):
+                return
+            if not self._flush_still_owner(tasks, key, current_task):
                 return
             event = pending.pop(key, None)
             if not event:
@@ -6603,6 +6751,62 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 committed.pop((where, key), None)
             if tasks.get(key) is current_task:
                 tasks.pop(key, None)
+
+    @staticmethod
+    def _flush_still_owner(tasks: dict, key: str, current_task) -> bool:
+        owner = tasks.get(key)
+        return owner is None or owner is current_task
+
+    def _media_collect_token(self, msg, event: MessageEvent) -> Optional[str]:
+        """Album items share a media_group_id; photo bursts share a batch key.
+
+        Voice, video, and documents dispatch immediately, so they must not take a token.
+        Computing a photo-burst key calls ``_event_session_key``, which partial test
+        adapters and pre-download size gates do not satisfy.
+        """
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id:
+            return f"album:{media_group_id}"
+        if not getattr(msg, "photo", None):
+            return None
+        return f"burst:{self._photo_batch_key(event, msg)}"
+
+    def _ensure_media_collect_maps(self) -> None:
+        if not hasattr(self, "_media_collect_inflight"):
+            self._media_collect_inflight = {}
+        if not hasattr(self, "_media_collect_idle"):
+            self._media_collect_idle = {}
+
+    def _begin_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
+        inflight = self._media_collect_inflight.get(token, 0) + 1
+        self._media_collect_inflight[token] = inflight
+        if inflight == 1:
+            self._media_collect_idle[token] = asyncio.Event()
+
+    def _end_media_collect(self, token: str) -> None:
+        self._ensure_media_collect_maps()
+        remaining = self._media_collect_inflight.get(token, 0) - 1
+        if remaining > 0:
+            self._media_collect_inflight[token] = remaining
+            return
+        self._media_collect_inflight.pop(token, None)
+        idle = self._media_collect_idle.pop(token, None)
+        if idle is not None:
+            idle.set()
+
+    async def _wait_media_collect_idle(self, token: str, tasks: dict, key: str, current_task) -> bool:
+        """Block until sibling downloads for ``token`` finish. False if a newer flush took the slot."""
+        inflight = getattr(self, "_media_collect_inflight", None)
+        idle_map = getattr(self, "_media_collect_idle", None)
+        while inflight is not None and inflight.get(token, 0) > 0:
+            if not self._flush_still_owner(tasks, key, current_task):
+                return False
+            idle = idle_map.get(token) if idle_map is not None else None
+            if idle is None:
+                return self._flush_still_owner(tasks, key, current_task)
+            await idle.wait()
+        return self._flush_still_owner(tasks, key, current_task)
 
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """Adaptive delay: near-split-point last chunk → long delay (continuation almost certain);
@@ -6638,7 +6842,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Send a buffered photo burst/album as a single MessageEvent."""
         await self._flush_buffered(
             self._pending_photo_batches, self._pending_photo_batch_tasks, batch_key, self._media_batch_delay_seconds, "photo",
-            lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)))
+            lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)),
+            collect_token=f"burst:{batch_key}")
 
     def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
         """Merge ``event`` into ``pending[key]`` (media + caption) or seed it."""
@@ -6831,6 +7036,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
+        # Hold the album/burst open for the whole download. The quiet window starts when the
+        # first item is enqueued (after its download); a slower sibling must still join that
+        # first message instead of hitting the busy queue.
+        collect_token = self._media_collect_token(msg, event)
+        if collect_token:
+            self._begin_media_collect(collect_token)
+        try:
+            return await self._cache_and_route_media(msg, event)
+        finally:
+            if collect_token:
+                self._end_media_collect(collect_token)
+
+    async def _cache_and_route_media(self, msg, event: MessageEvent) -> None:
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
@@ -6878,7 +7096,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _flush_media_group_event(self, media_group_id: str) -> None:
         await self._flush_buffered(
-            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group")
+            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group",
+            collect_token=f"album:{media_group_id}")
 
     async def _handle_sticker(self, msg: Message, event: MessageEvent) -> None:
         """Describe a sticker via vision, cached by file_unique_id; animated/video stickers get an emoji placeholder."""
