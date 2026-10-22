@@ -14,7 +14,8 @@ import pytest
 
 import cron.incidents as incidents
 from cron.jobs import create_job, get_due_jobs, get_job, load_jobs, mark_job_run, remove_job, save_jobs
-from cron.scheduler import _RunDelivery, _finish_completed_run
+from cron.scheduler import _RunDelivery
+from cron.scheduler_bookkeeping import finish_completed_run as _finish_completed_run
 from hermes_cli.cron import cron_doctor, cron_incidents
 
 

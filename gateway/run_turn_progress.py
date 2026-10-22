@@ -991,20 +991,62 @@ class GatewayTurnProgressMixin:
                 ctx.source.platform.value if ctx.source.platform else "unknown", event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            if str(event_type or "") == "compacted":
+                self._rearm_activity_after_compaction(ctx)
             return
         def present():
             if local_viewer_turn(self):
                 self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
                                                           "text": prepared})
+                if str(event_type or "") == "compacted":
+                    self._rearm_activity_after_compaction(ctx)
                 return
             fut = self._schedule(
                 _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
-            if fut is not None and ctx._cleanup_progress:
+            if fut is None:
+                if str(event_type or "") == "compacted":
+                    self._rearm_activity_after_compaction(ctx)
+                return
+            if ctx._cleanup_progress:
                 fut.add_done_callback(self._track_future_cleanup_id)
+            if str(event_type or "") == "compacted":
+                fut.add_done_callback(lambda _fut: self._rearm_activity_after_compaction(ctx))
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
                             diagnostic=is_warning_status(event_type, message))
+
+    def _rearm_activity_after_compaction(self, ctx) -> None:
+        """Resume typing after a mid-turn compaction boundary (Telegram clears it on status)."""
+        adapter = ctx._status_adapter
+        chat_id = ctx._status_chat_id
+        if not adapter or not chat_id or not ctx._run_still_current():
+            return
+        metadata = ctx._status_thread_metadata
+
+        async def _rearm_coro() -> None:
+            try:
+                resume = getattr(adapter, "resume_typing_for_chat", None)
+                if callable(resume):
+                    resume(chat_id)
+            except Exception:
+                pass
+            try:
+                cooldown = getattr(adapter, "_telegram_typing_cooldown_until", None)
+                if isinstance(cooldown, dict):
+                    cooldown.pop(str(chat_id), None)
+            except Exception:
+                pass
+            try:
+                send_typing = getattr(adapter, "send_typing", None)
+                if callable(send_typing):
+                    result = send_typing(chat_id, metadata=metadata)
+                    if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                        await result
+            except Exception:
+                logger.debug("post-compaction typing re-arm failed", exc_info=True)
+
+        self._schedule(_rearm_coro(), "post-compaction typing re-arm scheduling error")
 
 
 def local_viewer_turn(runner) -> bool:

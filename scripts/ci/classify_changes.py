@@ -434,6 +434,11 @@ _E2E_LANES: dict[str, tuple[str, ...]] = {
         "hermes_cli/install_",
         "hermes_cli/_install_",
         "hermes_cli/main_install",
+        # Imported by the update entry points; the lane owns them directly.
+        "hermes_cli/serving_generation.py",
+        "hermes_cli/serving_recovery.py",
+        "hermes_cli/config_effective.py",
+        "gateway/drain_control.py",
         *_UPDATE_PIPELINE,
         *_UPDATE_ENTRY_POINTS,
         *_UPDATE_DEPENDENCIES,

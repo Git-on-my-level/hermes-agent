@@ -310,16 +310,19 @@ def test_finish_prints_success_only_after_a_terminal_receipt(tmp_path, monkeypat
     receipt_dir = home / "logs" / "update_receipts"
     receipt_dir.mkdir(parents=True)
     update_id = "receipt-order"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    hermes_constants._default_hermes_root_memo = None
     order: list[str] = []
 
     def finalize(code, reason):
         order.append("finalize")
         (receipt_dir / f"update_x_{update_id}.json").write_text(
-            json.dumps({"update_id": update_id, "finished_at": "t", "exit_code": code}),
+            json.dumps({"update_id": update_id, "finished_at": "t", "exit_code": code, "outcome": "success"}),
             encoding="utf-8",
         )
 
-    monkeypatch.setattr(update_completion, "_complete_selected", lambda request: order.append("complete"))
+    monkeypatch.setattr(update_completion, "_complete_selected", lambda request: order.append("complete") or True)
     monkeypatch.setattr("pm.receipt.accept_worker_receipt", lambda data, update_id: None)
     monkeypatch.setattr("hermes_cli.update_receipt.record_stage", lambda *args, **kwargs: None)
     monkeypatch.setattr("hermes_cli.update_receipt.finalize_pending_update_receipt", finalize)

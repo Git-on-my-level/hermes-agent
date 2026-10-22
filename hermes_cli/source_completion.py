@@ -135,7 +135,9 @@ def _complete_locked(
         followups=owed,
     )))
     tail_done = not owed
-    if tail_done and all(verdict):
+    # An unsafe SQLite verdict withholds success, not the stamp: re-running the tail cannot
+    # fix the interpreter, and a finished tail must still publish checkout identity.
+    if tail_done:
         def _publish_stamp() -> None:
             from hermes_cli.source_stamp import write_source_stamp
 

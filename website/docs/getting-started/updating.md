@@ -451,6 +451,10 @@ updates:
   pre_update_backup: full
 ```
 
+A maintained checkout can track a remote other than origin/main. `updates.remote` and `updates.branch` select that git target (`origin` and `main` by default). `updates.converge` turns on idle converge onto that tip, or onto `updates.pin` when it is set. `updates.pin_file` names a file whose contents are the pin. `updates.converge_interval` is the idle check period in seconds (default 1800). `updates.converge_busy_sla` is how long a busy gateway may delay the move (default 21600). `updates.skip_gateway_restart` records the new commit without restarting the gateway.
+
+`goals.notices` selects which goal status posts are shown: `important` (default), `all`, or `off`.
+
 `updates.pre_update_backup` has three modes:
 
 - `quick` saves the selected state files described above. This is the default.

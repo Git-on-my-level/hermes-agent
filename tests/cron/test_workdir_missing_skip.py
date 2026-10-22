@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import cron.incidents as incidents
 import cron.jobs as cron_jobs
@@ -45,13 +45,13 @@ def test_prepare_skips_before_no_agent_script(tmp_path, monkeypatch):
         {"workdir": str(present)}, "job", "job") is None
 
 
-def test_dispatch_records_the_slot_and_notifies_once(tmp_path, monkeypatch):
+def test_dispatch_records_the_slot_and_notifies_once(tmp_path, monkeypatch, cron_owner):
     # run_agent's import probes the checkout's update marker. A worktree whose git dir
     # lives under the real Hermes home trips the home I/O guard before the skip runs.
     import sys
     import types
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = MagicMock()
+    fake_run_agent.AIAgent = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     _point_ledger(monkeypatch, tmp_path)
     workdir = tmp_path / "repo"
@@ -67,17 +67,17 @@ def test_dispatch_records_the_slot_and_notifies_once(tmp_path, monkeypatch):
 
     deliveries = []
 
-    def fake_deliver(jb, content, adapters=None, loop=None, **kwargs):
+    def fake_enqueue(execution_id, jb, content, **kwargs):
         deliveries.append(content)
-        return None
+        if kwargs.get("for_failure"):
+            sched._mark_incident_alerted(jb.get("_failure_incident_id"))
+        return {"status": "pending"}
 
-    fake_db = MagicMock()
     with patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=fake_db), \
          patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
-         patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+         patch("cron.delivery_queue.enqueue", side_effect=fake_enqueue), \
          patch("run_agent.AIAgent") as agent_cls:
         sched.run_one_job(dict(stored))
         assert agent_cls.call_count == 0

@@ -64,6 +64,35 @@ def _dependency_inputs_match(workspace: Path, source: Path) -> bool:
         return False
 
 
+# Files this publisher writes into the checkout. They are not user modifications, and a
+# status probe that runs after they land must not call the tree dirty.
+_PUBLISHER_OUTPUTS = frozenset({"install-stamp.json", ".hermes-bootstrap-complete"})
+
+
+def _git_identity_drift(root: Path, stamp: dict) -> str | None:
+    """Why *stamp* no longer names this checkout, ignoring publisher outputs."""
+    from hermes_cli.version_info import _git_version_info, _run_git
+    info = _git_version_info(root, include_untracked=True)
+    commit = _run_git(Path(root), "rev-parse", str(stamp.get("commit") or ""))
+    if not commit or info.commit != commit:
+        return "Git identity is dirty/unknown or HEAD differs from the install stamp"
+    if not info.dirty:
+        return None
+    import subprocess
+    status = subprocess.run(
+        ["git", "--no-optional-locks", "status", "--porcelain"],
+        cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, check=False,
+    )
+    if status.returncode != 0:
+        return "Git identity is dirty/unknown or HEAD differs from the install stamp"
+    for line in (status.stdout or "").splitlines():
+        path = line[3:].strip().strip('"') if len(line) > 3 else line
+        if path not in _PUBLISHER_OUTPUTS:
+            return "Git identity is dirty/unknown or HEAD differs from the install stamp"
+    return None
+
+
 class ServingGenerationPublishError(ValueError):
     """An update must not announce completion without a recoverable serving pair."""
 
@@ -75,17 +104,16 @@ class GatewayServingRefused(RuntimeError):
 def publish_completed_generation(root: Path, stamp: dict) -> None:
     """Strict publication seam for update and consistent first-deploy startup."""
     from pm.environments import committed_venv
-    from hermes_cli.version_info import _git_version_info
     reason = None
     if stamp.get('dirty') is not False or stamp.get('adoptedAt') or not stamp.get('commit'):
         reason = 'install stamp is dirty, unknown or adopted rather than completed'
     else:
-        info = _git_version_info(root, include_untracked=True)
-        if info.dirty or info.commit != stamp['commit']:
-            reason = 'Git identity is dirty/unknown or HEAD differs from the install stamp'
+        reason = _git_identity_drift(root, stamp)
     environment = committed_venv(root)
+    # A checkout with no committed environment is not a serving install. The install
+    # stamp already records its identity; publication is owed only once PM has one.
     if reason is None and environment is None:
-        reason = 'no committed dependency environment'
+        return
     if reason is None and environment is not None:
         if not _dependency_inputs_match(environment.parent / 'workspace', root):
             reason = 'dependency declarations differ from the committed environment'
@@ -163,10 +191,7 @@ def record_completed_generation(root: Path, stamp: dict) -> bool:
     if environment is None:
         return False
     generation = environment.parent.resolve()
-    from hermes_cli.version_info import _git_version_info, _run_git
-    info = _git_version_info(Path(root), include_untracked=True)
-    commit = _run_git(Path(root), 'rev-parse', str(stamp['commit']))
-    if info.dirty or not commit or info.commit != commit:
+    if _git_identity_drift(root, stamp):
         return False
     import shutil
     import tempfile

@@ -27,15 +27,15 @@ def _point_ledger(monkeypatch, tmp_path):
 def _run_failing(job, error):
     deliveries = []
 
-    def fake_deliver(jb, content, adapters=None, loop=None, **kwargs):
+    def fake_enqueue(execution_id, jb, content, **kwargs):
         deliveries.append(content)
-        return None
+        if kwargs.get("for_failure"):
+            sched._mark_incident_alerted(jb.get("_failure_incident_id"))
+        return {"status": "pending"}
 
-    fake_db = MagicMock()
     with patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=fake_db), \
          patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                return_value={
@@ -44,7 +44,7 @@ def _run_failing(job, error):
                    "provider": "openrouter",
                    "api_mode": "chat_completions",
                }), \
-         patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+         patch("cron.delivery_queue.enqueue", side_effect=fake_enqueue), \
          patch("run_agent.AIAgent") as agent_cls:
         agent = MagicMock()
         agent.run_conversation.side_effect = RuntimeError(error)
@@ -68,7 +68,7 @@ def test_classifier_covers_the_self_healing_set():
         {"transient_notify_after": 3, "transient_failure_streak": 2}, _IDLE) is False
 
 
-def test_default_threshold_still_delivers_the_first_transient(tmp_path, monkeypatch):
+def test_default_threshold_still_delivers_the_first_transient(tmp_path, monkeypatch, cron_owner):
     _point_ledger(monkeypatch, tmp_path)
     job = cron_jobs.create_job(
         prompt="ping", schedule="every 1h", name="default-threshold", deliver="telegram:123")
@@ -79,7 +79,7 @@ def test_default_threshold_still_delivers_the_first_transient(tmp_path, monkeypa
     assert cron_jobs.get_job(job["id"])["transient_failure_streak"] == 1
 
 
-def test_streak_withholds_until_threshold_then_a_real_failure_resets_it(tmp_path, monkeypatch):
+def test_streak_withholds_until_threshold_then_a_real_failure_resets_it(tmp_path, monkeypatch, cron_owner):
     _point_ledger(monkeypatch, tmp_path)
     job = cron_jobs.create_job(
         prompt="ping", schedule="every 1h", name="streak", deliver="telegram:123")
@@ -102,7 +102,7 @@ def test_streak_withholds_until_threshold_then_a_real_failure_resets_it(tmp_path
     assert cron_jobs.get_job(job["id"])["transient_failure_streak"] == 0
 
 
-def test_config_threshold_applies_when_the_job_has_no_override(tmp_path, monkeypatch):
+def test_config_threshold_applies_when_the_job_has_no_override(tmp_path, monkeypatch, cron_owner):
     _point_ledger(monkeypatch, tmp_path)
 
     real = cron_jobs._cron_config_number

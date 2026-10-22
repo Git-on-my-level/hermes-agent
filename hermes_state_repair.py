@@ -534,6 +534,17 @@ def _backup_db_file(db_path: Path) -> tuple[Optional[Path], Optional[str]]:
         return None, f"backup copy failed: {exc}"
 
 
+def _missing_or_raise(p: Path) -> bool:
+    """True when *p* is absent. ``PermissionError`` is not absence."""
+    try:
+        p.stat()
+    except PermissionError:
+        raise
+    except OSError:
+        return True
+    return False
+
+
 def _rw_or_vanished(p: Path) -> bool:
     """True when *p* is read-write for this user OR no longer exists.
 
@@ -541,9 +552,10 @@ def _rw_or_vanished(p: Path) -> bool:
     unlinks ``-wal``/``-shm`` in between (a concurrent quarantine can rename ``state.db`` aside the same way).
     ``os.access`` on the vanished path returns False, which is "gone", not "read-only". The final re-check covers
     a sidecar that vanished and was recreated by the next opener before ``exists()`` ran.
+    ``PermissionError`` from the existence probe propagates: it is not a missing file.
     """
     mode = os.R_OK | os.W_OK
-    return os.access(p, mode) or not p.exists() or os.access(p, mode)
+    return os.access(p, mode) or _missing_or_raise(p) or os.access(p, mode)
 
 
 def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", directory_only: bool = False) -> None:
@@ -565,7 +577,13 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", direc
         home = Path(get_hermes_home()).resolve()
     # SQLite needs a writable directory in every journal mode (WAL/SHM sidecars, or the DELETE-mode journal).
     sidecars = (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm"))
-    files = () if directory_only else tuple((p, False) for p in (db_path, *sidecars) if p.is_file())
+    # The snapshot uses ``Path.is_file`` (OSError, including a race, reads as absent). A later
+    # probe of the same candidates lets ``PermissionError`` propagate so a stat refusal is not
+    # treated as a missing file and skipped.
+    candidates = () if directory_only else (db_path, *sidecars)
+    files = tuple((p, False) for p in candidates if p.is_file())
+    for p in candidates:
+        _missing_or_raise(p)
     for p, is_dir in [(db_path.parent, True), *files]:
         if (is_dir and not p.is_dir()) or _rw_or_vanished(p):
             continue

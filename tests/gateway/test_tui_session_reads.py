@@ -139,7 +139,7 @@ async def test_cron_writes_stay_refused_on_a_viewer_connection_and_reads_list_al
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     token = set_hermes_home_override(str(owner.home))
     try:
-        pause_job(create_job('ping', 'every 2h', name='parked')['id'])
+        pause_job(create_job('ping', 'every 2h', name='parked')['id'], reason="parked")
     finally:
         reset_hermes_home_override(token)
     for source in ('cli', 'tui', 'gui', 'acp'):

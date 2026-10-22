@@ -77,10 +77,14 @@ async def test_status_callback_compacted_rearms_typing(monkeypatch):
         _cleanup_msg_ids=[],
         mute_notification_reply=False,
         user_config={},
+        session_id=None,
         source=SimpleNamespace(platform=SimpleNamespace(value="telegram")),
         _run_still_current=lambda: True,
     )
-    runner = TurnRunner(MagicMock(), ctx)
+    runner = MagicMock()
+    runner.session_authorities = None
+    runner.session_authority = None
+    runner = TurnRunner(runner, ctx)
     runner._status_callback_sync(
         "compacted", "✓ Context compaction complete — continuing turn..."
     )
@@ -114,10 +118,14 @@ async def test_compacted_rearm_runs_even_when_status_text_suppressed(monkeypatch
         _cleanup_msg_ids=[],
         mute_notification_reply=False,
         user_config={},
+        session_id=None,
         source=SimpleNamespace(platform=SimpleNamespace(value="telegram")),
         _run_still_current=lambda: True,
     )
-    runner = TurnRunner(MagicMock(), ctx)
+    runner = MagicMock()
+    runner.session_authorities = None
+    runner.session_authority = None
+    runner = TurnRunner(runner, ctx)
     runner._status_callback_sync(
         "compacted", "✓ Context compaction complete — continuing turn..."
     )

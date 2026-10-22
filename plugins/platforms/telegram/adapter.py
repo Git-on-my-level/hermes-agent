@@ -1657,7 +1657,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if old is None or not callable(build) or getattr(old, "is_closed", True):
             return
         try:
-            polling_req._client = build()
             rebuild = getattr(type(polling_req), 'rebuild_client', None)
             if callable(rebuild):
                 old = await rebuild(polling_req)

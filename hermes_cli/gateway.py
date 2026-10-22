@@ -5278,14 +5278,13 @@ def _cmd_install(args):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
-        launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
-                        force_unit_path=getattr(args, "force_unit_path", False))
         # Operator escape hatch: regeneration may otherwise carry forward entries from the
         # installed plist forever; this one install derives the PATH from this environment.
         global _reset_service_path
         _reset_service_path = bool(getattr(args, "reset_service_path", False))
         try:
-            launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
+            launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
+                            force_unit_path=getattr(args, "force_unit_path", False))
         finally:
             _reset_service_path = False
     elif backend == "windows":

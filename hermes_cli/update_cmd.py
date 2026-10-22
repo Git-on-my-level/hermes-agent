@@ -208,8 +208,9 @@ _UPDATE_CRITICAL_FILES = (
     "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
     "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
     "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
-    "hermes_cli/web_server.py", "cli.py", "run_agent.py", "model_tools.py", "toolsets.py",
-    "hermes_constants.py")
+    "hermes_cli/web_server.py", "hermes_cli/serving_generation.py",
+    "cli.py", "run_agent.py", "model_tools.py", "toolsets.py",
+    "hermes_constants.py", "gateway/__init__.py", "gateway/service_health.py")
 
 
 def _record_update_step(step: str, ok: bool, detail: str = "") -> None:
@@ -908,7 +909,11 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, target_r
             if has_common_ancestor:
                 dropped = (_git_run(
                     git_cmd, ["rev-list", "--count", f"{merge_ref}..{pre_pull_sha}"]).stdout or "").strip()
-                print(f"    {dropped or 'Some'} commit(s) not on {merge_ref} leave the branch; "
+                counted_on = (
+                    f"origin/{branch}"
+                    if merge_ref and len(merge_ref) >= 7 and all(c in "0123456789abcdef" for c in merge_ref.lower())
+                    else merge_ref)
+                print(f"    {dropped or 'Some'} commit(s) not on {counted_on} leave the branch; "
                       f"list them with: git log {merge_ref}..{rescue_ref}")
         else:
             # update-ref failure is intentionally non-fatal, but never claim a backup exists.
@@ -1061,12 +1066,13 @@ def _resolved_commit(git_cmd, ref: str) -> str:
     return (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{ref}^{{commit}}"]).stdout or "").strip()
 
 
-def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha) -> None:
+def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha, *, in_place_update=False) -> None:
     """The principal pull's one checkout move onto *target_sha*; exits when it cannot be made."""
     # merge --ff-only the already-fetched commit instead of `git pull`, which would do a
     # SECOND network fetch. Every move names ``target_sha``, never the ref: a ref that moves
     # after the arm cannot land a commit the marker and the debt do not name (review O3).
-    if merge_ref != f"origin/{branch}":
+    # An in-place update merges onto the branch the checkout is already on.
+    if merge_ref != f"origin/{branch}" and not in_place_update:
         # Keep detached local commits reachable, too. Named branches are
         # untouched by checkout --detach; an autostash protects dirty files.
         _park_detached_head(git_cmd, _m().PROJECT_ROOT, branch)
@@ -1142,7 +1148,8 @@ def _pull_updates(
         try:
             # The paused gateways' tree gate must know this move's target before git writes a file.
             with _checkout_move(_windows_gateway_resume, target_sha):
-                _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha)
+                _move_checkout_to(
+                    git_cmd, branch, merge_ref, target_sha, pre_pull_sha, in_place_update=in_place_update)
             _refuse_unselected_head(git_cmd, target_sha, pre_pull_sha)  # before the marker goes
         except KeyboardInterrupt:
             raise  # Ctrl-C reached git too (same process group): the tree may be torn, keep the marker
@@ -1223,9 +1230,9 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
     # rewrite the tree while this loop believed the checkout could not move.
     # The -B form names the resolved commit, never the ref (review O2); the local-branch form must
     # name the branch to attach HEAD to it, so its landing is verified against the armed commit.
-    local, remote = resolve(f"refs/heads/{branch}"), resolve(f"origin/{branch}")
+    local, remote = resolve(f"refs/heads/{branch}"), resolve(target_ref)
     attempts = [(["checkout", "--no-guess", branch], local),
-                (["checkout", "-B", branch, remote or f"origin/{branch}"], remote)]
+                (["checkout", "-B", branch, remote or target_ref], remote)]
     result = None
     for args, target in attempts:
         if not target:
@@ -1428,7 +1435,7 @@ def _prepare_checkout_for_update(
         # on the POSIX pause's baseline (its refusal, sticky, reaches the switch's arm_commit_point).
         _posix_pause.pause_at_commit_point()
         with _checkout_move(_windows_gateway_resume, *(_resolved_commit(git_cmd, ref) for ref in (
-                f"refs/heads/{branch}", f"origin/{branch}"))):
+                f"refs/heads/{branch}", target_ref))):
             track_result = _switch_branch_at_commit_point(
                 git_cmd, branch, target_ref, pre=moved_from_sha, stash=auto_stash_ref)
         if track_result.returncode != 0:

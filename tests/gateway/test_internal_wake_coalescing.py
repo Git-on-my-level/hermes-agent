@@ -68,6 +68,7 @@ def _runner(queue: _Queue, head=None):
     )
     runner._promote_queued_event = GatewayRunner._promote_queued_event.__get__(runner)
     runner._run_agent_drain_pending = GatewayTurnMixin._run_agent_drain_pending.__get__(runner)
+    runner._merge_leftover_steer = GatewayRunner._merge_leftover_steer.__get__(runner)
     runner._coalesce_internal_followups = (
         GatewayTurnMixin._coalesce_internal_followups.__get__(runner)
     )
