@@ -125,7 +125,7 @@ class StreamCommentaryPreviewMixin:
         newest single entry exceeds the editable limit.
         """
         limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
-        len_fn: "Callable[[str], int]" = len
+        len_fn: Callable[[str], int] = len
         if isinstance(self.adapter, _BasePlatformAdapter):
             try:
                 limit = self.adapter.max_message_length_for_chat(self.chat_id)

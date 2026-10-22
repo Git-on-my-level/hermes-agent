@@ -765,7 +765,7 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     return issues
 
 
-def _cron_doctor_pause_audit_findings() -> List[str]:
+def _cron_doctor_pause_audit_findings() -> list[str]:
     """Paused jobs with no reason, and pauses whose review date has arrived.
 
     Doctor stays read-only. Existing pauses with an empty reason keep not firing; this only
@@ -775,7 +775,7 @@ def _cron_doctor_pause_audit_findings() -> List[str]:
     from hermes_time import now as hermes_now
 
     today = hermes_now().date().isoformat()
-    findings: List[str] = []
+    findings: list[str] = []
     for job in list_jobs(include_disabled=True):
         if effective_job_state(job) != "paused":
             continue

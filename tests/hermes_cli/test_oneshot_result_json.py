@@ -229,7 +229,7 @@ def test_cli_default_oneshot_stdout_stays_plain_text(tmp_path):
 
 def test_interrupted_json_run_writes_a_failure_record_before_propagating(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    import hermes_cli.oneshot as oneshot
+    from hermes_cli import oneshot
 
     def boom(*args, **kwargs):
         raise KeyboardInterrupt

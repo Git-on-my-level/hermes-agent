@@ -3399,7 +3399,7 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     # The unit's PATH is deterministic (fixed tool/system dirs + config extras; the unit never
     # carries caller PATH), so the byte-exact comparison is caller-independent. Ignore directives
     # older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
-    norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))  # noqa: E731
+    norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))
     return norm(installed) == norm(expected)
 
 

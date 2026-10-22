@@ -8,7 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 from gateway.service_health import (
@@ -36,7 +36,7 @@ def test_dead_pid_claiming_running_is_stale(tmp_path: Path):
     fingerprint = _start_fingerprint(pid)
     proc.kill()
     proc.wait(timeout=5)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _write(tmp_path / "gateway_state.json", {
         "pid": pid,
         "start_time": fingerprint,
@@ -59,7 +59,7 @@ def test_dead_pid_claiming_running_is_stale(tmp_path: Path):
 
 
 def test_live_verified_gateway_with_a_fresh_heartbeat_is_ready(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _start_fingerprint(pid)
     _write(tmp_path / "gateway_state.json", {
@@ -95,7 +95,7 @@ def test_live_verified_gateway_with_a_fresh_heartbeat_is_ready(tmp_path: Path):
 def test_blocking_maintenance_outranks_a_stale_running_record(tmp_path: Path):
     from gateway.application_readiness import kernel_started_at, rfc3339_utc
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     started = kernel_started_at(pid)
     _write(tmp_path / "gateway_state.json", {
@@ -135,7 +135,7 @@ def test_loop_tick_answer_is_reported():
         return
     # macOS rejects AF_UNIX paths longer than 104 bytes; pytest's tmp_path exceeds that.
     import tempfile
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _start_fingerprint(pid)
     tmp_path = Path(tempfile.mkdtemp(prefix="hs", dir="/tmp"))
@@ -173,7 +173,7 @@ def test_loop_tick_answer_is_reported():
 
 
 def test_future_heartbeat_is_not_ready(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _start_fingerprint(pid)
     _write(tmp_path / "gateway_state.json", {
@@ -217,7 +217,7 @@ def _running(tmp_path: Path, now: datetime, heartbeat: dict | None) -> int | Non
 
 
 def test_wrong_pid_fresh_heartbeat_is_not_this_gateway(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fingerprint = _running(tmp_path, now, {
         "pid": 99999999,
         "updated_at": now.isoformat(),
@@ -237,7 +237,7 @@ def test_wrong_pid_fresh_heartbeat_is_not_this_gateway(tmp_path: Path):
 
 
 def test_missing_or_non_finite_heartbeat_pid_is_not_ready(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fingerprint = _running(tmp_path, now, {"updated_at": now.isoformat(), "event_loop_at": _stamp(now)})
     missing = collect_service_health(tmp_path, now=now)
     _write(tmp_path / "state" / "gateway.heartbeat", {
@@ -259,7 +259,7 @@ def test_missing_or_non_finite_heartbeat_pid_is_not_ready(tmp_path: Path):
 
 
 def test_legacy_heartbeat_without_a_loop_stamp_is_indeterminate(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _running(tmp_path, now, {"pid": pid, "updated_at": now.isoformat()})
     document = collect_service_health(tmp_path, now=now)
@@ -276,7 +276,7 @@ def test_legacy_heartbeat_without_a_loop_stamp_is_indeterminate(tmp_path: Path):
 def test_stale_loop_stamp_stays_stale_when_the_writer_clock_is_fresh(tmp_path: Path):
     from gateway.shutdown_watchdog import write_loop_liveness
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _running(tmp_path, now, None)
     loop_at = now - timedelta(minutes=3)
@@ -301,7 +301,7 @@ def test_stale_loop_stamp_stays_stale_when_the_writer_clock_is_fresh(tmp_path: P
 
 
 def test_writer_clock_in_the_future_does_not_override_a_fresh_loop_stamp(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _running(tmp_path, now, {
         "pid": pid,
@@ -322,7 +322,7 @@ def test_loop_tick_does_not_borrow_another_gateways_heartbeat():
     if sys.platform == "win32":
         return
     import tempfile
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     fingerprint = _start_fingerprint(pid)
     tmp_path = Path(tempfile.mkdtemp(prefix="hs", dir="/tmp"))
@@ -370,7 +370,7 @@ def test_loop_tick_does_not_borrow_another_gateways_heartbeat():
 
 
 def test_draining_gateway_is_not_ready(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pid = os_pid()
     _write(tmp_path / "gateway_state.json", {
         "pid": pid,
@@ -387,7 +387,7 @@ def test_draining_gateway_is_not_ready(tmp_path: Path):
 
 
 def test_unverified_maintenance_does_not_override_the_gateway(tmp_path: Path):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _write(tmp_path / "gateway_state.json", {
         "pid": 2**22,
         "gateway_state": "running",
@@ -413,7 +413,7 @@ def test_fifo_and_oversized_markers_are_not_healthy(tmp_path: Path):
     state = tmp_path / "gateway_state.json"
     state.write_bytes(b"{" + b"x" * (_oversized()) )
     began = time.monotonic()
-    document = collect_service_health(tmp_path, now=datetime.now(timezone.utc))
+    document = collect_service_health(tmp_path, now=datetime.now(UTC))
     assert time.monotonic() - began < 1
     assert document["evidence"]["state"] == "oversized"
     assert document["phase"] == "degraded"
@@ -425,7 +425,7 @@ def test_fifo_and_oversized_markers_are_not_healthy(tmp_path: Path):
     heartbeat.parent.mkdir(parents=True)
     os.mkfifo(heartbeat)
     began = time.monotonic()
-    probed = collect_service_health(tmp_path, now=datetime.now(timezone.utc))
+    probed = collect_service_health(tmp_path, now=datetime.now(UTC))
     assert time.monotonic() - began < 1
     assert probed["evidence"]["heartbeat"] == "unavailable"
     assert probed["healthy"] is False
@@ -456,7 +456,7 @@ def test_nonfinite_pid_does_not_raise(tmp_path: Path):
     (tmp_path / "gateway_state.json").write_text(
         '{"pid": 1e309, "gateway_state": "running"}', encoding="utf-8",
     )
-    document = collect_service_health(tmp_path, now=datetime.now(timezone.utc))
+    document = collect_service_health(tmp_path, now=datetime.now(UTC))
     assert document["healthy"] is False
     assert document["phase"] != "ready"
 
@@ -493,6 +493,7 @@ def test_gateway_health_entry_point_follows_explicit_and_saved_profile(tmp_path:
         return subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", *args],
             cwd=repo,
+            check=False,
             env=env | extra,
             capture_output=True,
             text=True,

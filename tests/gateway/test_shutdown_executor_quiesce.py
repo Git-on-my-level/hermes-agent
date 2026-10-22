@@ -244,7 +244,7 @@ def test_pending_start_cannot_write_after_quiesce_reports_no_live_workers(monkey
     def quiesce() -> None:
         try:
             gw_mod.GatewayRunner._stop_quiesce_and_close_session_dbs(runner, 30.0, ctx)
-        except BaseException as exc:  # noqa: BLE001 - surface a join of an unstarted thread
+        except BaseException as exc:
             failure.append(exc)
         finally:
             done.set()

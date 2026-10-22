@@ -8,11 +8,11 @@ walk a resolved-with-reason row back to alerted.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 import pytest
 
-import cron.incidents as incidents
+from cron import incidents
 from cron.jobs import create_job, get_due_jobs, get_job, load_jobs, mark_job_run, remove_job, save_jobs
 from cron.scheduler import _RunDelivery
 from cron.scheduler_bookkeeping import finish_completed_run as _finish_completed_run
@@ -113,7 +113,7 @@ def test_retention_sweep_resolves_open_incidents_for_pruned_jobs(cron_home):
     incident_id, _ = incidents.upsert_incident(job["id"], "final failure")
     assert mark_job_run(job["id"], success=False, error="final failure") is True
     assert incidents.get_incident(incident_id)["state"] == "detected"
-    stamp = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    stamp = (datetime.now(UTC) - timedelta(days=30)).isoformat()
     rows = load_jobs()
     for row in rows:
         if row["id"] == job["id"]:

@@ -48,9 +48,10 @@ jobs:
     name: Python tests
     if: github.repository == 'Git-on-my-level/hermes-agent'
     runs-on: ubuntu-latest
-    # Post-sync suite is past 40k tests. On a 4-vCPU runner, 70m cancelled
-    # the job around 80%. Stay at or above 70.
-    timeout-minutes: 120
+    # Post-sync suite is past 40k tests. A 4-vCPU public runner can take ~100m
+    # on a good day and was cancelled at ~50% after 120m on a slow one
+    # (run 39847663513). Stay at or above 180.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

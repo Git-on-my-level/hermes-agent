@@ -4462,7 +4462,7 @@ __all__ = [
     "ensure_compression_feasibility_checked",
     "is_compaction_progress_status",
     "replay_compression_warning",
-    "revalidate_compression_feasibility",
     "reset_ui_delivery_state_after_compaction",
+    "revalidate_compression_feasibility",
     "try_shrink_image_parts_in_messages",
 ]

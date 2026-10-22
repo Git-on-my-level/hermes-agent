@@ -91,7 +91,7 @@ async def test_status_rlock_does_not_stall_gateway_or_send(bot_api, monkeypatch,
     from gateway import status
     from gateway.status_async import publish_runtime_status
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    url, calls = bot_api
+    url, _ = bot_api
     req = isolate_request(HTTPXRequest())
     app = Application.builder().token('123:fake').base_url(url).request(req).build()
     await app.initialize()
@@ -324,7 +324,7 @@ async def test_conflict_disarms_retry_before_gateway_callback(monkeypatch):
     seen = []
     async def start(self, **kwargs):
         self._running = True
-        event = getattr(self, '_Updater__polling_task_stop_event')
+        event = self._Updater__polling_task_stop_event
         kwargs['error_callback'](Conflict('fake conflict'))
         assert event.is_set()
     async def stop(self):

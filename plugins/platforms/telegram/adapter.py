@@ -632,15 +632,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Flushes past their pop, by (family, key): a newer chunk must not cancel them (teardown still does).
         self._committed_flush_tasks: dict[tuple[str, str], asyncio.Task] = {}
-        self._pending_photo_batches: Dict[str, MessageEvent] = {}
-        self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
-        self._media_group_events: Dict[str, MessageEvent] = {}
-        self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_photo_batches: dict[str, MessageEvent] = {}
+        self._pending_photo_batch_tasks: dict[str, asyncio.Task] = {}
+        self._media_group_events: dict[str, MessageEvent] = {}
+        self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Downloads still in flight for an album/burst. The quiet-window flush must not
         # dispatch until these hit zero — the window starts when the first download
         # finishes, and a slower sibling would otherwise become a queued follow-up.
-        self._media_collect_inflight: Dict[str, int] = {}
-        self._media_collect_idle: Dict[str, asyncio.Event] = {}
+        self._media_collect_inflight: dict[str, int] = {}
+        self._media_collect_idle: dict[str, asyncio.Event] = {}
         # Aggregate client-side splits of long messages into one MessageEvent; bounds are conservative
         # for Telegram's ~1 edit/s flood envelope.
         self._text_batch_delay_seconds = self._env_float_clamped(
@@ -717,7 +717,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # operators who configured dropping; polling and webhooks preserve all
         # updates and durable update_id admission prevents duplicate dispatch.
         self._drop_pending_on_cold_boot: bool = self._coerce_bool_extra("drop_pending_on_cold_boot", False)
-        self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
+        self._dm_topics_config: list[dict[str, Any]] = extra.get("dm_topics", [])
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -1661,7 +1661,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if callable(rebuild):
                 old = await rebuild(polling_req)
             else:
-                polling_req._client = await asyncio.to_thread(build)  # noqa: SLF001
+                polling_req._client = await asyncio.to_thread(build)
         except Exception:
             logger.debug("[%s] Failed to rebuild polling HTTP client after hung drain", self.name, exc_info=True)
             return
@@ -5630,7 +5630,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     # ``object.__new__()`` (no __init__).
 
     @contextlib.asynccontextmanager
-    async def _chat_send_lock(self, chat_id: Any, metadata: Optional[Dict[str, Any]] = None):
+    async def _chat_send_lock(self, chat_id: Any, metadata: Optional[dict[str, Any]] = None):
         """FIFO per-conversation-stream gate around outgoing API calls, reentrant within one asyncio
         task (media paths nest: send_voice → send_document, and ``super().send_*`` fallbacks reach
         ``send()``; a plain ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends
@@ -5649,8 +5649,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         owners: dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
         if thread_id:
             key = f"{key}:{thread_id}"
-        locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
-        owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
+        locks: dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
+        owners: dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
         task = asyncio.current_task()
         if owners.get(key) is task:
             yield

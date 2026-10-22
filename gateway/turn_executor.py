@@ -117,7 +117,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             # Outside the executor lock: a slow start must not stall another submit, including one
             # issued on the event loop. The worker adds itself to ``_threads`` once it is running.
             thread.start()
-        except BaseException as exc:  # noqa: BLE001 - thread-limit and shutdown races are results
+        except BaseException as exc:
             with self._cv:
                 self._pending.discard(fut)
                 self._threads.discard(thread)

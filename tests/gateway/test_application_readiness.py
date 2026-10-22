@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 import gateway.application_readiness as readiness
@@ -15,17 +15,17 @@ import gateway.application_readiness as readiness
 def test_linux_start_ticks_match_the_hostctl_division():
     stat = "42 (python) R " + " ".join(["0"] * 18) + " 5000\n"
     started = readiness.parse_linux_start(stat, 1_700_000_000, 100)
-    assert started == datetime.fromtimestamp(1_700_000_050, timezone.utc)
+    assert started == datetime.fromtimestamp(1_700_000_050, UTC)
     assert readiness.parse_linux_start("9 (zombie) Z " + " ".join(["0"] * 18) + " 1\n", 1, 100) is None
 
 
 def test_darwin_lstart_parses_the_hostctl_sample():
     started = readiness.parse_darwin_lstart("S Thu Oct  8 23:48:08 2026\n")
-    assert started == datetime(2026, 10, 8, 23, 48, 8, tzinfo=timezone.utc)
+    assert started == datetime(2026, 10, 8, 23, 48, 8, tzinfo=UTC)
 
 
 def test_ready_receipt_keeps_the_loop_timestamp(tmp_path: Path):
-    loop_at = datetime(2026, 10, 8, 16, 0, tzinfo=timezone.utc)
+    loop_at = datetime(2026, 10, 8, 16, 0, tzinfo=UTC)
     path = readiness.publish_application_readiness(
         phase="ready", event_loop_at=loop_at, home=tmp_path, pid=os.getpid(),
     )
@@ -56,7 +56,7 @@ def test_unknown_kernel_start_writes_nothing(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(readiness, "kernel_started_at", lambda pid: None)
     assert readiness.publish_application_readiness(
         phase="ready",
-        event_loop_at=datetime.now(timezone.utc),
+        event_loop_at=datetime.now(UTC),
         home=tmp_path,
         pid=os.getpid(),
     ) is None
@@ -67,7 +67,7 @@ def test_stopped_receipt_drops_the_loop_signal(tmp_path: Path):
     path = readiness.publish_application_readiness(
         phase="stopped",
         exit_reason="gateway loop stopped",
-        event_loop_at=datetime.now(timezone.utc),
+        event_loop_at=datetime.now(UTC),
         home=tmp_path,
         pid=os.getpid(),
     )

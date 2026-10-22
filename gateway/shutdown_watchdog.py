@@ -209,7 +209,7 @@ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
 
 def write_loop_liveness(
     *, pid: Optional[int] = None, start_time: Optional[float] = None,
-    home: Optional[Path] = None, extra: Optional[Dict[str, Any]] = None,
+    home: Optional[Path] = None, extra: Optional[dict[str, Any]] = None,
     event_loop_at: Optional[datetime] = None,
 ) -> Path:
     """Heartbeat plus the hostctl receipt. ``event_loop_at`` was taken on the loop."""
@@ -450,7 +450,7 @@ async def loop_heartbeat_forever(
         while True:  # first write is immediate so monitors see a fresh file at once
             # Captured here, on the loop. The thread that writes the receipt must not
             # substitute its own clock for the event_loop signal.
-            loop_at = datetime.now(timezone.utc)
+            loop_at = datetime.now(UTC)
             try:
                 await asyncio.to_thread(
                     write_loop_liveness, start_time=start_time, home=home,

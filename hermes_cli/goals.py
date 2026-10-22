@@ -425,7 +425,7 @@ def infer_goal_from_turn(
     return objective
 
 
-def maybe_infer_goal(mgr: "GoalManager", last_user_message: Any, last_response: str) -> Optional[str]:
+def maybe_infer_goal(mgr: GoalManager, last_user_message: Any, last_response: str) -> Optional[str]:
     """Post-turn hook shared by CLI and gateway: when ``goals.auto_infer`` is on and the session has
     no goal, ask the judge whether the reply commits to work; install it as an inferred goal with a
     drafted contract. Returns the user-facing notice (or None when nothing was set).
@@ -1117,7 +1117,7 @@ def is_owner_authored_text(text: Any) -> bool:
     return _INTERNAL_NOTIFICATION_MARKER not in text
 
 
-def render_owner_messages_block(owner_messages: Optional[List[Dict[str, Any]]]) -> str:
+def render_owner_messages_block(owner_messages: Optional[list[dict[str, Any]]]) -> str:
     """Judge prompt block for the user's messages since the goal was set (``""`` when none)."""
     lines = []
     for m in (owner_messages or [])[-OWNER_MESSAGES_MAX:]:
@@ -1125,7 +1125,7 @@ def render_owner_messages_block(owner_messages: Optional[List[Dict[str, Any]]]) 
         if not text:
             continue
         at = float(m.get("at") or 0.0)
-        stamp = safe_strftime(datetime.fromtimestamp(at, tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M") if at else "?"
+        stamp = safe_strftime(datetime.fromtimestamp(at, tz=UTC).astimezone(), "%Y-%m-%d %H:%M") if at else "?"
         lines.append(f"- [{stamp}] {_truncate(text, 2 * _OWNER_MESSAGE_CHARS)}")  # stored already clipped
     return JUDGE_OWNER_MESSAGES_BLOCK_TEMPLATE.format(owner_lines="\n".join(lines)) if lines else ""
 
@@ -1148,7 +1148,7 @@ def gather_tool_activity(session_id: Optional[str], *, max_items: int = _TOOL_AC
     except Exception as exc:
         logger.debug("gather_tool_activity: messages read failed: %s", exc)
         return ""
-    calls: List[Any] = []
+    calls: list[Any] = []
     for row in reversed(rows):
         if not isinstance(row, dict):
             continue
@@ -1165,7 +1165,7 @@ def gather_tool_activity(session_id: Optional[str], *, max_items: int = _TOOL_AC
             break
     if not calls:
         return ""
-    result_by_id: Dict[str, Any] = {}
+    result_by_id: dict[str, Any] = {}
     for row in rows:
         if isinstance(row, dict) and row.get("role") == "tool" and row.get("tool_call_id"):
             result_by_id[str(row.get("tool_call_id"))] = row.get("content")
@@ -1344,7 +1344,7 @@ def gather_background_processes(task_id: Optional[str] = None, *, owner_task_id:
 
 
 def draft_contract(
-    objective: str, *, timeout: Optional[float] = None, exchange: Optional[Tuple[Any, str]] = None,
+    objective: str, *, timeout: Optional[float] = None, exchange: Optional[tuple[Any, str]] = None,
 ) -> Optional[GoalContract]:
     """Expand a plain-language objective into a completion contract via the ``goal_judge`` auxiliary
     task (a side LLM call, not a conversation turn). ``exchange`` selects checklist extraction

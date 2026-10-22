@@ -41,7 +41,7 @@ class StreamCommentaryPreviewFinalizeMixin:
         """
         try:
             return await self._retract_preview_bubbles_inner()
-        except Exception as e:  # noqa: BLE001 — retraction is best-effort
+        except Exception as e:
             logger.debug("Preview bubble retraction failed: %s", e)
             return False
 

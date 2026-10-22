@@ -283,7 +283,7 @@ def _ledger_exists() -> bool:
     return _db_path().is_file()
 
 
-def list_open_orphan_incidents(known_job_ids) -> List[Dict[str, Any]]:
+def list_open_orphan_incidents(known_job_ids) -> list[dict[str, Any]]:
     """Open incidents whose ``job_id`` is not in ``known_job_ids``. Empty when the ledger is absent."""
     if not _ledger_exists():
         return []

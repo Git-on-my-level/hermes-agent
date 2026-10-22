@@ -190,7 +190,7 @@ async def flush_runtime_status_async(timeout: float = 2.0) -> bool:
     from gateway.status_async import flush_pending
     try:
         await asyncio.wait_for(flush_pending(), timeout=max(float(timeout), 0.0))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False
     writer = _runtime_status_writer
     if writer is None:

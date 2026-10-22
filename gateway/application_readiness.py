@@ -16,7 +16,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +80,7 @@ def parse_linux_start(stat_text: str, btime_seconds: int, hz: int) -> datetime |
     if ticks is None:
         return None
     delta_ns = ticks * 1_000_000_000 // hz
-    boot = datetime.fromtimestamp(btime_seconds, timezone.utc)
+    boot = datetime.fromtimestamp(btime_seconds, UTC)
     return boot + timedelta(microseconds=delta_ns // 1000)
 
 
@@ -98,7 +98,7 @@ def parse_darwin_lstart(output: str) -> datetime | None:
         naive = datetime.strptime(" ".join(fields[1:6]), "%a %b %d %H:%M:%S %Y")
     except ValueError:
         return None
-    return naive.replace(tzinfo=timezone.utc)
+    return naive.replace(tzinfo=UTC)
 
 
 def project_serving_phase(home: Path, pid: int) -> str:
@@ -130,12 +130,12 @@ def _maintenance_names_this_process(maintenance: dict, pid: int) -> bool:
     if observed is None:
         return False
     try:
-        claimed = datetime.fromisoformat(recorded.replace("Z", "+00:00"))
+        claimed = datetime.fromisoformat(recorded)
     except ValueError:
         return False
     if claimed.tzinfo is None:
-        claimed = claimed.replace(tzinfo=timezone.utc)
-    return abs((observed - claimed.astimezone(timezone.utc)).total_seconds()) <= 2.0
+        claimed = claimed.replace(tzinfo=UTC)
+    return abs((observed - claimed.astimezone(UTC)).total_seconds()) <= 2.0
 
 
 def _publish(
@@ -163,7 +163,7 @@ def _publish(
         return None
     path = receipt_path(home)
     base = path.parent.parent
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "application_id": APPLICATION_ID,
@@ -262,7 +262,7 @@ def _utc_timestamp(value: str) -> str | None:
     if not text.endswith("Z"):
         return None
     try:
-        datetime.fromisoformat(text.replace("Z", "+00:00"))
+        datetime.fromisoformat(text)
     except ValueError:
         return None
     return text
@@ -274,7 +274,7 @@ def rfc3339_utc(value: datetime) -> str:
 
 
 def _rfc3339_z(value: datetime) -> str:
-    utc = value.astimezone(timezone.utc)
+    utc = value.astimezone(UTC)
     fraction = f".{utc.microsecond:06d}" if utc.microsecond else ""
     return utc.strftime("%Y-%m-%dT%H:%M:%S") + fraction + "Z"
 

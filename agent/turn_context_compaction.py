@@ -426,8 +426,8 @@ def _run_preflight_passes(
     )
     _default_status = (
         (
-            "📦 Preflight compression: ~{tokens:,} tokens — {reason}. This may take a moment."
-        ).format(tokens=_preflight_tokens, reason=trigger_reason)
+            f"📦 Preflight compression: ~{_preflight_tokens:,} tokens — {trigger_reason}. This may take a moment."
+        )
         if trigger_reason
         else PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
             tokens=_preflight_tokens, threshold=_compressor.threshold_tokens

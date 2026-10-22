@@ -960,7 +960,7 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
-def _action_pause(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+def _action_pause(job: dict[str, Any], a: dict[str, Any]) -> str:
     """Pause requires a non-empty reason. ``review_after`` is an optional YYYY-MM-DD."""
     reason = a.get("reason")
     if not isinstance(reason, str) or not reason.strip():
@@ -1034,7 +1034,7 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     paused_review_after: Optional[str] = None,
-    transient_notify_after: Optional[Union[int, str]] = None,
+    transient_notify_after: Optional[int | str] = None,
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None) -> str:
     """Unified cron job management tool."""

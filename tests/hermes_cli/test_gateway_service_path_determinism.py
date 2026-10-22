@@ -51,7 +51,6 @@ def _isolated_host(monkeypatch, tmp_path):
 def _fake_only_these_dirs_exist(monkeypatch, paths):
     """Make Path.is_dir() report True for EXACTLY *paths* — the host's real dirs are invisible,
     so exact candidate lists are host-independent."""
-    real_is_dir = Path.is_dir
     faked = {str(p) for p in paths}
 
     def fake_is_dir(self):
@@ -418,7 +417,7 @@ class TestLaunchdServicePath:
         installed = tmp_path / "ai.hermes.gateway.plist"
         version_dir = tmp_path / "actual" / "vX.Y"
         version_dir.mkdir(parents=True)
-        actual_bin = _make_dir(tmp_path / "actual" / "bin")
+        _make_dir(tmp_path / "actual" / "bin")
         link = tmp_path / "link"
         link.symlink_to(Path(version_dir))
         raw_entry = f"{link}/../bin"
@@ -550,7 +549,7 @@ class TestLaunchdPlistIsCurrent:
         import re as _re
 
         old_path_value = _re.search(
-            r"<key>PATH</key>\s*<string>(.*?)</string>", generated, _re.S,
+            r"<key>PATH</key>\s*<string>(.*?)</string>", generated, _re.DOTALL,
         ).group(1)
         drifted_text = generated.replace(old_path_value, "/usr/bin:/bin")
         assert drifted_text != generated

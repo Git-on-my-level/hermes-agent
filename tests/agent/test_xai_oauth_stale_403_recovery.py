@@ -17,7 +17,7 @@ a refresh that cannot fix them).
 
 import types
 
-import agent.turn_recovery as turn_recovery
+from agent import turn_recovery
 from agent.turn_retry_state import TurnRetryState
 
 

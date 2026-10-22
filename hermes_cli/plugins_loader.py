@@ -605,7 +605,7 @@ class PluginLoaderMixin:
             contexts = getattr(self, '_pending_platform_contexts', None)
             if contexts is None:
                 contexts = self._pending_platform_contexts = {}
-            setattr(ctx, "_platform_load_worker", pending.worker)
+            ctx._platform_load_worker = pending.worker
             contexts[plugin_key] = ctx
 
             def finish(pending=pending):

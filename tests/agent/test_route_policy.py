@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from unittest.mock import Mock
 
 import pytest
@@ -13,7 +13,7 @@ RULE = {
     "apply_at": ["new_session", "post_compaction"], "sticky": "boundary",
     "route": {"provider": "xai-oauth", "model": "grok-4.7", "base_url": "https://api.x.ai/v1"},
 }
-NOW = datetime(2026, 10, 12, 4, tzinfo=timezone.utc)  # Monday noon in Singapore
+NOW = datetime(2026, 10, 12, 4, tzinfo=UTC)  # Monday noon in Singapore
 
 
 def decide(rule=None, **kwargs):
@@ -29,7 +29,7 @@ def test_default_off(config):
 @pytest.mark.parametrize("day,hour,minute,match", [(12, 3, 59, False), (12, 4, 0, True), (12, 9, 59, True),
                                                 (12, 10, 0, False), (17, 4, 0, False)])
 def test_singapore_window(day, hour, minute, match):
-    assert bool(decide(now=datetime(2026, 10, day, hour, minute, tzinfo=timezone.utc))) is match
+    assert bool(decide(now=datetime(2026, 10, day, hour, minute, tzinfo=UTC))) is match
 
 
 @pytest.mark.parametrize("scope", ["cron", "delegation", "auxiliary", "pinned"])

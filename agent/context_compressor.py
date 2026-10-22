@@ -2906,7 +2906,7 @@ class ContextCompressor(
         # latency_pressure guard — a provider whose calls crawl long before the token
         # threshold (huge serving-side contexts on oversized catalog windows) can ask
         # for compaction on observed slowness alone.
-        self.api_latency_samples: List[Tuple[float, float, int]] = []
+        self.api_latency_samples: list[tuple[float, float, int]] = []
         self.latency_pressure_threshold_seconds: float = 0.0
         # Config: minimum REAL prompt tokens a sample must carry to count toward latency
         # pressure (0 = no floor).

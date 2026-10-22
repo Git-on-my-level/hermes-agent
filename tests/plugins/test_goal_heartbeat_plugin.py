@@ -132,7 +132,7 @@ def test_render_escalates_on_the_last_check():
 
 def test_settings_defaults_and_clamps(monkeypatch):
     mod = _load()
-    import hermes_cli.config as config
+    from hermes_cli import config
     monkeypatch.setattr(config, "load_config_readonly", lambda: {"plugins": {"entries": {
         "goal-heartbeat": {"interval_minutes": 1, "escalate_after": 0}}}})
     s = mod._settings()

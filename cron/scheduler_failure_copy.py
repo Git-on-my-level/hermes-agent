@@ -181,7 +181,7 @@ def transient_notify_after(job: dict) -> int:
             count = int(raw)
         except (TypeError, ValueError):
             count = 1
-        return count if count >= 1 else 1
+        return max(count, 1)
     from cron.jobs import _cron_config_number
 
     count = _cron_config_number("transient_notify_after", 1, int)
@@ -189,7 +189,7 @@ def transient_notify_after(job: dict) -> int:
         count = int(count)
     except (TypeError, ValueError):
         return 1
-    return count if count >= 1 else 1
+    return max(count, 1)
 
 
 def transient_notice_withheld(job: dict, error: Optional[str]) -> bool:

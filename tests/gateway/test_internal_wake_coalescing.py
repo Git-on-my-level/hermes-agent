@@ -35,7 +35,7 @@ def _source():
 
 
 def _event(text: str, *, internal: bool, mid: str, plugin_injected: bool = False,
-           metadata: dict = None) -> MessageEvent:
+           metadata: dict | None = None) -> MessageEvent:
     return MessageEvent(
         text=text, message_type=MessageType.TEXT, source=_source(),
         message_id=mid, internal=internal, plugin_injected=plugin_injected,
@@ -131,7 +131,7 @@ async def test_human_in_overflow_stops_coalescing_and_is_never_crossed():
     _enqueue(runner, human)
     _enqueue(runner, internal_tail)
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -154,7 +154,7 @@ async def test_human_in_slot_blocks_overflow_merge():
     _enqueue(runner, human_next)
     _enqueue(runner, internal_tail)
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -175,7 +175,7 @@ async def test_slot_restaged_when_overflow_remains():
     _enqueue(runner, _event("proc C done", internal=True, mid="m3"))
     _enqueue(runner, _event("proc D done", internal=True, mid="m4"))
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -199,7 +199,7 @@ async def test_incompatible_tail_restaged_into_slot():
     _enqueue(runner, _event("proc B done", internal=True, mid="m3"))
     _enqueue(runner, human)
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -218,7 +218,7 @@ async def test_incompatible_tail_restaged_into_slot():
     _enqueue(runner2, _event("proc Z done", internal=True, mid="m8"))
     _enqueue(runner2, human2)
 
-    pending_event2, pending2 = await runner2._run_agent_drain_pending(
+    _, pending2 = await runner2._run_agent_drain_pending(
         _result(), runner2._adapter, _source(), "sess"
     )
 
@@ -237,7 +237,7 @@ async def test_plugin_injected_event_is_never_absorbed():
     runner = _runner(q, head=head)
     _enqueue(runner, plugin)
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -256,7 +256,7 @@ async def test_diagnostic_category_mismatch_is_never_absorbed():
     runner = _runner(q, head=head)
     _enqueue(runner, diagnostic)
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _, pending = await runner._run_agent_drain_pending(
         _result(), runner._adapter, _source(), "sess"
     )
 
@@ -330,7 +330,7 @@ async def test_draining_discards_only_the_dequeued_head_not_the_backlog():
 # ---------------------------------------------------------------------------
 
 
-def _followup_runner(depth: int, drain_depth: int = 0, overflow: list = None):
+def _followup_runner(depth: int, drain_depth: int = 0, overflow: list | None = None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)

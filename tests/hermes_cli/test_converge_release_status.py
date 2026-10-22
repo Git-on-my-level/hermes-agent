@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main, update_converge as converge
-from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401
+from tests.hermes_cli.test_update_target_identity import git, update_tree
 
 
 @pytest.mark.parametrize("runtime,skip_restart,passed", [

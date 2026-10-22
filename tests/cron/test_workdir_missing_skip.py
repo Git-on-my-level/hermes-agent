@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from unittest.mock import patch
 
-import cron.incidents as incidents
+from cron import incidents
 import cron.jobs as cron_jobs
 import cron.scheduler as sched
 from cron.executions import list_executions

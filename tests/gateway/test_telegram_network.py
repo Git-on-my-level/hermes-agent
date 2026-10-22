@@ -487,7 +487,7 @@ class TestTlsBuiltOffTheLoop:
         import threading
         import time
 
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         loop_id = threading.get_ident()
         built_on: list[int] = []
         release = threading.Event()

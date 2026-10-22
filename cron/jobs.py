@@ -2574,8 +2574,8 @@ def mark_job_run(
     after the save. A failed final run leaves them open — that failure is still unresolved.
     Removing the job, and the retention sweep that later drops the record, resolve them instead.
     """
-    finished_reason: List[str] = []
-    finished_id: List[str] = []
+    finished_reason: list[str] = []
+    finished_id: list[str] = []
 
     def apply(jobs, _i, job):
         if execution_id is not None and execution_id in job.get("canonical_completions", []):

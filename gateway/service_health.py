@@ -19,7 +19,7 @@ import socket
 import stat
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any
 
@@ -202,7 +202,7 @@ def collect_service_health(
 ) -> dict[str, Any]:
     """Observe one Hermes home. Reads files and one short loop-tick connect; writes nothing."""
     home = Path(home) if home is not None else get_process_hermes_home()
-    observed = now or datetime.now(timezone.utc)
+    observed = now or datetime.now(UTC)
     state, state_evidence = _read_record(home / "gateway_state.json")
     pid_record, pid_evidence = _read_record(home / "gateway.pid")
     heartbeat, heartbeat_evidence = _read_record(home / "state" / "gateway.heartbeat")
@@ -534,7 +534,7 @@ def _read_update_marker(home: Path) -> dict[str, Any]:
     if started is None or not math.isfinite(started):
         age = None
     else:
-        age = max(0.0, datetime.now(timezone.utc).timestamp() - started)
+        age = max(0.0, datetime.now(UTC).timestamp() - started)
     return {"pid": pid, "age_s": age, "alive": _pid_alive(pid)}
 
 
@@ -560,7 +560,7 @@ def _latest_receipt(home: Path, now: datetime) -> dict[str, Any] | None:
     if latest is None or latest_mtime is None:
         return None
     try:
-        modified = datetime.fromtimestamp(latest_mtime, tz=timezone.utc)
+        modified = datetime.fromtimestamp(latest_mtime, tz=UTC)
     except (OSError, OverflowError, ValueError):
         return {"name": latest.name, "state": "indeterminate"}
     summary: dict[str, Any] = {
@@ -606,7 +606,7 @@ def _start_fingerprint(pid: int) -> int | None:
         pass
     try:
         import psutil
-        return int(round(psutil.Process(pid).create_time() * 100))
+        return round(psutil.Process(pid).create_time() * 100)
     except Exception:
         return None
 
@@ -684,8 +684,8 @@ def _parse_time(raw: Any) -> datetime | None:
     except (ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _age_seconds(raw: Any, now: datetime) -> float | None:

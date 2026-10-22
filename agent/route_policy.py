@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ def _idle_from_stamp(stamp, now):
         return now.timestamp() - float(stamp)
     if isinstance(stamp, str):
         try:
-            return (now - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
+            return (now - datetime.fromisoformat(stamp)).total_seconds()
         except (ValueError, TypeError):
             return None
     return None
@@ -196,7 +196,7 @@ def apply_gateway_policy(runner, key, source, config, *, boundary=None, now=None
         # enter it; pinned channel routes take the same precedence as explicit /model.
         if runner._channel_override_for(source):
             return current
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         # updated_at is touched by intake, so it cannot measure prefix inactivity.
         # Do not load_transcript here: that replays every message body on each
         # gateway turn once the policy is enabled.

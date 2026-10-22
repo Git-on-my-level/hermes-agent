@@ -22,7 +22,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 # A serving restart may spend this long proving the new dependency generation. It is
@@ -59,7 +59,7 @@ def publish_maintenance(
     home: Path | None = None,
 ) -> Path:
     """Write the maintenance record the read-only health probe reports. Never raises."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload: dict = {
         "schema": 1,
         "phase": phase,
@@ -103,7 +103,7 @@ def _publish_recovery_receipt(*, blocking: bool, summary: str, phase: str = "mai
     deadline = None
     if blocking:
         deadline = (
-            datetime.now(timezone.utc) + timedelta(seconds=SERVING_DEPENDENCY_SYNC_DEADLINE_S)
+            datetime.now(UTC) + timedelta(seconds=SERVING_DEPENDENCY_SYNC_DEADLINE_S)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
     publish_application_readiness(
         phase=phase,

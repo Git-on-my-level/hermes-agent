@@ -47,12 +47,12 @@ async def test_conflict_callback_sets_stop_event_before_gateway_runs(monkeypatch
     gateway_ran = []
 
     def gateway_cb(error):
-        assert getattr(app.updater, "_Updater__polling_task_stop_event").is_set()
+        assert app.updater._Updater__polling_task_stop_event.is_set()
         gateway_ran.append(error)
 
     await app.updater.start_polling(error_callback=gateway_cb)
     stop = asyncio.Event()
-    setattr(app.updater, "_Updater__polling_task_stop_event", stop)
+    app.updater._Updater__polling_task_stop_event = stop
 
     class Conflict(Exception):
         pass
@@ -76,7 +76,7 @@ async def test_conflict_callback_sets_stop_event_before_gateway_runs(monkeypatch
         app.updater.disarm_polling()
 
     await io_loop().run(disarm_legacy())
-    setattr(app.updater, "_Updater__polling_task_stop_event", asyncio.Event())
+    app.updater._Updater__polling_task_stop_event = asyncio.Event()
     app.updater._running = True
     await app.updater.stop()
     for request in app.bot._request:

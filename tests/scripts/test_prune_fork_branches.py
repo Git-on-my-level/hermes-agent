@@ -4,7 +4,7 @@ import hashlib
 import importlib.util
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -24,7 +24,7 @@ def _load():
 
 mod = _load()
 
-NOW = datetime(2026, 9, 26, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 26, 12, tzinfo=UTC)
 OLD = NOW - timedelta(days=200)
 FRESH = NOW - timedelta(days=5)
 

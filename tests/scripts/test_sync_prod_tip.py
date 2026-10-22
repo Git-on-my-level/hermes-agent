@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401
+from tests.hermes_cli.test_update_target_identity import git, update_tree
 
 spec = importlib.util.spec_from_file_location(
     "sync_prod_tip", Path(__file__).resolve().parents[2] / "scripts/check_sync_prod_tip.py")
@@ -39,4 +39,4 @@ def test_recheck_prod(update_tree, monkeypatch, case):
         with pytest.raises(ValueError):
             sync.check_prod_tip(t.base)
         assert git(t.clone, "rev-parse", "HEAD") == before
-        assert subprocess.run(["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"], capture_output=True).returncode != 0
+        assert subprocess.run(["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"], capture_output=True, check=False).returncode != 0

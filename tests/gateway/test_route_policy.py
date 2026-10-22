@@ -1,5 +1,5 @@
 """Exercise policy persistence and resolution against a real, isolated session store."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +9,7 @@ from agent.route_policy import apply_gateway_policy
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 
-NOW = datetime(2026, 10, 12, 4, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 12, 4, tzinfo=UTC)
 CONFIG = {"model": {"default": "primary"}, "route_policy": {"enabled": True, "rules": [{
     "name": "peak", "when": {"schedule": {"tz": "Asia/Singapore", "days": ["mon"], "start": "12:00", "end": "18:00"}},
     "scope": {"include": ["gateway_chat"], "exclude": ["pinned", "cron", "delegation", "auxiliary"]},
@@ -21,7 +21,7 @@ CONFIG = {"model": {"default": "primary"}, "route_policy": {"enabled": True, "ru
 @pytest.fixture
 def lane(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
-    import gateway.run as run
+    from gateway import run
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c", chat_type="dm")
     entry = store.get_or_create_session(source)
@@ -75,7 +75,7 @@ def test_policy_persists_rehydrates_and_keeps_warm_route(lane):
 
 @pytest.mark.parametrize("matching", [True, False])
 def test_successful_compaction_re_evaluates_policy(lane, monkeypatch, matching):
-    import gateway.run as run
+    from gateway import run
     from agent import route_policy
     from agent.conversation_compression import _finish_compaction_boundary
     runner, store, source, entry = lane
@@ -137,7 +137,7 @@ def test_unsuccessful_compaction_does_not_invoke_policy(lane, monkeypatch, commi
 
 
 def test_hygiene_compaction_uses_owning_gateway_lane(lane, monkeypatch):
-    import gateway.run as run
+    from gateway import run
     from agent.route_policy import apply_compaction_policy
     runner, store, source, entry = lane
     apply_gateway_policy(runner, entry.session_key, source, CONFIG, now=NOW)
@@ -151,7 +151,7 @@ def test_hygiene_compaction_uses_owning_gateway_lane(lane, monkeypatch):
 
 @pytest.mark.parametrize("scope", ["cron", "subagent", "auxiliary"])
 def test_non_chat_agents_do_not_change_route(lane, monkeypatch, scope):
-    import gateway.run as run
+    from gateway import run
     from agent.route_policy import apply_compaction_policy
     runner, store, source, entry = lane
     apply_gateway_policy(runner, entry.session_key, source, CONFIG, now=NOW)
@@ -205,14 +205,14 @@ def test_pinned_channel_is_not_diverted(lane, monkeypatch):
 
 def test_opt_in_local_ledger_uses_token_allowance(lane):
     from agent.route_policy import _ledger_remaining
-    runner, store, source, entry = lane
+    _, store, _, entry = lane
     db = store._db
     db.update_token_counts(entry.session_id, model="primary", billing_provider="example",
                            input_tokens=70, output_tokens=15, api_call_count=1)
     quota = {"provider": "example", "window": "5h"}
-    assert _ledger_remaining(store, quota, datetime.now(timezone.utc)) is None
+    assert _ledger_remaining(store, quota, datetime.now(UTC)) is None
     quota["token_limit"] = 100
-    assert _ledger_remaining(store, quota, datetime.now(timezone.utc)) == pytest.approx(.15)
+    assert _ledger_remaining(store, quota, datetime.now(UTC)) == pytest.approx(.15)
 
 
 def test_post_compaction_preserves_explicit_model(lane):
@@ -228,7 +228,7 @@ def test_post_compaction_preserves_explicit_model(lane):
 
 
 def test_detached_compaction_queues_first_diversion_notice(lane):
-    runner, store, source, entry = lane
+    runner, _, source, entry = lane
     agent = SimpleNamespace(switch_model=Mock())  # detached compressor has no delivery callback
     apply_gateway_policy(runner, entry.session_key, source, CONFIG, boundary="post_compaction", now=NOW, agent=agent)
     assert "Route policy peak:" in runner._session_state(entry.session_key).conversation.route_policy_notice

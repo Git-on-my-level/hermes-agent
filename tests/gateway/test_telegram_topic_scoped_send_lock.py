@@ -7,6 +7,7 @@ conversation views the interleave bug can appear in, so the lock is keyed by cha
 same-stream ordering (upstream's fix) is preserved while cross-topic sends run in parallel.
 """
 import asyncio
+from itertools import pairwise
 from unittest.mock import MagicMock
 
 import pytest
@@ -102,7 +103,7 @@ async def test_same_topic_concurrent_sends_still_serialize_in_order():
         return MagicMock(message_id=len(order))
 
     adapter._bot.send_message = fake_send_message
-    long = lambda tag: "\n".join(" ".join([tag] * 30) for _ in range(90))  # noqa: E731
+    long = lambda tag: "\n".join(" ".join([tag] * 30) for _ in range(90))
     metadata = {"thread_id": "42"}
 
     await asyncio.gather(
@@ -111,5 +112,5 @@ async def test_same_topic_concurrent_sends_still_serialize_in_order():
     )
 
     assert len(order) >= 4
-    switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    switches = sum(1 for a, b in pairwise(order) if a != b)
     assert switches == 1, order

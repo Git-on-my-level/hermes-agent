@@ -368,7 +368,7 @@ def test_latency_sample_uses_successful_attempt_not_retry_loop_wall_time():
 
 def test_perform_api_call_stamps_successful_attempt_duration(monkeypatch):
     """The attempt stamp is the HTTP call, not prior retry backoff."""
-    import agent.turn_api_call as turn_api_call
+    from agent import turn_api_call
     from agent.turn_api_call import perform_api_call
 
     clock = {"t": 10.0}

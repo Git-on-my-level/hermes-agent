@@ -6,7 +6,7 @@ import pytest
 
 from hermes_cli import main, update_cmd, update_converge
 from hermes_cli.update_git_target import configured_git_target
-from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401
+from tests.hermes_cli.test_update_target_identity import git, update_tree
 
 
 @pytest.mark.parametrize("config,target", [

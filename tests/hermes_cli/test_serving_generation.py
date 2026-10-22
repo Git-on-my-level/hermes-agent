@@ -68,7 +68,7 @@ def test_failed_update_boots_old_code_without_mutable_checkout(tmp_path, monkeyp
     assert (snapshot / "locales" / "en.yaml").is_file()
     assert (snapshot / "scripts" / "bridge.js").is_file()
     (snapshot / "hermes_cli" / "runtime_state.py").write_text("def lease_generation(x): pass\ndef lease_directory(x): pass\n", encoding='utf-8')
-    result = subprocess.run(command, capture_output=True, text=True, timeout=10, encoding='utf-8')
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10, encoding='utf-8', check=False)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "previous good code"
 
@@ -202,7 +202,7 @@ import hermes_cli
     (site/'editable.pth').write_text('import poison_finder\n', encoding='utf-8')
     assert sg.record_completed_generation(root, {'commit': commit, 'dirty': False})
     source = Path(sg.read_generation(root)['source'])
-    result = subprocess.run(sg.serving_command(root, ['hermes', 'gateway', 'run']), capture_output=True, text=True, encoding='utf-8', timeout=30)
+    result = subprocess.run(sg.serving_command(root, ['hermes', 'gateway', 'run']), capture_output=True, text=True, encoding='utf-8', timeout=30, check=False)
     assert result.returncode == 0, result.stderr
     values = json.loads(result.stdout)
     assert values[:3] == [str(source)] * 3
@@ -215,7 +215,7 @@ import hermes_cli
 @pytest.mark.parametrize('disable_lazy', [False, True])
 def test_unrecorded_generation_refuses_half_updated_tree(tmp_path, monkeypatch, fault, disable_lazy, capsys):
     from hermes_cli import venv_sync, _launchers
-    root, generation = installed(tmp_path, monkeypatch)
+    root, _ = installed(tmp_path, monkeypatch)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True, encoding='utf-8').strip()
     (root/'install-stamp.json').write_text(json.dumps({'updateMechanism':'self','commit':commit,'dirty':False}), encoding='utf-8')
     if fault == 'checkout_moved':
@@ -239,7 +239,7 @@ def test_unrecorded_generation_refuses_half_updated_tree(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize('fault', ['consistent', 'consistent_adopted', 'pending', 'head_moved', 'dependency_mismatch'])
 def test_first_deploy_at_real_bootstrap_process_boundary(tmp_path, monkeypatch, fault):
-    root, generation = installed(tmp_path, monkeypatch)
+    root, _ = installed(tmp_path, monkeypatch)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True, encoding='utf-8').strip()
     (root/'install-stamp.json').write_text(json.dumps({'updateMechanism':'self', 'commit':commit, 'dirty':False}), encoding='utf-8')
     if fault == 'consistent_adopted':
@@ -282,7 +282,7 @@ sys.argv = ['hermes', 'gateway', 'run']
 import hermes_bootstrap
 print('UNSAFE BOOTSTRAP RETURNED')
 """
-    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8', timeout=40)
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8', timeout=40, check=False)
     assert 'UNSAFE' not in result.stdout + result.stderr
     if fault in {'consistent', 'consistent_adopted'}:
         assert result.returncode == 0, result.stderr
@@ -336,7 +336,7 @@ update_completion._complete_selected({{'source':{str(root)!r}, 'sibling_snapshot
  'snapshot_id':None, 'pre_update_version':None, 'no_gateway_restart':True}})
 raise SystemExit(0)
 """
-    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8', timeout=40)
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8', timeout=40, check=False)
     assert result.returncode != 0, result.stdout + result.stderr
     reasons = {'dirty':'dirty', 'unknown_git':'Git identity is unknown', 'dependency_mismatch':'dependency declarations differ',
                'missing_resources':'skills/locales/scripts', 'publish_false':'snapshot validation'}

@@ -124,7 +124,7 @@ def _write_through_xai_oauth_to_global_root(state: dict[str, Any]) -> None:
         logger.debug("xAI OAuth: write-through to global root failed: %s", exc)
 
 
-def _write_xai_oauth_root_pool_update(state: Dict[str, Any]) -> None:
+def _write_xai_oauth_root_pool_update(state: dict[str, Any]) -> None:
     """Write a rotated xAI grant back into the global-root ``credential_pool`` entry.
 
     When the grant lives ONLY in root's pool (no ``providers.xai-oauth`` anywhere), the profile

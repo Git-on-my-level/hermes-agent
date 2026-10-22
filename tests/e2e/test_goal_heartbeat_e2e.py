@@ -46,7 +46,8 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
 
     mgr = goals.GoalManager(session_id=entry.session_id)
     mgr.set("ship the release")
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(120)")
     try:
         mgr.wait_on(child.pid, reason="CI watcher")
         mgr._state.waiting_since = time.time() - 3600  # a real heartbeat lands after the 30-min barrier cap
@@ -68,7 +69,7 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
             assert not any("Goal" in s or "Continuing" in s for s in sent), sent
 
             child.kill()
-            child.wait(timeout=10)
+            await child.wait()
             await adapter.handle_message(MessageEvent(
                 text="[Goal heartbeat 2/3 — no session activity for 50m; goal waiting on pid]",
                 message_type=MessageType.TEXT, source=source, internal=True, allow_gateway_control=False,
@@ -78,7 +79,7 @@ async def test_silent_heartbeat_keeps_live_park_and_judges_once_the_process_exit
             after = goals.load_goal(entry.session_id)
             assert after.waiting_on_pid is None and after.status == "done"
     finally:
-        if child.poll() is None:
+        if child.returncode is None:
             child.kill()
 
 
@@ -105,7 +106,8 @@ async def test_heartbeat_note_plus_silent_stays_quiet_while_the_wait_holds():
 
     mgr = goals.GoalManager(session_id=entry.session_id)
     mgr.set("ship the release")
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(120)")
     try:
         mgr.wait_on(child.pid, reason="CI watcher")
         mgr._state.waiting_since = time.time() - 3600
@@ -125,5 +127,5 @@ async def test_heartbeat_note_plus_silent_stays_quiet_while_the_wait_holds():
             assert not any("CI still running" in s or "[SILENT]" in s or "Goal" in s or "Continuing" in s
                            for s in sent), sent
     finally:
-        if child.poll() is None:
+        if child.returncode is None:
             child.kill()
