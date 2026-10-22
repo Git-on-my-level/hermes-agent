@@ -22,6 +22,7 @@ def _hooks_runner():
         _post_turn_loop_completion=AsyncMock(),
         _final_text_for_post_turn_hooks=GatewayRunner._final_text_for_post_turn_hooks,
         _silent_internal_turn=GatewayRunner._silent_internal_turn,
+        _publish_local_control=MagicMock(),
     )
 
 

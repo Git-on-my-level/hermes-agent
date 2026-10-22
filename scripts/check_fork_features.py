@@ -412,6 +412,16 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "Commentary preview edit still failing; not sending another bubble",
         "persistent commentary edit failure does not mint a bubble per item",
     ),
+    (
+        "agent/turn_recovery.py",
+        "if status_code != 401 and not xai_oauth_stale_403:",
+        "NousResearch/hermes-agent#108123 _refresh_credentials_after_401 treats xAI 403 bad-credentials as refreshable",
+    ),
+    (
+        "agent/turn_recovery.py",
+        '"unauthenticated:bad-credentials"',
+        "NousResearch/hermes-agent#108123 xAI stale OAuth 403 marker",
+    ),
 ]
 
 TEST_FILES = [
@@ -437,6 +447,9 @@ TEST_FILES = [
     "tests/gateway/test_rearm_typing_after_compaction.py",
     "tests/hermes_cli/test_update_converge.py",
     "tests/hermes_cli/test_gateway_service_path_determinism.py",
+    "tests/agent/test_xai_oauth_stale_403_recovery.py",
+    "tests/agent/test_codex_same_account_adoption.py",
+    "tests/hermes_cli/test_xai_oauth_root_pool_writeback.py",
 ]
 
 
