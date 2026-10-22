@@ -62,7 +62,7 @@ class GatewayGoalsMixin:
         except Exception:
             return False
 
-    async def _auto_start_goal_for_inbound_event(self, event: "MessageEvent") -> None:
+    async def _auto_start_goal_for_inbound_event(self, event: MessageEvent) -> None:
         """Start or correct an automatic goal; preserve explicit and paused goals.
 
         Idle turns run this after command dispatch and FIFO rescue; busy turns
@@ -453,6 +453,10 @@ class GatewayGoalsMixin:
         if getattr(source, "platform", None) == Platform.LOCAL:
             # A local session's adapter FIFO has no reader: its turns are authority admissions.
             # Commit the continuation there, as main's TUI chained it after the turn.
+            # A parked/done judge must not admit: the restructure that clears non-local
+            # queues dropped this guard and a done turn emitted a second continuation.
+            if not decision.get("should_continue") or not prompt:
+                return
             from gateway.session_automation import admit_route_wake
             try:
                 await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")

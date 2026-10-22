@@ -1066,13 +1066,17 @@ def _resolved_commit(git_cmd, ref: str) -> str:
     return (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{ref}^{{commit}}"]).stdout or "").strip()
 
 
-def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha, *, in_place_update=False) -> None:
+def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha, *, in_place_update=False, remote="origin") -> None:
     """The principal pull's one checkout move onto *target_sha*; exits when it cannot be made."""
     # merge --ff-only the already-fetched commit instead of `git pull`, which would do a
     # SECOND network fetch. Every move names ``target_sha``, never the ref: a ref that moves
     # after the arm cannot land a commit the marker and the debt do not name (review O3).
-    # An in-place update merges onto the branch the checkout is already on.
-    if merge_ref != f"origin/{branch}" and not in_place_update:
+    # Detach when the target is not remote/branch. A release plan sets in_place_update only
+    # to skip branch-policy; its merge_ref is the commit, so it must still detach (upstream's
+    # post-pull guard compares that move). A git-target in-place update merges because its
+    # merge_ref IS remote/branch, not because the flag suppresses the detach.
+    del in_place_update  # callers still pass the plan flag; the ref decides the command
+    if merge_ref != f"{remote}/{branch}":
         # Keep detached local commits reachable, too. Named branches are
         # untouched by checkout --detach; an autostash protects dirty files.
         _park_detached_head(git_cmd, _m().PROJECT_ROOT, branch)
@@ -1149,7 +1153,8 @@ def _pull_updates(
             # The paused gateways' tree gate must know this move's target before git writes a file.
             with _checkout_move(_windows_gateway_resume, target_sha):
                 _move_checkout_to(
-                    git_cmd, branch, merge_ref, target_sha, pre_pull_sha, in_place_update=in_place_update)
+                    git_cmd, branch, merge_ref, target_sha, pre_pull_sha,
+                    in_place_update=in_place_update, remote=remote)
             _refuse_unselected_head(git_cmd, target_sha, pre_pull_sha)  # before the marker goes
         except KeyboardInterrupt:
             raise  # Ctrl-C reached git too (same process group): the tree may be torn, keep the marker
