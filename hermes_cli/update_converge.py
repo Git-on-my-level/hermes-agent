@@ -116,6 +116,7 @@ def decide_converge(
     busy: bool,
     pin_age_s: float,
     target_sha: str = "",
+    channel_fetch_ok: bool = True,
 ) -> ConvergeDecision:
     """Pure policy. ``pin_age_s`` is how long this pin has been visible on the host.
 
@@ -132,6 +133,11 @@ def decide_converge(
             at_tip = prefixes_match(checkout_sha, desired)
             live_at_tip = prefixes_match(live_sha, desired) if live_sha else at_tip
             if at_tip and (live_at_tip or settings.skip_gateway_restart):
+                if not channel_fetch_ok:
+                    # The tip we just matched against came from a tracking ref the
+                    # fetch could not refresh. Calling that "current" is how a
+                    # behind host sits still forever; skip loudly instead.
+                    return ConvergeDecision("skip", "channel_fetch_failed")
                 return ConvergeDecision("skip", "already_current")
         if busy and pin_age_s < settings.busy_sla:
             return ConvergeDecision("skip", "busy")
@@ -260,22 +266,44 @@ def channel_tip_sha(project_root: Path, remote: str = "", branch: str = "") -> s
         return ""
 
 
-def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") -> None:
-    """Refresh the tracking ref used by channel-tip. Failures are skip-safe."""
+def fetch_channel_tip(project_root: Path, remote: str = "", branch: str = "") -> bool:
+    """Refresh the tracking ref used by channel-tip.
+
+    Returns ``True`` when the caller may trust the local tracking ref as the
+    channel tip: either there was nothing to fetch (no remote/branch config)
+    or the fetch ran and succeeded. A failed fetch leaves the tracking ref
+    stale, so the caller must not treat it as "no new tip" — a stale tip is
+    exactly how a behind host reports a false ``already_current`` (2026-10-23:
+    three macs sat on the old prod tip for hours behind silent fetch failures).
+    Failures stay skip-safe: the tick still runs, it just refuses to call
+    itself current.
+    """
     if not remote or not branch:
-        return
+        return True
     from hermes_cli.update_cmd_check import tracking_refspec
 
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["git", "-C", str(project_root), "fetch", "--prune", remote, tracking_refspec(remote, branch)],
             capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        logger.debug("channel-tip fetch failed: %s", e)
+        logger.warning("channel-tip fetch failed (%s); refusing already-current on a stale tip", e)
+        return False
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        logger.warning("channel-tip fetch failed (rc=%s): %s; refusing already-current on a stale tip",
+                       r.returncode, detail[-1] if detail else "no output")
+        return False
+    return True
 
 
-def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = None) -> ConvergeDecision:
+def decide_from_live(
+    project_root: Path,
+    settings: Optional[ConvergeSettings] = None,
+    *,
+    channel_fetch_ok: bool = True,
+) -> ConvergeDecision:
     settings = settings or load_converge_settings()
     pin = settings.pin
     target = "" if pin else channel_tip_sha(project_root, settings.remote, settings.branch)
@@ -292,6 +320,7 @@ def decide_from_live(project_root: Path, settings: Optional[ConvergeSettings] = 
         busy=gateway_is_busy(),
         pin_age_s=age,
         target_sha=target,
+        channel_fetch_ok=channel_fetch_ok,
     )
 
 
@@ -375,11 +404,12 @@ def cmd_converge_tick(args: Any) -> None:
     from hermes_cli.main import PROJECT_ROOT, cmd_update
 
     settings = load_converge_settings()
+    channel_fetch_ok = True
     if settings.enabled and not settings.pin:
-        fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
+        channel_fetch_ok = fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
     from hermes_cli.update_receipt import read_latest_receipt
     _alert_receipt(PROJECT_ROOT, read_latest_receipt())
-    decision = decide_from_live(PROJECT_ROOT, settings)
+    decision = decide_from_live(PROJECT_ROOT, settings, channel_fetch_ok=channel_fetch_ok)
     # A checkout/runtime can already name the pin while its product tail is
     # still owed. Do not let already_current permanently suppress repair.
     # A pending marker older than install-stamp.json is leftover debt from a
