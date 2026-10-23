@@ -64,6 +64,45 @@ def test_empty_pin_skips_when_already_on_tip():
     assert d.action == "skip" and d.reason == "already_current"
 
 
+def test_failed_channel_fetch_refuses_already_current():
+    # 2026-10-23: a silently-failed tip fetch left three macs answering
+    # already_current against a stale tracking ref for hours. A channel-tip
+    # match reached without a good fetch must not read as current.
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN, channel_fetch_ok=False,
+    )
+    assert d.action == "skip" and d.reason == "channel_fetch_failed"
+
+
+def test_successful_channel_fetch_still_reports_already_current():
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN, channel_fetch_ok=True,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
+def test_failed_channel_fetch_still_updates_when_behind():
+    # The guard only blocks the false-current path; a genuinely behind host
+    # still updates (updating to the stale tip is a no-op fetch retry away).
+    d = decide_converge(
+        settings=_s(pin=""), checkout_sha="aaaaaaaa" + "0" * 32, live_sha="", dirty=False, busy=False, pin_age_s=0,
+        target_sha=PIN, channel_fetch_ok=False,
+    )
+    assert d.action == "update" and d.reason == "channel_tip"
+
+
+def test_pin_mode_ignores_channel_fetch_flag():
+    # Explicit pins do not derive "current" from a fetched ref, so the flag
+    # must not change pin-mode decisions.
+    d = decide_converge(
+        settings=_s(), checkout_sha=PIN, live_sha=PIN, dirty=False, busy=False, pin_age_s=0,
+        channel_fetch_ok=False,
+    )
+    assert d.action == "skip" and d.reason == "already_current"
+
+
 def test_empty_pin_restarts_stale_runtime():
     d = decide_converge(
         settings=_s(pin=""), checkout_sha=PIN, live_sha=PIN2, dirty=False, busy=False, pin_age_s=0,
@@ -220,7 +259,7 @@ def test_failed_converge_is_alerted_even_when_busy(monkeypatch, caplog, capsys):
     main = SimpleNamespace(PROJECT_ROOT=__import__("pathlib").Path("/tmp/mock-hermes-source"), cmd_update=lambda a: None)
     monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
     monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
-    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "busy"))
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a, **k: uc.ConvergeDecision("skip", "busy"))
     monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: {"outcome": "failed"})
     monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(AssertionError("busy tick updated")))
     uc.cmd_converge_tick(SimpleNamespace())
@@ -237,7 +276,7 @@ def test_converge_nonzero_exit_alerts_and_clears_drain(monkeypatch, caplog):
     monkeypatch.setitem(sys.modules, "hermes_cli.main", main)
     from gateway import drain_control
     monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
-    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("update", "behind", PIN))
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a, **k: uc.ConvergeDecision("update", "behind", PIN))
     monkeypatch.setattr(update_receipt, "read_latest_receipt", lambda: None)
     monkeypatch.setattr(main, "cmd_update", lambda a: (_ for _ in ()).throw(SystemExit(1)))
     monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
@@ -256,7 +295,7 @@ def test_idle_tick_finishes_pending_tail_even_if_code_already_current(tmp_path, 
     called = []
     monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
     monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
-    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a, **k: uc.ConvergeDecision("skip", "already_current", PIN))
     monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
     monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
     monkeypatch.setattr(uc, "_mark_planned_drain", lambda: None)
@@ -276,7 +315,7 @@ def test_idle_tick_skips_leftover_pending_when_tree_already_matches_stamp(tmp_pa
     called = []
     monkeypatch.setitem(sys.modules, "hermes_cli.main", SimpleNamespace(PROJECT_ROOT=tmp_path, cmd_update=lambda a: called.append(a)))
     monkeypatch.setattr(uc, "load_converge_settings", lambda: _s())
-    monkeypatch.setattr(uc, "decide_from_live", lambda *a: uc.ConvergeDecision("skip", "already_current", PIN))
+    monkeypatch.setattr(uc, "decide_from_live", lambda *a, **k: uc.ConvergeDecision("skip", "already_current", PIN))
     monkeypatch.setattr(uc, "gateway_is_busy", lambda: False)
     monkeypatch.setattr(uc, "checkout_is_dirty", lambda r: False)
     monkeypatch.setattr(uc, "_mark_planned_drain", lambda: (_ for _ in ()).throw(AssertionError("leftover pending drained")))
@@ -297,7 +336,7 @@ def test_sticky_completion_backoff_and_receipt_alert_survive_repeated_ticks(tmp_
     calls, drains = [], []
     monkeypatch.setitem(sys.modules,'hermes_cli.main',SimpleNamespace(PROJECT_ROOT=tmp_path,cmd_update=lambda a:calls.append(a)))
     monkeypatch.setattr(uc,'load_converge_settings',lambda:_s())
-    monkeypatch.setattr(uc,'decide_from_live',lambda *a:uc.ConvergeDecision('skip','already_current',PIN))
+    monkeypatch.setattr(uc,'decide_from_live',lambda *a, **k: uc.ConvergeDecision('skip','already_current',PIN))
     monkeypatch.setattr(uc,'gateway_is_busy',lambda:False)
     monkeypatch.setattr(uc,'checkout_is_dirty',lambda r:False)
     monkeypatch.setattr(uc,'_mark_planned_drain',lambda:drains.append(True))
