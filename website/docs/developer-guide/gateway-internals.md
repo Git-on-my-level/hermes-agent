@@ -791,3 +791,16 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
+
+### Reconnect I/O and local sessions
+
+The native session listener and platform handlers share the gateway loop. Reconnect and
+profile reload must await blocking config, dependency and filesystem work in workers;
+`gateway/adapter_factory.py` owns this boundary. Registry preparation (lazy imports,
+dependency checks/install and validation) runs off-loop, while general plugin factories
+retain loop affinity. Telegram's synchronous factory runs in a worker and consumes the
+notification snapshot carried in `PlatformConfig.extra`, never a recursive config load.
+Secondary reconnects prepare their profile context off-loop and connect in that context
+on the gateway loop. Scoped token-lock acquisition also runs off-loop and releases a lock
+acquired after connect cancellation. No second session authority or cross-loop session
+mutation is introduced. Third-party async connect/handler code must still yield normally.

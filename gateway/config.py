@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import threading
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
@@ -196,6 +197,7 @@ def _getenv_str(name: str, default: str = "") -> str:
     return val if (val := _getenv(name, default)) is not None else default
 
 
+_bundled_plugin_scan_lock = threading.Lock()
 _Platform__bundled_plugin_names: Optional[set] = None  # cached outside the enum: never a member
 _Platform__bundled_plugin_aliases: Optional[dict] = None  # manifest ``name:`` (lower) -> directory name
 
@@ -249,12 +251,10 @@ class Platform(Enum):
         value = value.strip().lower()
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
-        global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
-        if _Platform__bundled_plugin_names is None:
-            _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()
-        registered = value in _Platform__bundled_plugin_names
+        names, aliases = cls.bundled_plugin_platforms()
+        registered = value in names
         if not registered:
-            alias = _Platform__bundled_plugin_aliases.get(value)
+            alias = aliases.get(value)
             if alias is not None:
                 # A bundled platform whose plugin.yaml ``name:`` differs from its directory (e.g. dir
                 # "a2a", name "a2a-platform") is configured under the manifest name — ``plugins
@@ -274,6 +274,18 @@ class Platform(Enum):
         cls._value2member_map_[value] = pseudo
         cls._member_map_[pseudo._name_] = pseudo
         return pseudo
+
+    @classmethod
+    def bundled_plugin_platforms(cls) -> tuple[set, dict]:
+        """Process snapshot of the serving source's bundled platforms (including aliases).
+
+        Serialize cold readers too: config loads for different profiles can run in workers.
+        """
+        global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
+        with _bundled_plugin_scan_lock:
+            if _Platform__bundled_plugin_names is None:
+                _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()
+            return _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
 
     @classmethod
     def _scan_bundled_plugin_platforms(cls) -> tuple[set, dict]:
