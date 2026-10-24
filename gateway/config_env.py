@@ -249,7 +249,7 @@ def _bundled_env_fallbacks(config: GatewayConfig, entries: list) -> list:
     from gateway.platform_activation import activation_predicate
     from gateway.platform_env import _BUNDLED_ENV_SIBLINGS, bundled_env_rows
     have = {getattr(e, "name", "") for e in entries}
-    names = (set(Platform._scan_bundled_plugin_platforms()[0]) | set(_BUNDLED_ENV_SIBLINGS)) - have
+    names = (set(Platform.bundled_plugin_platforms()[0]) | set(_BUNDLED_ENV_SIBLINGS)) - have
     if not names:
         return []
     wanted = activation_predicate(yaml_cfg={}, platform_names=config.platforms)

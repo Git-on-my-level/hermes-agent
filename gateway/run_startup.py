@@ -1250,9 +1250,7 @@ class GatewayStartupMixin:
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
-            # Import/register may wait on host I/O; factories retain their loop
-            # affinity (third-party adapters may create asyncio resources).
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = await self._create_adapter_off_loop(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 if platform.value in {m.value for m in Platform.__members__.values()}:

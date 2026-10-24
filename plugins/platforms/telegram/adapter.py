@@ -2654,7 +2654,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return None
         topic_conf["thread_id"] = thread_id
         self._dm_topics[cache_key] = int(thread_id)
-        self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
+        await asyncio.to_thread(
+            self._persist_dm_topic_thread_id, chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
 
     async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str) -> None:
@@ -2733,7 +2734,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     continue
                 self._dm_topics[cache_key] = thread_id
                 logger.info("[%s] DM topic cached: %s -> thread_id=%s", self.name, cache_key, thread_id)
-                self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
+                await asyncio.to_thread(self._persist_dm_topic_thread_id, int(chat_id), topic_name, thread_id)
                 # Seed message: Telegram's client hides empty topics until they contain one.
                 try:
                     await _await_with_thread_deadline(
@@ -3281,7 +3282,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
         try:
-            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
+            from gateway.adapter_factory import acquire_adapter_lock
+            if not await acquire_adapter_lock(self, 'telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
             from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor
             builder = Application.builder().token(self.config.token)
@@ -3347,7 +3349,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._start_post_connect_housekeeping()
             return True
         except Exception as e:
-            self._release_platform_lock()
+            await asyncio.to_thread(self._release_platform_lock)
             safe_error = _redact_telegram_error_text(e)
             # Classify by exception TYPE (never message text): auth failures can never self-heal, so
             # marking them retryable put agents into a silent eternal reconnect loop.
@@ -3494,7 +3496,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._send_path_degraded = True
         # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
         # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        await asyncio.to_thread(self._release_platform_lock)
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
@@ -7434,19 +7436,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 # _PLATFORMS["telegram"] static dict in hermes_cli/{setup,gateway}.py, and the _send_telegram dispatch in
 # tools/send_message_tool.py). Telegram uses the generic token connected check, so no is_connected override
 # is needed. ──────────────────────────────────────────────────────────────────────────
-def _resolve_notifications_mode() -> str:
-    """Notification mode (all/important) from env, else config.yaml display.platforms.telegram.notifications."""
-    mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
+def _resolve_notifications_mode(config) -> str:
+    """Resolve from the loaded snapshot; never read config/filesystem during a rebuild."""
+    mode = _get_scoped_secret("HERMES_TELEGRAM_NOTIFICATIONS", "")
     if not mode:
-        try:
-            from gateway.config import load_gateway_config
-            from gateway.run import cfg_get
-            _raw = cfg_get(load_gateway_config(), "display", "platforms", "telegram", "notifications")
-            if _raw not in {None, ""}:
-                mode = str(_raw).strip().lower()
-        except Exception:
-            pass
-    mode = mode or "important"
+        mode = str(config.extra.get("notifications") or "important").strip().lower()
     if mode not in {"all", "important"}:
         logger.warning("Unknown telegram notifications mode '%s', defaulting to 'important' (valid: all, important)", mode)
         mode = "important"
@@ -7454,12 +7448,9 @@ def _resolve_notifications_mode() -> str:
 
 
 def _build_adapter(config):
-    """Construct TelegramAdapter and apply the notification mode."""
+    """Construct TelegramAdapter with the startup/reload notification snapshot."""
     adapter = TelegramAdapter(config)
-    try:
-        adapter._notifications_mode = _resolve_notifications_mode()
-    except Exception:
-        adapter._notifications_mode = "important"
+    adapter._notifications_mode = _resolve_notifications_mode(config)
     return adapter
 
 

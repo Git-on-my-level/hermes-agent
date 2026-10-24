@@ -798,7 +798,7 @@ class GatewayAdapterLifecycleMixin:
         # None: removed concurrently since the caller's snapshot. Paused needs /platform resume.
         if info is None or info.get("paused"):
             return
-        self._flag_reconnect_needs_attention(platform, info, now)
+        await asyncio.to_thread(self._flag_reconnect_needs_attention, platform, info, now)
         if now < info["next_retry"]:
             return  # not time yet
         platform_config = info["config"]
@@ -806,7 +806,7 @@ class GatewayAdapterLifecycleMixin:
         # Empty-token primary configs can never reconnect; drop them so multiplex setups
         # where a secondary profile owns the bot do not spin forever.
         # See #64674.
-        if not _platform_has_bot_credential(platform, platform_config):
+        if not await asyncio.to_thread(_platform_has_bot_credential, platform, platform_config):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
         logger.info("Reconnecting %s (attempt %d)...", platform.value, attempt)
@@ -815,9 +815,9 @@ class GatewayAdapterLifecycleMixin:
             from gateway.platform_registry import platform_registry
             # A re-armed plugin import + register() joins its load deadline: run it off the event loop.
             await self._run_in_executor_with_context(platform_registry.get, platform.value)
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = await self._create_adapter_off_loop(platform, platform_config)
             if not adapter:
-                if not self._adapter_may_heal(platform, platform_config):
+                if not await asyncio.to_thread(self._adapter_may_heal, platform, platform_config):
                     # Became builtin/registered-but-None: a config change is needed, so stop retrying.
                     self._update_platform_runtime_status(
                         platform.value, platform_state="fatal", error_code="adapter_unavailable",
@@ -1082,17 +1082,22 @@ class GatewayAdapterLifecycleMixin:
         # A platform that left core for a catalog plugin is installed before discovery below.
         from gateway.run_startup import recover_left_core_in
         await asyncio.to_thread(recover_left_core_in, profile_home, hydrate_secrets=False)
-        with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-            profile_runtime_cfg = _load_gateway_config()
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-            discover_plugins()
-            self._subscribe_plugin_rewire(get_plugin_manager(), profile_name, profile_home)
-            # This profile's `hooks:` block: start() registered before any profile scope existed.
-            self._register_config_hooks(
-                "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
-            )
-            profile_cfg = load_gateway_config()
-            violation = _own_policy_open_startup_violation(profile_cfg)
+        def load():
+            with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                profile_runtime_cfg = _load_gateway_config()
+                from hermes_cli.plugins import discover_plugins, get_plugin_manager
+                discover_plugins()
+                # This profile's `hooks:` block: start() registered before any profile scope existed.
+                self._register_config_hooks(
+                    "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
+                )
+                manager = get_plugin_manager()
+                profile_cfg = load_gateway_config()
+                violation = _own_policy_open_startup_violation(profile_cfg)
+            return profile_runtime_cfg, profile_cfg, violation, manager
+
+        profile_runtime_cfg, profile_cfg, violation, manager = await asyncio.to_thread(load)
+        self._subscribe_plugin_rewire(manager, profile_name, profile_home)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
@@ -1303,7 +1308,7 @@ class GatewayAdapterLifecycleMixin:
                 platform.value, exc_info=True,
             ):
                 with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = await self._create_adapter_off_loop(platform, platform_config)
                 if not adapter:
                     logger.warning(
                         "[MULTIPLEX] Profile '%s': skipping platform '%s' - adapter creation returned None",
@@ -1425,50 +1430,54 @@ class GatewayAdapterLifecycleMixin:
         """One scoped attempt to rebuild+connect a secondary adapter → ``(adapter, success)``;
         ``(None, None)`` = give up for good (disabled, credential removed, adapter unavailable). Caller
         tears down a RETURNED adapter; one whose configure/connect raised is torn down here."""
-        from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
         # Lazy + per-attempt: keeps test monkeypatches on these modules live.
         from hermes_cli.profiles import get_profile_dir
         from hermes_cli.env_loader import hydrate_profile_secret_sources
-        from gateway.config import load_gateway_config
-        profile_home = get_profile_dir(profile_name)
+        profile_home = await asyncio.to_thread(get_profile_dir, profile_name)
         # Hydrate external secret sources off-loop so they cannot starve heartbeats.
         await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
-        with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-            profile_config = load_gateway_config().platforms.get(platform)
-            if profile_config is None or not profile_config.enabled:
-                return None, None
-            # Startup credential gate mirror: a removed credential must not rebuild.
-            # Mirrors the startup credential gate (#84079): a credential removed from this profile's scope
-            # must not rebuild an adapter that would fan out turns.
-            if not _platform_has_bot_credential(platform, profile_config):
-                logger.info(
-                    "Secondary %s reconnect skipped: no bot credential (profile: %s)",
-                    platform.value, profile_name,
-                )
-                return None, None
-            adapter = self._create_adapter(platform, profile_config)
-            if adapter is None:
-                logger.warning(
-                    "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
-                    platform.value, profile_name,
-                )
-                return None, None
-            carry_inbound_dedup(predecessor, adapter)
-            try:
-                self._configure_profile_adapter(adapter, profile_name, platform)
-                success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
-            except BaseException:
-                # Caller never sees this adapter; release its partial resources and return its held inbound.
-                await self._safe_adapter_disconnect(adapter, platform)
-                hand_over_held_inbound(adapter, predecessor)
-                raise
-            return adapter, success
+        from gateway.adapter_factory import run_in_adapter_profile
+        return await run_in_adapter_profile(
+            profile_home, self._connect_secondary_profile_adapter, profile_name, platform, predecessor)
+
+    async def _connect_secondary_profile_adapter(self, profile_name, platform, predecessor):
+        from gateway.run import _platform_has_bot_credential
+        from gateway.config import load_gateway_config
+        profile_config = (await asyncio.to_thread(load_gateway_config)).platforms.get(platform)
+        if profile_config is None or not profile_config.enabled:
+            return None, None
+        # Startup credential gate mirror: a removed credential must not rebuild.
+        # Mirrors the startup credential gate (#84079): a credential removed from this profile's scope
+        # must not rebuild an adapter that would fan out turns.
+        if not await asyncio.to_thread(_platform_has_bot_credential, platform, profile_config):
+            logger.info(
+                "Secondary %s reconnect skipped: no bot credential (profile: %s)",
+                platform.value, profile_name,
+            )
+            return None, None
+        adapter = await self._create_adapter_off_loop(platform, profile_config)
+        if adapter is None:
+            logger.warning(
+                "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
+                platform.value, profile_name,
+            )
+            return None, None
+        carry_inbound_dedup(predecessor, adapter)
+        try:
+            self._configure_profile_adapter(adapter, profile_name, platform)
+            success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+        except BaseException:
+            # Caller never sees this adapter; release its partial resources and return its held inbound.
+            await self._safe_adapter_disconnect(adapter, platform)
+            hand_over_held_inbound(adapter, predecessor)
+            raise
+        return adapter, success
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform, predecessor=None
     ) -> None:
         """Reconnect a retryable secondary adapter under its own profile scope."""
-        from gateway.run import _profile_runtime_scope, _reconnect_backoff
+        from gateway.run import _reconnect_backoff
         attempts = 0
         # Same escalation shape as the primary queue entry; ``queued_at`` is this task's start.
         queue_info = {"queued_at": time.monotonic(), "attempts": 0}
@@ -1525,12 +1534,8 @@ class GatewayAdapterLifecycleMixin:
                     return
                 attempts += 1
                 queue_info["attempts"] = attempts
-                profile_home = self._routed_profile_home(profile_name)
-                # The attempt above already hydrated this profile's secret sources off-loop.
-                with self._scope_or_null(
-                        functools.partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
-                    self._flag_reconnect_needs_attention(
-                        platform, queue_info, time.monotonic(), status_key=f"{profile_name}:{platform.value}")
+                from gateway.adapter_factory import flag_secondary_reconnect_attention
+                await asyncio.to_thread(flag_secondary_reconnect_attention, self, profile_name, platform, queue_info)
                 backoff = _reconnect_backoff(attempts)
                 logger.info(
                     "Secondary %s reconnect retry in %ds (profile: %s)", platform.value, backoff, profile_name
@@ -1899,6 +1904,18 @@ class GatewayAdapterLifecycleMixin:
                 return hashlib.sha256(("hermes-mux:" + val.strip()).encode("utf-8")).hexdigest()[:16]
         return None
 
+    async def _create_adapter_off_loop(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
+        from gateway.adapter_factory import create_adapter_async
+        return await create_adapter_async(self, platform, config)
+
+    def _seed_adapter_config(self, config: Any) -> None:
+        """In-memory runner defaults, shared by sync and prepared factories."""
+        if hasattr(config, "extra") and isinstance(config.extra, dict):
+            config.extra.setdefault("group_sessions_per_user", self.config.group_sessions_per_user)
+            config.extra.setdefault(
+                "thread_sessions_per_user", getattr(self.config, "thread_sessions_per_user", False)
+            )
+
     def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Create an adapter bound to this runner (every lifecycle path goes through here so
         adapters can resolve inbound profile routes before handlers or connect())."""
@@ -1910,11 +1927,7 @@ class GatewayAdapterLifecycleMixin:
     def _instantiate_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Instantiate the adapter for a platform: plugin registry first, then built-ins."""
         from gateway.run import _instantiate_builtin_adapter
-        if hasattr(config, "extra") and isinstance(config.extra, dict):
-            config.extra.setdefault("group_sessions_per_user", self.config.group_sessions_per_user)
-            config.extra.setdefault(
-                "thread_sessions_per_user", getattr(self.config, "thread_sessions_per_user", False)
-            )
+        self._seed_adapter_config(config)
         with _log_suppressed(logging.DEBUG, "Platform registry lookup for '%s' failed: %s", platform.value):
             from gateway.platform_registry import platform_registry
             if platform_registry.is_registered(platform.value):
