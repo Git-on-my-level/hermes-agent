@@ -12,10 +12,9 @@ name: Fork CI
 # Blocking lint lanes are INLINED below (not called via lint.yml) on a public
 # runner: upstream lint.yml pins every job to blacksmith-4vcpu runners, which
 # sat queue-starved on this fork for hours (four runs stuck 2026-10-22), so a
-# push gate could never start. lint.yml stays the PR path — its PR-only
-# advisory lanes (lint-diff, code-health) still run there. These inlined jobs
-# mirror only lint.yml's blocking steps; keep them in sync when upstream
-# changes them.
+# push gate could never start. The PR lane uses scripts/check for the full
+# blocking set, including the code-health ratchet; keep these jobs in sync
+# when upstream changes its checks.
 
 on:
   pull_request:
@@ -36,13 +35,23 @@ concurrency:
 
 jobs:
   lint:
-    name: Python lints (PR advisory + blocking via upstream lint.yml)
-    # push events use the inlined blocking jobs below: lint.yml's Blacksmith
-    # runners starve, and a queued workflow_call job would hold the gate.
+    name: Python lints / all blocking checks
+    # The upstream reusable workflow requires Blacksmith runners unavailable to this fork.
+    # Use its canonical local checker, retaining all blocking checks on public runners.
     if: github.event_name == 'pull_request' && github.repository == 'Git-on-my-level/hermes-agent'
-    uses: ./.github/workflows/lint.yml
-    with:
-      event_name: ${{ github.event_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pm
+      - name: Install pinned check tools
+        run: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
+      - name: Run every blocking lint check
+        run: python scripts/check --base HEAD^1
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
 
   tests:
     name: Python tests
@@ -175,7 +184,7 @@ jobs:
           FOOTGUNS: ${{ needs.windows-footguns.result }}
         run: |
           echo "lint=$LINT tests=$TESTS ruff=$RUFF footguns=$FOOTGUNS"
-          # lint (upstream lint.yml) runs on pull_request only; skipped is
+          # The canonical lint checker runs on pull_request only; skipped is
           # expected on push events, where the inlined blocking jobs cover it.
           case "$LINT" in success|skipped) ;; *) exit 1;; esac
           test "$TESTS" = success
