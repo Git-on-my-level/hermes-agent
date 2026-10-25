@@ -103,11 +103,14 @@ def test_pty_bridge_reads_and_waits_above_fd_setsize(high_fds, monkeypatch):
         assert bridge._fd >= 1024
         buf = bytearray()
         deadline = time.monotonic() + 5
-        while b"pty-high-fd" not in buf and time.monotonic() < deadline:
+        # A PTY is a byte stream: echo's text and its CRLF may arrive in separate reads.
+        # Consume the complete line before asserting that the child is idle.
+        while b"pty-high-fd\r\n" not in buf and time.monotonic() < deadline:
             chunk = bridge.read(timeout=0.2)
             assert chunk is not None, f"PTY reported EOF before output (got {bytes(buf)!r})"
             buf.extend(chunk)
         assert b"pty-high-fd" in buf
+        assert b"pty-high-fd\r\n" in buf
         _assert_idle_read_waits(bridge)
     finally:
         bridge.close()
