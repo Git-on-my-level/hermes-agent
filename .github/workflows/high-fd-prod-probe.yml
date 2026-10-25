@@ -1,0 +1,67 @@
+name: Clean prod high-FD probe
+on:
+  push:
+    branches: [ci-probe/sca-1078-high-fd-20261025]
+permissions:
+  contents: read
+jobs:
+  repeat-on-prod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 73459238e4e5d90072d00f7d31a8d9cb67d3ae78
+      - uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "telegram", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Repeat the unchanged prod test with the Fork CI environment
+        env:
+          HERMES_TEST_WORKERS: '4'
+          HERMES_TEST_FILE_TIMEOUT: '600'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          python - <<'PY'
+          import concurrent.futures
+          import json
+          import subprocess
+          import threading
+
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == '73459238e4e5d90072d00f7d31a8d9cb67d3ae78'
+          assert not subprocess.check_output(['git', 'status', '--porcelain']).strip()
+          command = ['scripts/run_tests.sh', 'tests/tools/test_drain_high_fd.py',
+                     '--file-retries', '0', '-j', '4', '-q',
+                     '-k', 'test_pty_bridge_reads_and_waits_above_fd_setsize']
+          print('COMMAND:', json.dumps(command), flush=True)
+          stop = threading.Event()
+          lock = threading.Lock()
+          counts = {'passed': 0, 'crlf_failure': 0}
+
+          def trial(number):
+              if stop.is_set():
+                  return
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, encoding='utf-8', errors='replace', timeout=700)
+              with lock:
+                  if result.returncode == 0:
+                      counts['passed'] += 1
+                  elif "assert b'\\r\\n' == b''" in result.stdout:
+                      counts['crlf_failure'] += 1
+                      print(f'REPRODUCED on trial {number}:\n{result.stdout}', flush=True)
+                  else:
+                      print(result.stdout, flush=True)
+                      raise RuntimeError(f'unexpected failure on trial {number}: {result.returncode}')
+                  print('TRIAL', number, json.dumps(counts), flush=True)
+                  if counts['passed'] and counts['crlf_failure']:
+                      stop.set()
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              list(pool.map(trial, range(1, 1001)))
+          assert not subprocess.check_output(['git', 'status', '--porcelain']).strip()
+          print('CLEAN_PROD_RESULT:', json.dumps(counts), flush=True)
+          print('FLAKY_REPRODUCED' if counts['crlf_failure'] else 'NOT_REPRODUCED_IN_1000_TRIALS', flush=True)
+          PY
