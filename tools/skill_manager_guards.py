@@ -222,11 +222,14 @@ def _background_review_read_before_write_guard(
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
-    if action != "delete":
+    if not _is_background_review():
         return None
     from tools import skill_manager_tool as _smt
+    from tools.skill_ownership import external_skill_owner, external_owner_message
     existing = _smt._find_skill(name)
-    return _background_review_delete_guard(name, existing["path"]) if existing else None
+    if existing and (owner := external_skill_owner(existing["path"])):
+        return _refusal(external_owner_message(name, owner))
+    return _background_review_delete_guard(name, existing["path"]) if existing and action == "delete" else None
 
 
 def _curator_consolidation_delete_guard(
