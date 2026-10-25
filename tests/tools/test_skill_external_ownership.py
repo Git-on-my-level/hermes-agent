@@ -61,7 +61,7 @@ def test_curator_skips_external_owner_but_keeps_local_skills(library, marker, ow
     ("delete", {"absorbed_into": "local"}),
 ])
 def test_curator_mutations_respect_owner(library, owner, batch, action, args):
-    from tools.skill_manager_tool import skill_manage
+    from tools.registry import registry
     from tools.skill_manager_guards import mark_background_review_skill_read
 
     folder = library / "managed"
@@ -73,7 +73,8 @@ def test_curator_mutations_respect_owner(library, owner, batch, action, args):
         for path in folder.rglob("*"):
             mark_background_review_skill_read(path)
         operation = dict(action="patch" if batch and action == "edit" else action, name="managed", **args)
-        result = json.loads(skill_manage(action="", name="", operations=[operation]) if batch else skill_manage(**operation))
+        payload = {"operations": [operation]} if batch else operation
+        result = json.loads(registry.dispatch("skill_manage", payload))
     finally:
         reset_current_write_origin(token)
     if owner == "agentctl":
