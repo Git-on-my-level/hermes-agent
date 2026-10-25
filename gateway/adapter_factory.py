@@ -7,6 +7,7 @@ from gateway.config import Platform
 async def create_adapter_async(runner, platform, config):
     """Keep disk/dependency work out of reconnect and profile-reload tasks.
 
+    Builtin (unregistered) factories also construct off-loop.
     Telegram's synchronous constructor has no loop affinity. Other plugin factories can
     create loop-owned resources, so only their load/probe/validation phase runs in a worker.
     """
@@ -50,15 +51,22 @@ def flag_secondary_reconnect_attention(runner, profile_name, platform, info):
             platform, info, time.monotonic(), status_key=f"{profile_name}:{platform.value}")
 
 
-async def acquire_adapter_lock(adapter, *args):
+async def acquire_adapter_lock(adapter, scope, identity, resource_desc):
     """Acquire off-loop; a canceled connect must release a lock that the worker acquires late."""
-    task = asyncio.create_task(asyncio.to_thread(adapter._acquire_platform_lock, *args))
+    def acquire():
+        # Keep the receipt independent of fields that disconnect clears while we wait.
+        return adapter._acquire_platform_lock(scope, identity, resource_desc), scope, identity
+
+    task = asyncio.create_task(asyncio.to_thread(acquire))
     try:
-        return await asyncio.shield(task)
+        acquired, _, _ = await asyncio.shield(task)
+        return acquired
     except asyncio.CancelledError:
         async def release_late():
-            if await task:
-                await asyncio.to_thread(adapter._release_platform_lock)
+            acquired, lock_scope, lock_identity = await task
+            if acquired:
+                from gateway.status_scoped_locks import release_scoped_lock
+                await asyncio.to_thread(release_scoped_lock, lock_scope, lock_identity)
 
         cleanup = asyncio.create_task(release_late())
         adapter._detached_fatal_tasks.add(cleanup)

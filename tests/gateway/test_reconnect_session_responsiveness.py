@@ -41,12 +41,15 @@ async def test_platform_rebuild_stall_keeps_native_session_create_responsive(tmp
     runner._failed_platforms[platform] = dict(config=pconfig, attempts=0, next_retry=0)
     entered, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
-    started = []
+    stall_active = threading.Event()
 
     def stalled_factory(platform, config):
-        started.append(time.monotonic())
+        stall_active.set()
         loop.call_soon_threadsafe(entered.set)
-        release.wait(2)  # synchronous filesystem-like stall, also finite on the unfixed branch
+        try:
+            release.wait(10)  # finite even when the unfixed implementation blocks the loop
+        finally:
+            stall_active.clear()
         return StubAdapter(platform=platform)
 
     if platform is Platform.TELEGRAM:
@@ -88,7 +91,7 @@ async def test_platform_rebuild_stall_keeps_native_session_create_responsive(tmp
                 registry.register(entry, scope=registry.current_scope_key())  # cold plugin discovery during ready may register the real adapter
             reconnect = asyncio.create_task(runner._reconnect_failed_platform(platform, time.monotonic()))
             try:
-                await asyncio.wait_for(entered.wait(), 10)
+                await asyncio.wait_for(entered.wait(), 30)
             except TimeoutError:
                 pytest.fail(f"rebuild never reached the injected stall: {runner._failed_platforms!r}; "
                             f"task={reconnect!r}")
@@ -99,9 +102,8 @@ async def test_platform_rebuild_stall_keeps_native_session_create_responsive(tmp
                 reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
                 if reply.get('id') == 'create':
                     break
-            elapsed = time.monotonic() - started[0]
             assert 'result' in reply, reply
-            assert elapsed < 1, f'native session.create took {elapsed:.3f}s during a 2s rebuild stall'
+            assert stall_active.is_set(), 'session.create completed only after the rebuild stall ended'
     finally:
         release.set()
         if reconnect is not None:

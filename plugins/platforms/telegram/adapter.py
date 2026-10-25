@@ -12,6 +12,7 @@ import os
 import html as _html
 import re
 import time
+import threading
 from contextvars import ContextVar
 from datetime import datetime, timezone, UTC
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -27,6 +28,16 @@ from gateway.platforms._shared import (
     platform_gate_env as _scoped_gate_env,
 )
 
+
+# Adapters sharing a profile must serialize the entire config read-modify-write.
+_DM_TOPIC_CONFIG_LOCKS: dict[str, Any] = {}
+_DM_TOPIC_CONFIG_LOCKS_GUARD = threading.Lock()
+
+
+def _dm_topic_config_lock(config_path):
+    key = str(config_path.resolve())
+    with _DM_TOPIC_CONFIG_LOCKS_GUARD:
+        return _DM_TOPIC_CONFIG_LOCKS.setdefault(key, threading.Lock())
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -2674,37 +2685,38 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             from hermes_constants import get_hermes_home
             config_path = get_hermes_home() / "config.yaml"
-            if not config_path.exists():
-                logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
-                return
-            from hermes_cli.config import atomic_config_write, read_user_config_raw
-            config = read_user_config_raw(config_path)
-            # platforms.telegram.extra.dm_topics — create the path for topics not predeclared in config.yaml.
-            dm_topics = config.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {}).setdefault("dm_topics", [])
-            changed = False
-            matching_chat_entry = None
-            for chat_entry in dm_topics:
-                try:
-                    if int(chat_entry.get("chat_id", 0)) != int(chat_id):
+            with _dm_topic_config_lock(config_path):
+                if not config_path.exists():
+                    logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
+                    return
+                from hermes_cli.config import atomic_config_write, read_user_config_raw
+                config = read_user_config_raw(config_path)
+                # platforms.telegram.extra.dm_topics — create the path for topics not predeclared in config.yaml.
+                dm_topics = config.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {}).setdefault("dm_topics", [])
+                changed = False
+                matching_chat_entry = None
+                for chat_entry in dm_topics:
+                    try:
+                        if int(chat_entry.get("chat_id", 0)) != int(chat_id):
+                            continue
+                    except (TypeError, ValueError):
                         continue
-                except (TypeError, ValueError):
-                    continue
-                matching_chat_entry = chat_entry
-                topics = chat_entry.setdefault("topics", [])
-                t = next((t for t in topics if t.get("name") == topic_name), None)
-                if t is None:
-                    topics.append({"name": topic_name, "thread_id": thread_id})
+                    matching_chat_entry = chat_entry
+                    topics = chat_entry.setdefault("topics", [])
+                    t = next((t for t in topics if t.get("name") == topic_name), None)
+                    if t is None:
+                        topics.append({"name": topic_name, "thread_id": thread_id})
+                        changed = True
+                    elif (replace_existing or not t.get("thread_id")) and t.get("thread_id") != thread_id:
+                        t["thread_id"] = thread_id
+                        changed = True
+                    break
+                if matching_chat_entry is None:
+                    dm_topics.append({"chat_id": chat_id, "topics": [{"name": topic_name, "thread_id": thread_id}]})
                     changed = True
-                elif (replace_existing or not t.get("thread_id")) and t.get("thread_id") != thread_id:
-                    t["thread_id"] = thread_id
-                    changed = True
-                break
-            if matching_chat_entry is None:
-                dm_topics.append({"chat_id": chat_id, "topics": [{"name": topic_name, "thread_id": thread_id}]})
-                changed = True
-            if changed:
-                atomic_config_write(config_path, config)
-                logger.info("[%s] Persisted thread_id=%s for topic '%s' in config.yaml", self.name, thread_id, topic_name)
+                if changed:
+                    atomic_config_write(config_path, config)
+                    logger.info("[%s] Persisted thread_id=%s for topic '%s' in config.yaml", self.name, thread_id, topic_name)
         except Exception as e:
             logger.warning("[%s] Failed to persist thread_id to config: %s", self.name, e, exc_info=True)
 
