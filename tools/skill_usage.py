@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set,
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from tools.skill_ownership import external_skill_owner, external_owner_message
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -226,7 +227,8 @@ def _scan_local_skills(keep: Callable[[str, Path, set[str], dict[str, Any]], boo
         return []
     hub, bundled, usage = _read_hub_installed_names(), _read_bundled_names(), load_usage()
     return sorted({name for name, skill_md in _iter_skill_mds(base, local_only=True)
-                   if name not in hub and not is_protected_builtin(name) and keep(name, skill_md, bundled, usage)})
+                   if name not in hub and not is_protected_builtin(name)
+                   and not external_skill_owner(skill_md) and keep(name, skill_md, bundled, usage)})
 
 
 def list_agent_created_skill_names() -> list[str]:
@@ -259,7 +261,8 @@ def read_skill_name(skill_md: Path, fallback: str) -> str:
 
 def is_agent_created(skill_name: str) -> bool:
     """Neither bundled nor hub-installed (and not only present in an external dir)."""
-    return not (is_bundled(skill_name) or is_hub_installed(skill_name)) and (
+    return not (is_bundled(skill_name) or is_hub_installed(skill_name)
+                or external_skill_owner(_find_skill_dir(skill_name))) and (
         _find_skill_dir(skill_name) is not None or _find_external_skill_dir(skill_name) is None)
 
 
@@ -279,7 +282,8 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
     """Agent-created: yes. Bundled: only with ``curator.prune_builtins``. Hub / external-dir / protected built-ins:
     never (external owner)."""
     if ((skill_path is not None and is_external_skill_path(skill_path)) or is_protected_builtin(skill_name)
-            or is_hub_installed(skill_name)):
+            or is_hub_installed(skill_name)
+            or external_skill_owner(skill_path or _find_skill_dir(skill_name))):
         return False
     if is_bundled(skill_name):
         return _prune_builtins_enabled()
@@ -334,6 +338,8 @@ def adopt_skill(skill_name: str) -> tuple[bool, str]:
         if _find_external_skill_dir(skill_name) is not None:
             return False, f"'{skill_name}' lives in skills.external_dirs and is read-only to the curator"
         return False, f"skill '{skill_name}' not found"
+    if owner := external_skill_owner(skill_dir):
+        return False, external_owner_message(skill_name, owner)
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
     if is_curator_managed(skill_name):
@@ -620,6 +626,8 @@ def archive_skill(skill_name: str) -> tuple[bool, str]:
     skill_dir = _find_skill_dir(skill_name)
     if skill_dir is None and _find_external_skill_dir(skill_name) is not None:
         return False, _external_read_only_message(skill_name)
+    if owner := external_skill_owner(skill_dir):
+        return False, external_owner_message(skill_name, owner)
     if not is_curation_eligible(skill_name, skill_dir):
         if is_protected_builtin(skill_name):
             return False, f"skill '{skill_name}' is a protected built-in; it backs load-bearing UX and is never archived or consolidated"
