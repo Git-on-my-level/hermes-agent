@@ -624,6 +624,7 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     from pm.extras import legacy_selection
 
     from hermes_cli.update_disk_space import require_source_write_space
+    from pm.disk_space import DiskFloorError
     require_source_write_space(root)
     if borrowed_from is not None:
         print(f"hermes: preparing dependencies for this data root (the checkout's updates belong to "
@@ -643,8 +644,9 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     try:
         ensure_tools_for_sync()
         pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
-    except (RuntimeError, OSError):
+    except DiskFloorError:
         # Space can fall below the floor after admission, while a worker runs.
+        # A lockfile or uv failure is not a disk refusal and must not start the backoff.
         _record_completion_attempt(root, failed=True)
         raise
     collect_superseded_generations(root)
