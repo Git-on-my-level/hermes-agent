@@ -101,6 +101,7 @@ class GatewayGoalCommandsMixin:
                     auto_skill=event.auto_skill if kickoff else None,
                     inherit_channel_pin=not kickoff,
                 )
+                turn._goal_kickoff = kickoff
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)

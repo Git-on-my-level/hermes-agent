@@ -49,6 +49,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "stay parked in git stash instead of being restored onto the "
             "updated code. Used by the desktop updater so local source edits "
             "never silently ride along across updates.")
+    update_parser.add_argument("--remote", default=None, metavar="NAME",
+                               help="Git remote to update from (overrides updates.remote).")
     update_parser.add_argument(
         "--branch", default=None, metavar="NAME",
         help="Update against this branch instead of the default (main). "
@@ -106,6 +108,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "--set-channel persists). 'stable' and 'canary' select published "
             "releases, 'main' the branch tip. Source installs only."
         ),
+    )
+    update_parser.add_argument(
+        "--converge", action="store_true", default=False,
+        help="Idle/after-turn tick when updates.converge is true. Applies updates.pin if set, "
+            "else the configured update channel tip. Skips when busy (until converge_busy_sla) "
+            "or dirty. Silent on no-op. Intended for the ai.hermes.converge LaunchAgent.",
+    )
+    update_parser.add_argument(
+        "--sha", default=None, metavar="SHA",
+        help="Install this commit instead of the channel tip. The SHA must be an ancestor "
+            "of the configured updates.remote/updates.branch (or --remote/--branch).",
     )
     update_parser.add_argument(
         "--no-gateway-restart", action="store_true", default=False,

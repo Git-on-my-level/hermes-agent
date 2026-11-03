@@ -2629,6 +2629,7 @@ export interface Translations extends NoticeTranslations {
     pause: string
     resumeTitle: string
     pauseTitle: string
+    pauseReasonPrompt: string
     triggerNow: string
     edit: string
     deleteTitle: string

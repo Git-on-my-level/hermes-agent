@@ -1,0 +1,4 @@
+name: goal-heartbeat
+version: "1.0"
+description: Wake gateway sessions whose /goal is active but idle (usually parked on a waiter) every interval_minutes so the agent re-checks the wait; escalate to the user after escalate_after silent checks.
+author: Git-on-my-level (fork)

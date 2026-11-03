@@ -167,6 +167,50 @@ async def test_internal_silence_token_suppresses_delivery_but_preserves_transcri
 
 
 @pytest.mark.asyncio
+async def test_internal_note_plus_silent_is_not_delivered(monkeypatch, tmp_path, caplog):
+    """An internal reply of a note plus a trailing marker is not delivered. A user turn is."""
+    note = "Checked: CI still running.\n\n[SILENT]"
+    buried = "the lane said [SILENT] mid-sentence and kept talking"
+    session_key = "agent:main:telegram:group:-1001:12345"
+
+    def _result(text):
+        return {
+            "final_response": text,
+            "messages": [
+                {"role": "user", "content": "side chatter"},
+                {"role": "assistant", "content": text},
+            ],
+            "tools": [], "history_offset": 0, "last_prompt_tokens": 0,
+            "api_calls": 1, "failed": False,
+        }
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_result(note))
+    with caplog.at_level("INFO", logger="gateway.run"):
+        response = await runner._handle_message_with_agent(
+            _event(internal=True), _source(), session_key, 1)
+    assert response == ""
+    assert any(
+        record.levelname == "INFO"
+        and "autonomous silence rule" in record.message
+        and session_key in record.message
+        for record in caplog.records
+    )
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_result(note))
+    response = await runner._handle_message_with_agent(
+        _event(internal=False), _source(), session_key, 1)
+    assert response and "CI still running" in response and "[SILENT]" in response
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_result(buried))
+    response = await runner._handle_message_with_agent(
+        _event(internal=True), _source(), session_key, 1)
+    assert response and "mid-sentence" in response and "[SILENT]" in response
+
+
+@pytest.mark.asyncio
 async def test_scheduled_heartbeat_silence_suppresses_delivery(monkeypatch, tmp_path):
     """A poller-stamped heartbeat turn may end on a bare marker (#113031); the event stays
     non-internal so authorization and the emergency stop still apply to it."""
@@ -228,13 +272,15 @@ async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_pa
         run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
         context_prompt=None, result_holder=[None])
     pending_event = SimpleNamespace(source=_source(), message_id="43", channel_prompt=None,
-                                    message_type=None, internal=True, metadata={}, reply_expected=True)
+                                    message_type=None, internal=True, plugin_injected=True,
+                                    metadata={}, reply_expected=True)
 
     merged = await gateway_run.GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None)
 
     followup = runner._run_agent.await_args.kwargs
+    assert followup["plugin_injected"] is True
     assert followup["persist_user_display_kind"] == "internal_notification"
     assert followup["reply_expected"] is True
     assert followup["persist_user_display_metadata"]["reply_expected"] is True

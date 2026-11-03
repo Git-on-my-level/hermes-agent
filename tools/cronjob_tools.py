@@ -897,6 +897,12 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["interpreter"] is not None:
         # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
         updates["interpreter"] = a["interpreter"]
+    if a.get("paused_reason") is not None:
+        updates["paused_reason"] = a["paused_reason"]
+    if a.get("paused_review_after") is not None:
+        updates["paused_review_after"] = a["paused_review_after"]
+    if a.get("transient_notify_after") is not None:
+        updates["transient_notify_after"] = a["transient_notify_after"]
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1005,6 +1011,19 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
+def _action_pause(job: dict[str, Any], a: dict[str, Any]) -> str:
+    """Pause requires a non-empty reason. ``review_after`` is an optional YYYY-MM-DD."""
+    reason = a.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        from cron.jobs import PAUSE_REASON_REQUIRED
+        return tool_error(PAUSE_REASON_REQUIRED, success=False)
+    try:
+        updated = pause_job(job["id"], reason=reason, review_after=a.get("review_after"))
+    except ValueError as exc:
+        return tool_error(str(exc), success=False)
+    return _job_state_result(updated)
+
+
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 
 
@@ -1019,7 +1038,7 @@ def _action_cancel(job: dict[str, Any], a: dict[str, Any]) -> str:
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
+    "pause": _action_pause,
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
     "cancel": _action_cancel,
 }
@@ -1060,6 +1079,7 @@ def cronjob(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
+    review_after: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[str | list[str]] = None,
     continuity: Optional[bool] = None,
@@ -1076,6 +1096,8 @@ def cronjob(
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    paused_review_after: Optional[str] = None,
+    transient_notify_after: Optional[int | str] = None,
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
@@ -1127,7 +1149,9 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
         "type": "object",
         "properties": {
             "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
-            "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
+            "paused_reason": {"type": "string", "description": "Auditable pause reason. On create, requires paused=true. On update, sets the reason on an existing pause (non-empty). Refused when the job is not paused."},
+            "reason": {"type": "string", "description": "Required for action=pause: why the job is paused. Must be non-empty."},
+            "review_after": {"type": "string", "description": "Optional for action=pause: YYYY-MM-DD date. hermes cron doctor flags the pause once this day has arrived."},
             "action": {
                 "type": "string",
                 "description": "One of: create, list, update, pause, resume, remove, run, cancel. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
@@ -1239,7 +1263,7 @@ def check_cronjob_requirements() -> bool:
 # create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
-    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
+    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason", "review_after",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
     "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up")
 

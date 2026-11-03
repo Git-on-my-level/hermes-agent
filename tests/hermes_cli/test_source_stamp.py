@@ -5,6 +5,13 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def identity_only_publication(monkeypatch):
+    monkeypatch.setattr('hermes_cli.serving_generation.publish_completed_generation', lambda *args: None)
+
 
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(

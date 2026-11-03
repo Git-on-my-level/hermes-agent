@@ -103,6 +103,7 @@ class GatewayTurnPersistenceMixin:
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        internal: bool = False,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -117,11 +118,16 @@ class GatewayTurnPersistenceMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # A queued chain's terminal turn owns the flag; a single turn uses the event's.
+        if isinstance(agent_result, dict) and "queued_terminal_internal" in agent_result:
+            internal = bool(agent_result.get("queued_terminal_internal"))
+        _intentional_silence = self._is_intentional_silence(agent_result, response, internal=internal)
+        if _intentional_silence and internal:
+            self._log_autonomous_internal_silence(session_key, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        from gateway.response_filters import is_machinery_display_kind, strip_trailing_silence_marker
+        from gateway.response_filters import is_machinery_display_kind
         from gateway.run_turn import _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
@@ -168,7 +174,9 @@ class GatewayTurnPersistenceMixin:
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
         if not _intentional_silence:
-            response = strip_trailing_silence_marker(response)
+            # No trailing-marker strip here: a non-internal turn's reply is delivered verbatim —
+            # silence on a user turn requires an exact marker, so a note that closes on the
+            # marker keeps both lines (the stream consumer holds that case while streaming).
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 

@@ -19,15 +19,23 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     built, so it must never read as a completed install/update of this commit.
 
     A root git cannot identify -- the ZIP update fallback runs precisely because
-    git is unusable -- publishes no identity: the old stamp is removed rather
-    than left naming the commit that was just replaced. Returns None then.
+    git is unusable -- removes the old identity and fails completion loudly.
+    Adoption alone may return None; completed updates must publish a serving pair.
     """
     root = Path(root).resolve()
     info = _git_version_info(root, include_untracked=True)
+    dirty = bool(getattr(info, "dirty", False))
+    if dirty:
+        from hermes_cli.serving_generation import publisher_outputs_only
+        if publisher_outputs_only(root):
+            dirty = False
     if info.commit is None:
         with suppress(FileNotFoundError):
             (root / "install-stamp.json").unlink()
         _reset_version_info_cache()
+        if not adopted:
+            from hermes_cli.serving_generation import ServingGenerationPublishError
+            raise ServingGenerationPublishError('Serving generation publication failed: Git identity is unknown')
         return None
     stamp = {
         "schemaVersion": 2,
@@ -35,7 +43,7 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
         "commitDate": info.commit_date,
         "branch": info.branch,
         "builtAt": datetime.now(UTC).isoformat(),
-        "dirty": info.dirty,
+        "dirty": dirty,
         "source": "git",
         "distribution": None,
         "updateMechanism": "self",
@@ -67,6 +75,9 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     _reset_version_info_cache()
     # Every path that publishes a new checkout identity (completion handoff, the PM
     # updater's finish, boot-time adoption) moves the installers' receipt with it.
+    if not adopted:
+        from hermes_cli.serving_generation import publish_completed_generation
+        publish_completed_generation(root, stamp)
     refresh_bootstrap_receipt(root, stamp)
     return stamp
 

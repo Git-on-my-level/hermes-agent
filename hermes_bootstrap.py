@@ -568,6 +568,16 @@ if _legacy_post_swap is not None:
     raise SystemExit(_continue_legacy_post_swap(_handoff_path, argv_tail=_argv_tail))
 
 
+# Read-only health is dispatched before PM activation, launch preparation, or the
+# CLI parser. A broken dependency sync is exactly when the probe has to work.
+if "gateway" in sys.argv and "health" in sys.argv:
+    from gateway.service_health import maybe_run_readonly_health
+
+    _health_code = maybe_run_readonly_health(sys.argv[1:])
+    if _health_code is not None:
+        raise SystemExit(_health_code)
+
+
 class RelaunchExit(SystemExit):
     """Exit carrying a relaunched child's status: that child already produced this run's output,
     so callers that report their own boot failures (the Bot Chat delivery runner) must not."""
@@ -580,12 +590,23 @@ from hermes_cli._early_recovery import recover_if_needed
 from hermes_cli._parser import command_argv
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
-_pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
+_boot_command = command_argv(sys.argv[1:])
+_pm_repair = _boot_command[:2] == ["pm", "repair"]
+_serving_gateway = (_boot_command[:1] == ["gateway"] and
+                    (len(_boot_command) == 1 or _boot_command[1] == "run")) or (
+                        Path(sys.argv[0]).resolve() == _root / "gateway" / "run.py")
 if not _pm_repair:
+    if _serving_gateway:
+        from hermes_cli.serving_generation import (
+            GatewayServingRefused, exit_refused_gateway, launch_completed_gateway,
+        )
+        launch_completed_gateway(_root)
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:
         _launch_python = prepare_launch(_root, sys.argv[1:])
+        if _serving_gateway:
+            launch_completed_gateway(_root)  # First deploy may have just published its completed pair.
         if _launch_python is not None:
             _main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
             _command = relaunch_command(
@@ -598,6 +619,8 @@ if not _pm_repair:
                 raise RelaunchExit(subprocess.call(_command))
             os.execv(str(_launch_python), _command)
     except Exception as exc:
+        if _serving_gateway and isinstance(exc, GatewayServingRefused):
+            exit_refused_gateway(exc)
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)
             raise SystemExit(1) from None

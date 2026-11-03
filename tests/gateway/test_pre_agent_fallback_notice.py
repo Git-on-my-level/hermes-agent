@@ -107,3 +107,29 @@ def test_model_override_fast_path_clears_stale_notice():
         model, runtime = runner._resolve_session_agent_runtime(session_key="test-session-key")
     assert (model, runtime["provider"]) == ("claude-sonnet-5", "anthropic")
     assert runner._pre_agent_fallback_notice is None
+
+
+def test_policy_notice_survives_resolution_probes_and_is_consumed_once():
+    from gateway.run_turn_runner import TurnRunner
+    runner = _runner_with_real_runtime_resolution()
+    text = "Route policy peak: using grok-4.7 via xai-oauth until the next compaction or new session."
+    state = SimpleNamespace(conversation=SimpleNamespace(model_override=None, route_policy_notice=text))
+    runner._peek_session_state.return_value = state
+    ctx = TurnContext(
+        source=SessionSource(platform=Platform.LOCAL, chat_id="c", user_id="u"),
+        message="hi", history=[], session_id="sid", session_key="test-session-key", user_config={},
+        AIAgent=_RecordingAgent, resolve_display_setting=lambda *_a: False, _run_still_current=lambda: True,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+    )
+    with patch("gateway.run._resolve_gateway_model", return_value="grok-4.7"), \
+         patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "xai-oauth", "api_key": "fake"}), \
+         patch("gateway.run._get_channel_override", return_value=None):
+        # Hygiene and background probes resolve routes without a real agent turn.
+        runner._resolve_session_agent_runtime(session_key="test-session-key", user_config={})
+        runner._resolve_session_agent_runtime(session_key="test-session-key", user_config={})
+        assert state.conversation.route_policy_notice == text
+        TurnRunner(runner, ctx).run_sync()
+        assert ctx.agent_holder[0]._pending_fallback_notice == text
+        assert state.conversation.route_policy_notice is None
+        TurnRunner(runner, ctx).run_sync()
+        assert getattr(ctx.agent_holder[0], "_pending_fallback_notice", None) is None

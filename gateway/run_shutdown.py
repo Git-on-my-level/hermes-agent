@@ -1093,6 +1093,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
+            from gateway.drain_control import external_supervisor_shutdown_is_quiet
+            if external_supervisor_shutdown_is_quiet() and not self._restart_requested:
+                logger.info(
+                    "Home-channel shutdown broadcast suppressed: external supervisor recycle"
+                )
+                return
         # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
         # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
         # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
@@ -2128,9 +2134,13 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             # file, and a rename on either side must not strand the other's write.
             from gateway.restart_notice import write_planned_restart_marker
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                from gateway.drain_control import drain_notification_suppressed
                 write_planned_restart_marker(
                     via_service=bool(self._restart_via_service),
                     detached=bool(self._restart_detached),
+                    # A quiet drain stays quiet across the restart: the booting gateway
+                    # skips the "Gateway online" broadcast when this is set.
+                    quiet=drain_notification_suppressed(),
                 )
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.

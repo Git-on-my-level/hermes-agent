@@ -171,3 +171,49 @@ async def test_loop_tick_witness_arms_over_tcp_on_windows(short_home, caplog):
 async def test_loop_tick_witness_arms_on_posix(short_home):
     payload = await _run_heartbeat_until_payload(short_home)
     assert payload["loop_tick_socket"] is True
+    assert isinstance(payload.get("event_loop_at"), str) and payload["event_loop_at"].endswith("Z")
+
+
+def test_stopped_receipt_stays_off_the_loop_when_cancelled(monkeypatch):
+    """Shutdown publication must not run ps and state reads on the event loop."""
+    home = Path(tempfile.mkdtemp(prefix="hs", dir="/tmp"))
+    seen: dict[str, int] = {}
+
+    ticks_box = [0]
+
+    def slow_stop(**_kwargs):
+        seen["writer"] = threading.get_ident()
+        seen["ticks_at_stop"] = ticks_box[0]
+        time.sleep(0.25)
+        seen["ticks_after"] = ticks_box[0]
+
+    monkeypatch.setattr(shutdown_watchdog_module, "publish_loop_stopped", slow_stop)
+
+    async def scenario() -> None:
+        seen["loop"] = threading.get_ident()
+
+        async def ticker() -> None:
+            while True:
+                ticks_box[0] += 1
+                await asyncio.sleep(0.02)
+
+        pulse = asyncio.create_task(ticker())
+        task = asyncio.create_task(
+            loop_heartbeat_forever(interval_s=30.0, home=home)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=3)
+        pulse.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pulse
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+    assert seen["writer"] != seen["loop"]
+    assert seen["ticks_after"] > seen["ticks_at_stop"]
+    assert ticks_box[0] >= 1

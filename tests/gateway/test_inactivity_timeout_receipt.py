@@ -25,7 +25,7 @@ async def test_timeout_diagnostic_keeps_failed_receipt_after_string_projection(o
     owner.sessions['s'] = LiveSession(source, 'route')
     owner.runner._adapter_for_source = lambda source: None
     owner.runner._agent_activity_summary = lambda agent: {'seconds_since_activity': 1800}
-    owner.runner._is_intentional_silence = lambda *args: False
+    owner.runner._is_intentional_silence = lambda *args, **kwargs: False
     diagnostic = []
 
     async def handle(event):

@@ -412,7 +412,9 @@ def _complete_selected(request: dict) -> bool:
             gateway_mode=request["gateway_mode"], pre_update_snapshot_id=request["snapshot_id"],
             pre_update_version=request["pre_update_version"],
             completion_message=request.get("completion_message"),
-            announce=None if request.get("completion_message") else "\n✓ Code updated!",
+            # The banner follows the receipt in _finish. Printing it here reported
+            # success while maintenance and the stamp were still ahead.
+            announce=None,
             followups=followups, before_build=lambda: _resume_paused_before_build(request))
     except (Exception, SystemExit) as exc:  # health: allow BLE001 -- e.g. the shared update lock refused the tail
         reason = str(exc) or type(exc).__name__
@@ -420,6 +422,12 @@ def _complete_selected(request: dict) -> bool:
         _report_desktop_build_owed(request, None, "the source-update tail did not run")
         record_followup("completion", reason)
         followups.append(("completion", reason))
+    # A failed serving publication is not a follow-up the restart advice may paper over.
+    # An unsafe SQLite verdict withholds success without a stamp follow-up and still exits 0.
+    if any(step == "stamp" for step, _reason in followups):
+        if request["gateway_mode"]:
+            update_cmd._write_gateway_update_exit_code(False)
+        raise SystemExit(1)
     tail_owed = any(step in TAIL_FOLLOWUPS for step, _ in followups)
     record_build_stage(followups)
     if not tail_owed:
@@ -539,6 +547,10 @@ def _finish(request: dict, result_path: Path) -> int:
             _write_gateway_update_exit_code(False)
         if not terminal_receipt:
             code = code or 1  # the parent settles a lost result (settle_lost_completion)
+        # The banner follows the receipt. Printing it from the product build
+        # reported success while maintenance and the stamp were still ahead.
+        if code == 0 and terminal_receipt and not request.get("completion_message"):
+            print("\n✓ Code updated!")
         _write_json(result_path, {
             "schema": 1, "update_id": request["receipt"]["update_id"], "exit_code": code,
             "receipt": terminal_receipt, "windows_resume": request["windows_resume"],

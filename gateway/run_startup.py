@@ -722,6 +722,9 @@ class GatewayStartupMixin:
         if getattr(self, "_loop_floor_timer_handle", None) is None:
             with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
                 self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
+        if getattr(self, "_loop_lag_watchdog", None) is None:
+            from gateway.loop_lag import start_loop_lag_watchdog
+            self._loop_lag_watchdog = start_loop_lag_watchdog(loop)
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
             try:
@@ -745,6 +748,7 @@ class GatewayStartupMixin:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
         for attr, method, what in (
+            ("_loop_lag_watchdog", "set", "stop gateway loop lag watchdog"),
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
             ("_loop_heartbeat_task", "cancel", "cancel gateway loop heartbeat task"),
@@ -1262,10 +1266,20 @@ class GatewayStartupMixin:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
+        from gateway.platform_registry import platform_registry
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
         _pending_connects = []  # (platform, platform_config, adapter); connected concurrently later
+        if await self._abort_startup_if_shutdown_requested():
+            return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
+        # Materialize independent deferred plugins concurrently. Each lookup is
+        # bounded and retains late registration; one slow import must not put
+        # every healthy transport behind its load threshold.
+        from hermes_cli.plugins_loader import background_platform_loads
+        with background_platform_loads():
+            await asyncio.gather(*(asyncio.to_thread(platform_registry.get, p.value)
+                                   for p, cfg in self.config.platforms.items() if cfg.enabled))
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
@@ -1286,14 +1300,16 @@ class GatewayStartupMixin:
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
+            # Import/register may wait on host I/O; factories retain their loop
+            # affinity (third-party adapters may create asyncio resources).
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 if platform.value in {m.value for m in Platform.__members__.values()}:
-                    logger.warning("No adapter available for %s", platform.value)
+                    logger.error("Configured messaging platform %s is NOT running: no adapter available", platform.value)
                 else:
-                    logger.warning(
-                        "No adapter for '%s' -- is the plugin installed? "
+                    logger.error(
+                        "Configured messaging platform '%s' is NOT running -- is the plugin installed? "
                         "(platform is enabled in config.yaml but no plugin registered it)", platform.value,
                     )
                 # Only a platform that can heal on its own is queued for the reconnect watcher; either way
@@ -1682,6 +1698,12 @@ class GatewayStartupMixin:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
+        try:
+            from gateway.drain_control import clear_update_converge_drain
+
+            clear_update_converge_drain()
+        except Exception:
+            logger.debug("update-converge drain marker clear at startup failed", exc_info=True)
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
     @staticmethod

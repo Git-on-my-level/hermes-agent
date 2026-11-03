@@ -400,6 +400,10 @@ class TestRunJobScript:
         def _broken(repo):
             raise RuntimeError("dependency environment is missing or outside this install")
 
+        # Never spawns a child (the interpreter is refused before Popen); stub the env build
+        # so the worktree-only real-home guard on PATH probing cannot mask the contract.
+        monkeypatch.setattr(
+            "tools.environments.local.build_subprocess_env", lambda **kwargs: {})
         monkeypatch.setattr(
             "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
         )
@@ -407,11 +411,110 @@ class TestRunJobScript:
             "pm.environments.selected_venv",
             _broken if broken == "selection_raises" else (lambda repo: tmp_path / "gone-venv"),
         )
+        if sys.prefix != sys.base_prefix:
+            # A venv'd process (real gateway, dev checkout) now falls back to its own
+            # interpreter instead of failing; pin the bare-store condition this test encodes.
+            monkeypatch.setattr(sys, "prefix", sys.base_prefix)
         (cron_env / "scripts" / "probe.py").write_text('print("ok")\n', encoding="utf-8")
 
         success, output = _run_job_script("probe.py")
         assert success is False
         assert "dependency environment" in output
+
+    @pytest.mark.platforms("posix")
+    def test_posix_serving_snapshot_without_venv_falls_back_to_process_interpreter(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """A serving snapshot has no ``<snapshot>/venv`` — the selection record is keyed on
+        the real checkout and only legacy snapshots carry the symlink — so after a generation
+        switch the selection resolves to a missing interpreter. The gateway process itself
+        exec'd onto its boot-validated generation venv, so scripts share it instead of every
+        managed-store cron run failing (2026-10-18 outage)."""
+        from cron import scheduler_script
+
+        # The subject is interpreter selection, not env sanitization; stub the env build so
+        # the worktree-only real-home guard on PATH probing cannot mask the contract.
+        monkeypatch.setattr(
+            "tools.environments.local.build_subprocess_env", lambda **kwargs: {})
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+        )
+        monkeypatch.setattr(
+            "pm.environments.selected_venv", lambda repo: tmp_path / "gone-venv"
+        )
+        if sys.prefix == sys.base_prefix:
+            # A bare interpreter must still take the fallback branch (CI checkouts do).
+            monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv-marker"))
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text("import sys; print(sys.executable)\n", encoding="utf-8")
+
+        success, output = scheduler_script._run_job_script("probe.py")
+        assert success is True, output
+        assert Path(output) == Path(sys.executable)
+
+    @pytest.mark.platforms("posix")
+    def test_fallback_venv_serves_its_own_packages_without_pythonpath(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """Real launch geometry end to end: the process runs on a real venv (the gateway's
+        generation), the selection is a missing snapshot venv, and the spawned script must
+        import a dependency that ONLY the fallback venv carries — with no PYTHONPATH left
+        for its own children (#123440)."""
+        import subprocess as sp
+
+        from cron import scheduler_script
+        from pm.environments import venv_python
+
+        venv = tmp_path / "generation-venv"
+        sp.run([sys.executable, "-m", "venv", "--without-pip", str(venv)],
+               check=True, capture_output=True)
+        fallback_python = venv_python(venv)
+        assert fallback_python.is_file()
+        site = Path(sp.check_output(
+            [str(fallback_python), "-I", "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+            text=True, encoding="utf-8").strip())
+        (site / "probe_dep.py").write_text("VALUE = 'from-fallback-venv'\n", encoding="utf-8")
+
+        # The process IS the generation venv; the selection (a serving snapshot) is broken.
+        monkeypatch.setattr(sys, "executable", str(fallback_python))
+        monkeypatch.setattr(sys, "prefix", str(venv))
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python", lambda repo: fallback_python
+        )
+        monkeypatch.setattr(
+            "pm.environments.selected_venv", lambda repo: tmp_path / "gone-venv"
+        )
+        monkeypatch.setattr(
+            "tools.environments.local.build_subprocess_env", lambda **kwargs: {})
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text(
+            "import os, sys, probe_dep\n"
+            "print(sys.executable)\n"
+            "print(probe_dep.VALUE)\n"
+            "print('PYTHONPATH=' + (os.environ.get('PYTHONPATH') or ''))\n",
+            encoding="utf-8")
+
+        success, output = scheduler_script._run_job_script("probe.py")
+        assert success is True, output
+        executable, value, pythonpath = output.splitlines()
+        assert Path(executable) == fallback_python
+        assert value == "from-fallback-venv"
+        assert pythonpath == "PYTHONPATH="
+
+    @pytest.mark.platforms("posix")
+    def test_serving_fallback_python_matches_process_venv_state(self):
+        """The fallback is this process's venv interpreter, or None on a bare store Python —
+        never a non-absolute path."""
+        from cron.scheduler_script import _serving_fallback_python
+
+        fallback = _serving_fallback_python()
+        if sys.prefix == sys.base_prefix:
+            assert fallback is None
+        else:
+            assert fallback in (Path(sys.executable), Path(sys.executable).resolve())
+            assert fallback.is_absolute()
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).

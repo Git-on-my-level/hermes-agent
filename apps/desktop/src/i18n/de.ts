@@ -3452,6 +3452,7 @@ export const deOverrides = {
     pause: 'Cron pausieren',
     resumeTitle: 'Fortsetzen',
     pauseTitle: 'Pausieren',
+    pauseReasonPrompt: 'Warum ist dieser Job pausiert?',
     triggerNow: 'Jetzt auslösen',
     edit: 'Cron bearbeiten',
     deleteTitle: 'Cron-Job löschen?',

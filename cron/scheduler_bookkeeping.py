@@ -61,6 +61,11 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    if not d.success:
+        # Classify before popping ``_model_unreachable`` — that flag is part of the transient set.
+        from cron.scheduler_failure_copy import is_transient_cron_failure
+        if is_transient_cron_failure(job, d.error or ""):
+            mark_kwargs["transient"] = True
     from cron.scheduler_authority import journal_path
     journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):

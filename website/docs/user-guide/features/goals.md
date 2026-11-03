@@ -186,7 +186,7 @@ After every turn, Hermes calls an auxiliary model with:
 - The agent's most recent final response (last ~4 KB of text)
 - A system prompt telling the judge to reply with strict one-line JSON: `{"verdict": "done" | "blocked" | "continue" | "wait", "reason": "<one-sentence rationale>"}` (wait verdicts add `wait_on_session` / `wait_on_pid` / `wait_for_seconds`; the legacy `{"done": <bool>, "reason": "..."}` shape is still accepted)
 
-The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal **pauses** with the judge's reason (`🚫 Goal judged unachievable — paused`), so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
+The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. The judge also sees **host-observed tool activity** from the turn — tool names, one key argument per call, and exit codes, extracted from the session store — as evidence alongside the response text; when no tool calls are extractable the judge prompt is unchanged. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal **pauses** with the judge's reason (`🚫 Goal judged unachievable — paused`), so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
 
 ### Fail-open semantics
 
@@ -228,11 +228,51 @@ Add to `~/.hermes/config.yaml`:
 
 ```yaml
 goals:
+  # Gateway only: start or correct an automatic goal with each ordinary
+  # external user message. Slash commands and continuation turns are excluded.
+  # Default: false. This runs the judge even for short questions.
+  auto_start: false
   # Max continuation turns before Hermes auto-pauses and asks you to
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+  # Set goals automatically from the agent's own commitments (off by default).
+  # See "Inferred goals" below.
+  auto_infer: false
 ```
+
+When `auto_start` is enabled, an ordinary gateway message starts or corrects an automatic goal before the agent starts, including a correction sent while the agent is running. These goals are stored as `source: auto_start`; inferred goals use `source: auto`. Explicit `/goal` objectives and all paused goals are preserved. Use `/goal resume` to restart a paused goal after supplying missing input. Replacing an automatic goal removes its old queued continuations while keeping queued user messages. Slash commands, goal kickoffs and synthetic continuation messages never become new goals. Keep `max_turns` bounded: the judge runs after every response, including a one-turn answer.
+
+When both options are enabled, `auto_start` sets the goal before the turn, so post-turn inference skips it. Explicit and paused goals also prevent inference.
+
+### Inferred goals (`goals.auto_infer`)
+
+Most sessions never type `/goal`. The agent says "I'll cut the release once CI is green" and the
+session goes quiet — nothing drives it to the finish line. With `auto_infer: true`, after every
+real user turn in a session that has **no goal**, a small side judge (the `goal_judge` auxiliary
+model) reads the user message and the agent's reply and answers one question: *did the agent commit
+to multi-step work with a checkable end state?* If yes, Hermes sets that end state as the session's
+goal, drafts a completion contract for it, and prints:
+
+```
+⊙ Goal inferred from my reply: Cut release v1.2.13 once CI is green
+(/goal clear to drop it, /goal status to inspect)
+```
+
+From then on the normal goal loop applies: the judge checks each turn, continuation prompts fire
+when the agent stops early, `/goal pause|resume|clear` work as usual. The inferred goal shows as
+`inferred` in `/goal status` and is stored as `source: auto`.
+
+Rules the judge follows (and the tests enforce):
+
+- A user-typed goal always wins: inference never runs while any goal is active or paused.
+- Only real user turns can seed a goal. Heartbeat ticks, goal continuations, and internal
+  synthetic prompts are skipped so the loop can never feed itself.
+- Greetings, one-shot answers, explanations, and questions back to the user are not goals.
+- Any judge or API error fails open: no goal, no retry, nothing blocks the reply.
+
+Cost: one extra small aux call (~300 output tokens) per user turn in goal-less sessions. Route
+`goal_judge` to a cheap model (next section) if you enable this profile-wide.
 
 ### Choosing the judge model
 

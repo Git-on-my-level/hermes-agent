@@ -166,6 +166,9 @@ def build_gateway_parser(
         "install", help="Install gateway as a systemd/launchd background service")
     _flag(gateway_install, "--force",
         help="Force reinstall, and install even when the default multiplexer already serves this profile")
+    _flag(gateway_install, "--reset-service-path",
+        help="Reinstall and derive the service PATH from this environment only, without carrying "
+             "forward entries from the installed service definition")
     _flag(gateway_install, "--system",
         help="Install as a Linux system-level service (starts at boot)")
     gateway_install.add_argument("--run-as-user", dest="run_as_user",

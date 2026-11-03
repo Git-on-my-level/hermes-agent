@@ -13,12 +13,16 @@ import { queryClient } from '@hermes/plugin-sdk'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { request } = vi.hoisted(() => ({ request: vi.fn(async () => ({})) }))
+const { notifyError, promptText, request } = vi.hoisted(() => ({
+  notifyError: vi.fn(),
+  promptText: vi.fn(async () => 'holding for review'),
+  request: vi.fn(async () => ({ success: true }))
+}))
 
 vi.mock('@hermes/plugin-sdk', async importOriginal => {
   const sdk = await importOriginal<typeof HermesSdk>()
 
-  return { ...sdk, host: { ...sdk.host, request } }
+  return { ...sdk, host: { ...sdk.host, notifyError, request }, promptText }
 })
 
 const { invalidateRoutineOwner, RoutineRow, routineCreateTarget } = await import('./cron')
@@ -64,7 +68,47 @@ describe('a row mutation addresses the owner that rendered it', () => {
 
     await waitFor(() => expect(invalidateQueries).toHaveBeenCalled())
 
-    expect(request).toHaveBeenCalledWith('cron.manage', { action: 'pause', name: 'digest', profile: 'ops' })
+    expect(promptText).toHaveBeenCalled()
+    expect(request).toHaveBeenCalledWith('cron.manage', {
+      action: 'pause',
+      name: 'digest',
+      profile: 'ops',
+      reason: 'holding for review'
+    })
     expect(invalidateQueries).toHaveBeenCalledWith({ exact: true, queryKey: ['hermes-bots', 'routines', 'ops'] })
+  })
+
+  it('does not pause when the reason dialog is cancelled', async () => {
+    promptText.mockResolvedValueOnce(null)
+
+    render(
+      <RoutineRow
+        job={{ enabled: true, job_id: 'digest', name: '[bot:ops] Digest', schedule: 'every 1h' }}
+        onOpen={() => undefined}
+        owner={{ name: 'ops' }}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('switch'))
+
+    await waitFor(() => expect(promptText).toHaveBeenCalled())
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a pause the gateway reports as unsuccessful', async () => {
+    request.mockResolvedValueOnce({ error: 'paused_reason required', success: false })
+
+    render(
+      <RoutineRow
+        job={{ enabled: true, job_id: 'digest', name: '[bot:ops] Digest', schedule: 'every 1h' }}
+        onOpen={() => undefined}
+        owner={{ name: 'ops' }}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('switch'))
+
+    await waitFor(() => expect(notifyError).toHaveBeenCalled())
+    expect(invalidateQueries).not.toHaveBeenCalled()
   })
 })

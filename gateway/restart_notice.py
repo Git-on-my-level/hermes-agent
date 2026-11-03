@@ -27,11 +27,15 @@ def planned_restart_marker_path(home: Path | None = None) -> Path:
     return (home or get_process_hermes_home()) / PLANNED_RESTART_MARKER_FILENAME
 
 
-def write_planned_restart_marker(*, via_service: bool = False, detached: bool = False) -> None:
+def write_planned_restart_marker(*, via_service: bool = False, detached: bool = False,
+                                 quiet: bool = False) -> None:
     """Record that the running gateway is going down FOR A RESTART; never blocks the restart.
 
     One writer for both restart kinds: the gateway's own in-band shutdown (``via_service`` /
     ``detached`` from its shutdown context) and the CLI, which has no in-band path of its own.
+
+    ``quiet``: a quiet drain stays quiet across the restart — the booting gateway skips the
+    "Gateway online" broadcast when this is set.
 
     Best-effort like ``gateway.status.write_planned_stop_marker``: an unwritable home costs the
     notice, not the restart. Wider than ``OSError`` on purpose — a marker write that raises for any
@@ -44,6 +48,7 @@ def write_planned_restart_marker(*, via_service: bool = False, detached: bool = 
                 "requested_at": time.time(),
                 "via_service": bool(via_service),
                 "detached": bool(detached),
+                "quiet": bool(quiet),
             },
             indent=None,
         )

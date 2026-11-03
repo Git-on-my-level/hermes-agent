@@ -7,6 +7,7 @@ import contextvars
 import logging
 import queue
 import threading
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
         self._idle: list[_Worker] = []
         self._shutdown = False
         self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
         self._n = 0
         self._idle_timeout = idle_timeout
 
@@ -113,8 +115,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             return worker.inbox.get()
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
-        # cancel_futures is accepted for API parity only: there is no queue, so nothing is pending.
-        with self._lock:
+        with self._cv:
             self._shutdown = True
             threads = list(self._threads)
             idle, self._idle = self._idle, []

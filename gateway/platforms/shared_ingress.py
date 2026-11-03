@@ -65,6 +65,8 @@ async def bind_listener(
     profile = shared_ingress_profile(adapter)
     if profile:
         publish_shared_ingress(adapter, app, ingress_path)
+        from gateway.status_async import flush_pending
+        await flush_pending()
         return None
     runner = web.AppRunner(app) if access_log is ... else web.AppRunner(app, access_log=access_log)
     await runner.setup()

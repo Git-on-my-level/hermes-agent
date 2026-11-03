@@ -270,6 +270,18 @@ def _parse_config_int(raw: Any, default: int) -> int:
         return default
 
 
+def _parse_config_float(raw: Any, default: float) -> float:
+    """Strict float coercion: rejects bool and non-numeric strings (mirrors _parse_config_int)."""
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _cfg_flag(cfg: dict[str, Any], key: str, default: bool) -> bool:
     """Legacy string-set truthiness used by the ``compression`` section."""
     return str(cfg.get(key, default)).lower() in {"true", "1", "yes"}
@@ -1033,8 +1045,18 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         disabled_toolsets, getattr(agent, "platform", None), oneshot=agent_is_oneshot(agent))  # pin restore reads both
     agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
     agent._tool_snapshot_selection = tool_selection_key(enabled_toolsets, disabled_toolsets)  # tools[] freeze gate
+    # xAI reserves tool_search on its Responses API. Skip the client-side
+    # bridge for that route only; other providers keep the assembled catalog.
+    # getattr: test stubs and partial agents may not have api_mode yet.
+    # Upstream aliases the bridge on chat-completions; Responses still 400s on the raw name.
+    _provider = str(getattr(agent, "provider", "") or "")
+    _xai_responses = getattr(agent, "api_mode", None) == "codex_responses" and (
+        _provider in {"xai", "xai-oauth"}
+        or getattr(agent, "_base_url_hostname", "") == "api.x.ai"
+    )
     agent.tools = agent_tool_surface(agent, model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode) or [])
+        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=_xai_responses) or [])
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
@@ -1461,6 +1483,14 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         max_attempts=min(max_attempts, 10),
         # Opt-in proactive tool-result prune trigger (0 = disabled; negatives = disabled).
         proactive_prune_tokens=max(0, _parse_config_int(cfg.get("proactive_prune_tokens", 0), 0)),
+        # Opt-in latency-pressure compaction trigger (seconds; 0 = disabled) and its context
+        # floor (real prompt tokens a sample must carry to count; 0 = no floor).
+        latency_pressure_threshold_seconds=max(
+            0.0, _parse_config_float(cfg.get("latency_pressure_threshold_seconds", 0), 0.0)
+        ),
+        latency_pressure_min_context_tokens=max(
+            0, _parse_config_int(cfg.get("latency_pressure_min_context_tokens", 0), 0)
+        ),
         proactive_prune_min_chars=_parse_config_int(
             cfg.get("proactive_prune_min_result_chars", 8000), 8000
         ),
@@ -1911,6 +1941,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
+            latency_pressure_threshold_seconds=getattr(cs, "latency_pressure_threshold_seconds", 0.0),
+            latency_pressure_min_context_tokens=getattr(cs, "latency_pressure_min_context_tokens", 0),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

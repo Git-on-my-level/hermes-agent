@@ -4,6 +4,9 @@ Toolsets = explicit --toolsets, else the user's "cli" toolsets from `hermes tool
 memory / AGENTS.md / preloaded skills = same as a normal chat turn. Approvals are auto-bypassed
 (HERMES_YOLO_MODE=1). Model/provider mirror `hermes chat`: both optional; only --model → auto-detect
 the provider; only --provider → error (ambiguous).
+
+``output_format="json"`` (``--output-format json``) replaces the plain stdout answer with one
+agentctl generic-process terminal record. The default text path is unchanged.
 """
 
 from __future__ import annotations
@@ -235,6 +238,42 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _emit_oneshot_json(
+    stream,
+    *,
+    response: object,
+    result: dict,
+    exit_code: int,
+    failure: Optional[str] = None,
+) -> None:
+    from hermes_cli.oneshot_result import build_oneshot_result_record, write_oneshot_result_line
+
+    write_oneshot_result_line(stream, build_oneshot_result_record(
+        response=response, result=result, exit_code=exit_code, failure=failure,
+    ))
+
+
+def _mark_oneshot_record_written(exc: BaseException) -> None:
+    """So ``_run_and_exit_oneshot`` does not write a second record after this one."""
+    try:
+        exc.oneshot_record_written = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _control_flow_record(failure: BaseException) -> tuple[int, str]:
+    """Exit code and error text for a record written before re-raising."""
+    if isinstance(failure, KeyboardInterrupt):
+        return 130, "Interrupted"
+    if isinstance(failure, SystemExit) and isinstance(failure.code, str) and failure.code.strip():
+        return 1, failure.code.strip()
+    code = failure.code if isinstance(failure, SystemExit) and isinstance(failure.code, int) else 1
+    # sys.exit(0) inside the agent never reached the normal answer path.
+    if code == 0:
+        code = 1
+    return code, "hermes -z exited"
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -244,14 +283,17 @@ def run_oneshot(
     usage_file: Optional[str] = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    output_format: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
     Model/provider fall back to ``HERMES_INFERENCE_MODEL`` and config.yaml. ``usage_file`` gets a
     JSON usage report even when the run fails. ``resume`` is a session id (already normalized by
     the CLI layer: latest/title/--continue resolution) whose transcript is loaded and continued
-    by this turn. Returns the exit code; the caller owns process termination.
+    by this turn. ``output_format="json"`` writes one terminal record to stdout instead of the
+    plain answer. Returns the exit code; the caller owns process termination.
     """
+    json_mode = output_format == "json"
     # Silence every stdlib logger: AIAgent, tools and provider adapters log to stderr through the
     # root logger. File handlers from setup_logging() keep working (level-independent).
     logging.disable(logging.CRITICAL)
@@ -260,15 +302,22 @@ def run_oneshot(
     # picking its catalog default hides the mismatch). Validate BEFORE the stderr redirect.
     env_model_early = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
     if provider and not ((model or "").strip() or env_model_early):
-        sys.stderr.write(
+        message = (
             "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
             "Pass both explicitly, or neither to use your configured defaults.\n"
         )
+        sys.stderr.write(message)
+        if json_mode:
+            _emit_oneshot_json(sys.stdout, response=None, result={}, exit_code=2, failure=message)
         return 2
 
     explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
     if toolsets_error:
         sys.stderr.write(toolsets_error)
+        if json_mode:
+            _emit_oneshot_json(
+                sys.stdout, response=None, result={}, exit_code=2, failure=toolsets_error,
+            )
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
@@ -315,13 +364,38 @@ def run_oneshot(
         # Control-flow exceptions (Ctrl-C / sys.exit inside the agent) re-raise to the parent.
         if isinstance(failure, (KeyboardInterrupt, SystemExit)):
             _write_usage_file(usage_file, result, failure=repr(failure))
+            if json_mode:
+                code, detail = _control_flow_record(failure)
+                _emit_oneshot_json(
+                    real_stdout, response=response, result=result, exit_code=code, failure=detail,
+                )
+                _mark_oneshot_record_written(failure)
             raise failure
         _write_usage_file(usage_file, result, failure=str(failure))
         real_stderr.write(f"hermes -z: agent failed: {failure}\n")
         real_stderr.flush()
+        if json_mode:
+            _emit_oneshot_json(
+                real_stdout, response=response, result=result, exit_code=1, failure=str(failure),
+            )
         return 1
 
     _write_usage_file(usage_file, result)
+
+    if json_mode:
+        exit_code = _oneshot_exit_code(response, result)
+        detail = None
+        if exit_code == 130:
+            detail = "Interrupted"
+        elif exit_code != 0:
+            detail = str(result.get("error") or "") or None
+        _emit_oneshot_json(
+            real_stdout, response=response, result=result, exit_code=exit_code, failure=detail,
+        )
+        if exit_code == 1:
+            real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
+            real_stderr.flush()
+        return exit_code
 
     if response:
         # Lone UTF-16 surrogates would raise UnicodeEncodeError on a real stdout and abort with

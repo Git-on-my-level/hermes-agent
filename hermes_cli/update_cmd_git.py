@@ -175,7 +175,7 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     return f" [{label}]" if label else ""
 
 
-def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> tuple[bool, str]:
+def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str, *, remote: str = "origin") -> tuple[bool, str]:
     """Decide whether a parked feature branch may be auto-switched back to the update target.
 
     - (True, "") — tree clean and every parked commit is in ``origin/<target>`` (no ``git cherry +``).
@@ -203,7 +203,7 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     # patch-id walk needs upstream-side trees and lazy-fetches them in many promisor
     # batches; one failed batch failed the whole verification and skipped a clean
     # checkout (#124767).
-    ahead = _git_run(git_cmd, ["rev-list", "--count", f"origin/{target_branch}..HEAD"], cwd)
+    ahead = _git_run(git_cmd, ["rev-list", "--count", f"{remote}/{target_branch}..HEAD"], cwd)
     if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
         return False, "unverifiable"
     ahead_count = int(ahead.stdout.strip())
@@ -219,7 +219,7 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     # a tree batch per commit and, with nothing bounding it, one such walk wrote 332 packs /
     # 180 GiB over 7 h on Windows (#131444). With lazy fetch off a missing object fails the
     # command fast and the commit count below stands in.
-    cherry = _git_run(git_cmd, ["cherry", f"origin/{target_branch}"], cwd,
+    cherry = _git_run(git_cmd, ["cherry", f"{remote}/{target_branch}"], cwd,
                       env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV})
     if cherry.returncode != 0:
         # Patch-equivalence only refines the count for rebase/squash-merged branches;

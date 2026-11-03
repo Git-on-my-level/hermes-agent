@@ -331,6 +331,9 @@ class PlatformRegistry:
                 logger.warning("Deferred platform '%s' recursively requested while loading", name)
                 return
         if not is_loader:
+            from hermes_cli.plugins_loader import platform_loads_are_background
+            if platform_loads_are_background():
+                return  # Transport startup never waits for another metadata caller's import.
             event.wait()
             # Teardown may have restored an older deferred generation while cancelling the one
             # we waited for; resolve that predecessor instead of a one-shot false negative.
@@ -492,7 +495,9 @@ class PlatformRegistry:
     def create_adapter(self, name: str, config: Any) -> Optional[Any]:
         """Create an adapter instance for *name*; None when no entry exists, deps are missing
         and cannot be installed, ``validate_config`` fails, or the factory raises."""
-        entry = self.get(name)
+        from hermes_cli.plugins_loader import background_platform_loads
+        with background_platform_loads():
+            entry = self.get(name)
         if entry is None:
             return None
         def _probe(fn: Callable[[], Any], failure_msg: str) -> bool:

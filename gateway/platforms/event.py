@@ -133,10 +133,11 @@ class MessageEvent:
     # ``message_id`` with new text, so native admission keys it apart from the original send.
     # Appended for positional compat (see the field-order rule above).
     edit_revision: Optional[str] = None
-    # Original filename per attachment, parallel to ``media_urls`` like ``media_types`` ("" =
-    # unknown). For adapters whose ``media_urls`` are random cache names (relay); the name is
-    # display data only, never a path. Appended for positional compat.
     media_filenames: list[str] = field(default_factory=list)
+    # Set only by plugin message injection. Those turns stay quiet until the reply is finished
+    # (a trailing silence marker is unknowable while text is streaming). Other internal turns
+    # — process notices, goal wakeups — still stream. The silence rule itself uses ``internal``.
+    plugin_injected: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

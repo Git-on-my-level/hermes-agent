@@ -28,6 +28,7 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR)
 from gateway.response_filters import (
+    is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
     ends_with_partial_silence_marker as _ends_with_partial_silence_marker,
@@ -35,6 +36,8 @@ from gateway.response_filters import (
 from gateway.stream_consumer_directives import has_pending_media_directive, strip_image_tags_for_display
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
+from gateway.stream_consumer_preview import StreamCommentaryPreviewMixin
+from gateway.stream_consumer_preview_finalize import StreamCommentaryPreviewFinalizeMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 
@@ -77,6 +80,9 @@ class StreamConsumerConfig:
     # (progressive editMessageText).  "off" is handled by the gateway.
     transport: str = "edit"
     chat_type: str = ""  # originating chat type; gates platform-specific drafts
+    # "separate" = one message per commentary item; "preview" = one editable bubble (Telegram).
+    commentary_mode: str = "separate"
+    commentary_waiting_label: str = ""
 
 
 @dataclass
@@ -99,7 +105,13 @@ class _Tick:
         return not self.got_done and not self.got_segment_break and self.commentary_text is None
 
 
-class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThinkFilterMixin):
+class GatewayStreamConsumer(
+    StreamTransportMixin,
+    StreamCommentaryPreviewMixin,
+    StreamCommentaryPreviewFinalizeMixin,
+    StreamFallbackMixin,
+    StreamThinkFilterMixin,
+):
     """Async consumer that progressively edits a platform message with streamed tokens.
     Usage: ``agent.stream_delta_callback = consumer.on_delta``; ``create_task(consumer.run())``;
     after the agent finishes ``consumer.finish()`` then ``await task`` for the final edit."""
@@ -121,9 +133,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        *,
+        quiet_until_final: bool = False,
+        session_key: Optional[str] = None):
         self.adapter = adapter
         self.chat_id = chat_id
+        # Plugin-injected turns only. Holds every interim frame and applies the autonomous
+        # silence rule at the end, so a note cannot post before a trailing marker. Other
+        # internal turns stream; their final reply is filtered on the delivery path.
+        self._quiet_until_final = bool(quiet_until_final)
+        self._session_key = session_key
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
         # Hooks (exceptions swallowed): on_new_message per fresh content bubble (next
@@ -192,6 +212,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # to emit a lone "✅"; an EAGER re-seed opened a bubble that got_done MUST close.
         self._awaiting_reopen_after_boundary = False
         self._reopen_seeded_eagerly = False
+        self._commentary_preview_message_ids: list[str] = []
+        self._commentary_preview_message_id: Optional[str] = None
+        self._commentary_preview_last_text = ""
+        self._commentary_preview_edit_supported = True
+        self._commentary_preview_entries: list[str] = []
+        self._commentary_preview_is_placeholder = False
+        self._commentary_waiting_label = str(getattr(self.cfg, "commentary_waiting_label", "") or "").strip()
+        self._commentary_placeholder_sent = False
+        self._commentary_edit_fail_streak = 0
 
     def _reset_message_state(self) -> None:
         """Per-message (segment) state: fresh at construction and after each segment break."""
@@ -556,6 +585,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Async task that drains the queue and edits the platform message."""
         self._len_fn, self._safe_limit = self._resolve_length_budget()
         await self._start_transports()
+        await self._maybe_send_waiting_placeholder()
         try:
             while True:
                 # Session reset (/new, /stop): abandon rather than deliver stale deltas.
@@ -577,8 +607,22 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     self._flush_think_buffer()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
-                    # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    # preview, so retract it here instead of finalizing. A plugin-injected
+                    # turn held until now uses the autonomous rule (note on its own last line)
+                    # judged on the RAW reply: the display cleaner strips a closing marker,
+                    # which would read a note-plus-marker reply as deliverable.
+                    _cleaned = self._clean_for_display(self._accumulated)
+                    _silent = (
+                        _is_autonomous_silence_response(self._accumulated)
+                        if self._quiet_until_final
+                        else _is_intentional_silence_response(_cleaned)
+                    )
+                    if _silent:
+                        if self._quiet_until_final and not _is_intentional_silence_response(self._accumulated):
+                            logger.info(
+                                "Suppressing internal reply under autonomous silence rule: session=%s",
+                                self._session_key or "unknown",
+                            )
                         await self._suppress_silence_marker()
                         return
                     # Drop a closing marker before any overflow split: cut off on its own, it
@@ -774,7 +818,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Decide whether this tick flushes an edit/frame."""
         if not tick.is_interim:
             return True
-        if self.cfg.buffer_only:
+        # Plugin-injected turns hold every interim frame. A trailing [SILENT] is unknowable
+        # until the reply is complete; posting the note first would leak it (cron never streams).
+        if self._quiet_until_final or self.cfg.buffer_only:
             return False
         if self._use_native_streaming:
             # No platform edit-rate limit: push every delta immediately.

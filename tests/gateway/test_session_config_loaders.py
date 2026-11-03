@@ -38,7 +38,7 @@ def test_in_process_turn_routes_with_the_sessions_own_provider_routing(tmp_path,
     turn._ctx = SimpleNamespace(source=SimpleNamespace(platform=Platform.LOCAL, chat_id='c'), session_key='k',
                                 user_config={}, message='hi', inbound_message_id=None, enabled_toolsets=[])
     turn._combined_ephemeral_prompt = lambda: None
-    turn._setup_stream_consumer = lambda platform_key: (None, None, None, False)
+    turn._setup_stream_consumer = lambda platform_key, **kwargs: (None, None, None, False)
 
     def built(route, platform_key, ephemeral, max_iterations, reasoning, pr):
         raise _Built(pr)

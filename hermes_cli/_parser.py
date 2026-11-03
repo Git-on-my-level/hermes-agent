@@ -21,7 +21,7 @@ PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [("--profile", True), ("-
 # snapshot lacks AND derivation regresses.
 _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({
     "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning", "-t", "--toolsets",
-    "-r", "--resume", "-s", "--skills", "--usage-file", "--in",
+    "-r", "--resume", "-s", "--skills", "--usage-file", "--output-format", "--in",
 })
 _OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
 
@@ -67,17 +67,11 @@ def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:
 
 def command_argv(argv: list[str]) -> list[str]:
     """Subcommand and its arguments, excluding top-level flags and their values."""
+    from hermes_cli.profile_argv import command_positionals
+
     required, optional = top_level_value_flag_sets()
     value_flags = required | optional | {flag for flag, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value}
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == "--":
-            return argv[i + 1:]
-        if not token.startswith("-"):
-            return argv[i:]
-        i += 2 if "=" not in token and token in value_flags and i + 1 < len(argv) else 1
-    return []
+    return command_positionals(argv, value_flags)
 
 
 def _inherited_flag(parser, *args, **kwargs):
@@ -150,7 +144,16 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
         "response text to stdout. No banner, no spinner, no tool "
         "previews, no session_id line. Tools, memory, rules, and "
         "AGENTS.md in the CWD are loaded as normal; approvals are "
-        "auto-bypassed. Intended for scripts / pipes."))
+        "auto-bypassed. Intended for scripts / pipes. "
+        "--output-format json prints one agentctl terminal record instead."))
+    add("--output-format", choices=["text", "json"], default="text",
+        dest="oneshot_output_format", help=(
+            "One-shot mode only (-z/--oneshot). 'text' (default) prints the "
+            "final response. 'json' prints exactly one agentctl generic-process "
+            "terminal record on stdout (type=result, status success or failed, "
+            "result=the answer) and keeps every other message off stdout. "
+            "Put it before -z or after the prompt — -z consumes the next token, "
+            "same as --usage-file. No effect outside -z/--oneshot."))
     add("--usage-file", metavar="PATH", default=None, help=(
         "One-shot mode only: after the run, write a JSON usage report "
         "(estimated cost, token counts, model, api_calls) to PATH. "

@@ -61,15 +61,24 @@ def test_failed_thread_start_leaves_nothing_for_shutdown_to_join(monkeypatch):
     ex.submit(wedged)
     assert entered.wait(5)
 
-    # At the OS thread limit Thread.start raises; that submit must fail without leaving an
-    # unstarted thread behind, or shutdown's join() raises and skips the quiesce decision.
+    # At the OS thread limit Thread.start raises. submit itself stays nonblocking:
+    # the dispatcher calls start off the caller, and the Future carries the failure.
+    # An unstarted thread must not be registered, or shutdown's join() raises and
+    # skips the quiesce decision.
+    ran = []
+
     def refuse(self):
         raise RuntimeError("can't start new thread")
 
     with monkeypatch.context() as m:
         m.setattr(threading.Thread, "start", refuse)
-        with pytest.raises(RuntimeError):
-            ex.submit(lambda: None)
+        failed = ex.submit(lambda: ran.append("body"))
+        error = failed.exception(timeout=5)
+    assert isinstance(error, RuntimeError)
+    assert "can't start new thread" in str(error)
+    assert ran == []
+    assert failed not in ex._pending
+    assert all(thread.ident is not None for thread in ex._threads)
     # Release first and give a real deadline so the drain joins EVERY registered thread,
     # whatever the set's iteration order; a leftover unstarted one then always raises.
     wedge.set()
