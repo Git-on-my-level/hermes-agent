@@ -82,12 +82,20 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
+    # threshold_tokens must sit ABOVE the rough estimate at PRESSURE_3's preflight
+    # (~12.0k, and the system prompt embeds the tmp_path four times, so CI/runner
+    # tmp roots add ~30 tokens) and BELOW the PRESSURE_4 estimate (~15.7k): the
+    # journey's contract is that compaction folds PRESSURE_1's exchange into the
+    # summary, which protect_first_n=1/protect_last_n=2 only allow when the
+    # trigger fires at PRESSURE_4. At 12000 the trigger was one token over the
+    # boundary on long-tmp-path runners and compacted only the ACK_0 body.
+    # 14000 makes the trigger point deterministic on every environment.
     (home / 'config.yaml').write_text(json.dumps({
         'gateway': {'multiplex_profiles': False},
         'model': {'provider': 'custom', 'default': 'original', 'base_url': url, 'context_length': 64000},
         'auxiliary': {'title_generation': {'enabled': False},
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
-        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 12000,
+        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 14000,
                         'threshold': 0.5, 'in_place': False},
         'platform_toolsets': {'cli': []}}))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {

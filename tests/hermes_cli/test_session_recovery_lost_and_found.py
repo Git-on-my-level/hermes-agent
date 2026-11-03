@@ -225,6 +225,12 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    # Simulate the full refused-CLI state, not just the None return: a prior
+    # find_sqlite3_cli() call in this process records its refusal in a module
+    # global (e.g. wal_reset_vulnerable on a runner whose CLI is capable but
+    # unsafe), and the None path reports THAT reason. A missing CLI must
+    # refuse with reason "missing" so the guidance names what to install.
+    monkeypatch.setattr(laf, "_last_cli_refusal", {"reason": "missing"})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,
