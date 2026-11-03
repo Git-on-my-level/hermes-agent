@@ -470,3 +470,37 @@ def test_group_topic_skill_binding_second_topic():
 # ── _build_message_event: from_user=None fallback in DMs ──
 
 
+
+
+def test_concurrent_dm_topic_persists_preserve_both_writes(tmp_path, monkeypatch):
+    """Threaded topic creation must serialize the complete config transaction."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import hermes_yaml as yaml
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("{}", encoding="utf-8")
+    read = config_module.read_user_config_raw
+    snapshots = threading.Barrier(2)
+
+    def coordinated_read(path):
+        config = read(path)
+        # On unfixed code both writers snapshot the same document. With serialization,
+        # the first reader times out here before the second can enter the transaction.
+        try:
+            snapshots.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            pass
+        return config
+
+    monkeypatch.setattr(config_module, "read_user_config_raw", coordinated_read)
+    adapters = [_make_adapter(), _make_adapter()]
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        writes = [workers.submit(adapter._persist_dm_topic_thread_id, 111, name, thread_id)
+                  for adapter, name, thread_id in zip(adapters, ["Alpha", "Beta"], [101, 202])]
+        for write in writes:
+            write.result(timeout=10)
+    topics = yaml.safe_load(config_path.read_text(encoding="utf-8"))["platforms"]["telegram"]["extra"]["dm_topics"][0]["topics"]
+    assert {topic["name"]: topic["thread_id"] for topic in topics} == {"Alpha": 101, "Beta": 202}

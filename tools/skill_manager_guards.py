@@ -163,7 +163,7 @@ def _pinned_guard(name: str) -> Optional[str]:
 
 def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[dict[str, Any]]:
     """Refuse autonomous deletes of anything but curator-owned sediment. Content writes are not
-    gated by ownership: the review fork exists to improve every skill it learns from, and every
+    gated here by ownership (external package markers are enforced by preflight): every
     write is ledgered and reversible, while an archive removes a skill the user relies on."""
     if not _is_background_review():
         return None
@@ -253,14 +253,18 @@ def _locked_guard(name: str, action: str) -> Optional[dict[str, Any]]:
 
 def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
     """Guards that run on the bare action/name before any handler, for the single-op AND the
-    batch path: the content lock (every mutating action) and the ownership delete guard."""
+    batch path: the content lock (every mutating action), the externally-managed ownership
+    guard, and the ownership delete guard."""
     if (locked := _locked_guard(name, action)) is not None:
         return locked
-    if action != "delete":
+    if not _is_background_review():
         return None
     from tools import skill_manager_tool as _smt
+    from tools.skill_ownership import external_skill_owner, external_owner_message
     existing = _smt._find_skill(name)
-    return _background_review_delete_guard(name, existing["path"]) if existing else None
+    if existing and (owner := external_skill_owner(existing["path"])):
+        return _refusal(external_owner_message(name, owner))
+    return _background_review_delete_guard(name, existing["path"]) if existing and action == "delete" else None
 
 
 def _curator_consolidation_delete_guard(

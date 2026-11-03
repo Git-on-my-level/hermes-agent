@@ -261,7 +261,7 @@ def _bundled_env_fallbacks(config: GatewayConfig, entries: list, *, only: Option
     if only is not None:  # bundled_env_rows() answers for one name without scanning every manifest
         names = {only.value} - have
     else:
-        names = (set(Platform._scan_bundled_plugin_platforms()[0]) | set(_BUNDLED_ENV_SIBLINGS)) - have
+        names = (set(Platform.bundled_plugin_platforms()[0]) | set(_BUNDLED_ENV_SIBLINGS)) - have
     if not names:
         return []
     wanted = activation_predicate(yaml_cfg={}, platform_names=config.platforms)

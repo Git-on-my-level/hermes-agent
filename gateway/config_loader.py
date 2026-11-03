@@ -460,6 +460,13 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
             )
         else:
             os.environ.pop("GATEWAY_ALLOW_ALL_USERS", None)
+    # Carry presentation config through the startup/reload snapshot, including env-only bots
+    # with no telegram: YAML block. Adapter rebuild must never reload config from its factory.
+    from hermes_cli.config import cfg_get
+    notifications = cfg_get(yaml_cfg, "display", "platforms", "telegram", "notifications")
+    if notifications is not None:
+        _dict_slot(_dict_slot(platforms_data, "telegram"), "extra")["notifications"] = notifications
+
     tl_require_mention = yaml_cfg.get("require_mention")
     if tl_require_mention is not None and "require_mention" not in (yaml_cfg.get("telegram") or {}):
         tg_plat = platforms_data.setdefault(Platform.TELEGRAM.value, {})

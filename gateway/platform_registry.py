@@ -184,7 +184,7 @@ def core_ships_platform(name: str) -> bool:
     from gateway.config import Platform
     value = str(name or "").strip().lower()
     return value in {Platform[member].value for member in Platform._member_names_} or (
-        value in Platform._scan_bundled_plugin_platforms()[0])
+        value in Platform.bundled_plugin_platforms()[0])
 
 
 class PlatformRegistry:
@@ -492,9 +492,8 @@ class PlatformRegistry:
             entries, _deferred = self._scope_maps(scope)
             return name in entries or name in self._entries or self._load_pending(scope, name)
 
-    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
-        """Create an adapter instance for *name*; None when no entry exists, deps are missing
-        and cannot be installed, ``validate_config`` fails, or the factory raises."""
+    def prepare_adapter(self, name: str, config: Any) -> Optional[PlatformEntry]:
+        """Load, probe/install dependencies and validate config. Run off-loop in async callers."""
         from hermes_cli.plugins_loader import background_platform_loads
         with background_platform_loads():
             entry = self.get(name)
@@ -522,8 +521,18 @@ class PlatformRegistry:
                     logger.warning("Platform '%s' config validation failed", entry.label)
                     return None
             except Exception as e:
-                logger.warning("Platform '%s' config validation error: %s", entry.label, e)
+                logger.warning("Platform '%s' config validation error: %s", entry.label, e, exc_info=True)
                 return None
+        return entry
+
+    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
+        """Synchronous entry point for non-gateway callers."""
+        entry = self.prepare_adapter(name, config)
+        return self.build_adapter(entry, config) if entry is not None else None
+
+    @staticmethod
+    def build_adapter(entry: PlatformEntry, config: Any) -> Optional[Any]:
+        """Construct only; async callers retain factory loop affinity after off-loop preparation."""
         try:
             return entry.adapter_factory(config)
         except Exception as e:
