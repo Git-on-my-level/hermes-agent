@@ -302,6 +302,24 @@ Long files are truncated before injection.
 
 The skills system contributes a compact skills index to the prompt when skills tooling is available.
 
+`build_skills_system_prompt()` filters `skills.disabled` and the current session's
+`skills.platform_disabled` list before rendering `<available_skills>`, on both a
+fresh scan and disk-cache reuse. The in-process cache includes the disabled set
+and session platform in its key, so new builds reflect configuration changes.
+Existing conversations retain their frozen system prompt as described above.
+
+The profile's `.skills_prompt_snapshot.json` is a metadata cache, not a saved
+system prompt. It retains installed skill metadata and category descriptions for
+name resolution and later re-enabling; its manifest also tracks disabled files.
+Its byte size and skill count therefore do not measure model input. Measure the
+rendered skills index or the actual session prompt instead. A category blurb is
+rendered only when the category has visible skills.
+
+Disabled skills are omitted from `skills_list` and rejected by `skill_view`;
+disabling does not mean discoverable on demand. The management catalog can still
+include disabled skills for re-enabling. Essential skills are exempt from the
+disabled set in `agent.skill_utils.get_disabled_skill_names()`.
+
 ## Supported prompt customization surfaces
 
 Most users should treat `agent/prompt_builder.py` as implementation code, not a configuration surface. The supported customization path is to change the prompt inputs Hermes already loads, rather than editing Python templates in place.
