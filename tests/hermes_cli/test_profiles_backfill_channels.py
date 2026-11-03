@@ -1,7 +1,9 @@
-"""``hermes update``'s .env backfill must never copy the default's secrets into a profile.
+"""``hermes update``'s .env backfill copies the default's credentials into a profile that predates
+per-profile ``.env`` seeding.
 
-Secrets are profile-scoped, and one bot token can't be consumed twice: a copied TELEGRAM_BOT_TOKEN only
-ever surfaces as a ``duplicate_credential`` fatal next to the default's live adapter.
+Those profiles ran on the root install's environment, so the copy preserves the credentials they
+were effectively using; the user diverges per profile from there. An install with no default
+``.env`` gets the placeholder header instead.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ def profile_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_backfill_never_copies_default_credentials(profile_env):
+def test_backfill_copies_the_default_credentials(profile_env):
     (profile_env / ".hermes" / ".env").write_text(
         "OPENROUTER_API_KEY=root-key\nTELEGRAM_BOT_TOKEN=123:abc\nDISCORD_BOT_TOKEN=d1\n", encoding="utf-8"
     )
@@ -30,5 +32,14 @@ def test_backfill_never_copies_default_credentials(profile_env):
     (p / ".env").unlink()
 
     assert backfill_profile_envs(quiet=True) == ["legacy"]
+    assert ((p / ".env").read_text(encoding="utf-8-sig")
+            == "OPENROUTER_API_KEY=root-key\nTELEGRAM_BOT_TOKEN=123:abc\nDISCORD_BOT_TOKEN=d1\n")
+
+
+def test_backfill_seeds_the_placeholder_when_the_default_has_no_env(profile_env):
+    p = create_profile("fresh", no_alias=True, no_skills=True)
+    (p / ".env").unlink()
+
+    assert backfill_profile_envs(quiet=True) == ["fresh"]
     assert all(line.startswith("#") or not line.strip()
                for line in (p / ".env").read_text(encoding="utf-8-sig").splitlines())

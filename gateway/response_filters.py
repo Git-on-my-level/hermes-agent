@@ -89,17 +89,36 @@ def _split_trailing_line(text: str) -> tuple[str, str]:
     return head.rstrip(), tail
 
 
-def strip_trailing_silence_marker(response: Any) -> Any:
+def _is_bracketed_silence_marker(text: Any) -> bool:
+    """True when *text* is, or opens with, a bracketed silence marker (``[SILENT]`` family)."""
+    stripped = text.strip() if isinstance(text, str) else ""
+    if not stripped:
+        return False
+    if stripped.upper().startswith(_BRACKETED_SILENCE_MARKERS):
+        return True
+    # A bare localized bracketed marker with edge punctuation ("[SILENT].") still reads as one.
+    canonical = _canonical_silence_candidate(stripped)
+    return is_intentional_silence_response(stripped) and any(
+        canonical.startswith(m.upper()) for m in _BRACKETED_SILENCE_MARKERS)
+
+
+def strip_trailing_silence_marker(response: Any, *, keep_bracketed: bool = False) -> Any:
     """Drop a silence marker that closes a real reply on its own line.
 
     ``"Here is the answer.\\n\\nNO_REPLY"`` delivers ``"Here is the answer."``: the model
     answered, then also said it has nothing more to add, and the token is not meant for the
     reader. A bare marker is returned unchanged (that is the silence verdict, decided by
     :func:`is_intentional_silence_response`), and a marker inside a line is prose.
+
+    ``keep_bracketed``: the bracketed family (``[SILENT]`` and its localized forms) is the
+    gateway's silence-coordination marker, not model noise — a reply that closes on it is
+    delivered as written (the silence filters decide delivery), so the final-send strip skips it.
     """
     if not isinstance(response, str):
         return response
     head, tail = _split_trailing_line(response)
+    if keep_bracketed and _is_bracketed_silence_marker(tail):
+        return response
     return head if head.strip() and is_intentional_silence_response(tail) else response
 
 

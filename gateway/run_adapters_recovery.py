@@ -199,7 +199,9 @@ class GatewaySecondaryReconnectMixin:
             # A re-armed plugin import + register() joins its load deadline: run it off the event loop,
             # in this profile's scope (the registry keeps deferred loaders per profile home).
             await self._run_in_executor_with_context(platform_registry.get, platform.value)
-            adapter = self._create_adapter(platform, profile_config)
+            # Reconnect creation runs off the session loop (gateway/adapter_factory.py): the
+            # plugin's load/probe/validate disk work must not stall heartbeats mid-reconnect.
+            adapter = await self._create_adapter_off_loop(platform, profile_config)
             if adapter is None:
                 if self._adapter_may_heal(platform, profile_config):
                     logger.info("Secondary %s: no adapter yet (profile: %s)", platform.value, profile_name)

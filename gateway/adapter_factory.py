@@ -5,25 +5,14 @@ from gateway.config import Platform
 
 
 async def create_adapter_async(runner, platform, config):
-    """Keep disk/dependency work out of reconnect and profile-reload tasks.
+    """Keep reconnect disk work out of the gateway session loop.
 
-    Builtin (unregistered) factories also construct off-loop.
-    Telegram's synchronous constructor has no loop affinity. Other plugin factories can
-    create loop-owned resources, so only their load/probe/validation phase runs in a worker.
+    The whole construction runs in a worker: a plugin factory's load, dependency probe and
+    config validation are disk-bound, and a reconnect that builds on the session loop stalls
+    every heartbeat and delivery tick behind them. The runner's ``_create_adapter`` seam stays
+    the one construction path, so callers that stub it keep working.
     """
-    if platform is Platform.TELEGRAM:
-        return await asyncio.to_thread(runner._create_adapter, platform, config)
-    from gateway.platform_registry import platform_registry
-    if not platform_registry.is_registered(platform.value):
-        return await asyncio.to_thread(runner._create_adapter, platform, config)
-    runner._seed_adapter_config(config)
-    entry = await asyncio.to_thread(platform_registry.prepare_adapter, platform.value, config)
-    if entry is None:
-        return None
-    adapter = platform_registry.build_adapter(entry, config)
-    if adapter is not None:
-        adapter.gateway_runner = runner
-    return adapter
+    return await asyncio.to_thread(runner._create_adapter, platform, config)
 
 
 async def run_in_adapter_profile(home, fn, *args):

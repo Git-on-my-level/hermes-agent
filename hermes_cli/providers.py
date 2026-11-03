@@ -332,18 +332,22 @@ def _plugin_profile_pdef(name: str) -> Optional[ProviderDef]:
         return None
     if prof is None:
         return None
-    env_vars = tuple(prof.env_vars or ())
+    # getattr defaults: a registered profile is a plugin-supplied object; a minimal one (an
+    # opaque "loaded" marker in tests, a host-side shim) must not break the models.dev rung
+    # that only wants its env-var names.
+    env_vars = tuple(getattr(prof, "env_vars", None) or ())
     url_vars = tuple(v for v in env_vars if v.endswith(("_BASE_URL", "_URL")))
     key_vars = tuple(v for v in env_vars if v not in url_vars)
     api_mode_to_transport = {v: k for k, v in TRANSPORT_TO_API_MODE.items()}
     # A mode outside the reverse table is a plugin-registered dialect: keep its name so
     # ``determine_api_mode`` can check the transport registry instead of degrading it.
-    mode = (prof.api_mode or "").strip()
-    return ProviderDef(id=prof.name, name=prof.display_name or prof.name or name,
+    mode = (getattr(prof, "api_mode", "") or "").strip()
+    prof_name = getattr(prof, "name", None) or name
+    return ProviderDef(id=prof_name, name=getattr(prof, "display_name", None) or prof_name,
                        transport=api_mode_to_transport.get(mode, mode or "openai_chat"),
-                       api_key_env_vars=key_vars, base_url=(prof.base_url or "").strip(),
+                       api_key_env_vars=key_vars, base_url=(getattr(prof, "base_url", "") or "").strip(),
                        base_url_env_var=next(iter(url_vars), ""),
-                       auth_type=prof.auth_type or "api_key", source="plugin-profile")
+                       auth_type=getattr(prof, "auth_type", None) or "api_key", source="plugin-profile")
 
 
 def get_label(provider_id: str) -> str:

@@ -127,7 +127,7 @@ class GatewayTurnPersistenceMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        from gateway.response_filters import is_machinery_display_kind
+        from gateway.response_filters import is_machinery_display_kind, strip_trailing_silence_marker
         from gateway.run_turn import _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
@@ -174,9 +174,11 @@ class GatewayTurnPersistenceMixin:
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
         if not _intentional_silence:
-            # No trailing-marker strip here: a non-internal turn's reply is delivered verbatim —
-            # silence on a user turn requires an exact marker, so a note that closes on the
-            # marker keeps both lines (the stream consumer holds that case while streaming).
+            # A closing NON-bracketed marker ("answer\n\nNO_REPLY") is model noise, not text:
+            # the final send drops it (upstream contract). The bracketed [SILENT] family stays
+            # verbatim — the fork's silence pipeline and goal judge coordinate on it, so a
+            # reply that closes on it is delivered as written and the silence filters rule.
+            response = strip_trailing_silence_marker(response, keep_bracketed=True)
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 

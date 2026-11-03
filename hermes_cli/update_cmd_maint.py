@@ -846,14 +846,15 @@ def _sync_profiles_after_update() -> None:
                 except Exception as pe:
                     print(f"  {p.name}: error ({pe})")
 
-    # Seed the placeholder .env into any named profile lacking one (never a copy of the default's).
+    # Backfill .env for profiles created before .env seeding (copy the default's) so they
+    # keep the credentials they were effectively using.
     with suppress(Exception):
         # See #44792.
         from hermes_cli.profiles import backfill_profile_envs
         backfilled = backfill_profile_envs(quiet=True)
         if backfilled:
             print()
-            print(f"→ Seeded .env for {len(backfilled)} profile(s) (empty placeholder): {', '.join(backfilled)}")
+            print(f"→ Seeded .env for {len(backfilled)} profile(s) (copied from default): {', '.join(backfilled)}")
 
     with suppress(Exception):
         from plugins.memory import import_provider_module

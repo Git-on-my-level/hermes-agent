@@ -181,6 +181,9 @@ def run_bounded_dependency_sync(root: Path, *, arm: bool, deadline: float) -> No
         command,
         cwd=root,
         env=activation_environment(root),
+        # The dependency-sync child must outlive this process: the recovery relaunch execs away
+        # mid-sync and the detached child finishes the owed tail.
+        # detached-spawn: ok — restart-owned repair child, awaited by _wait_process_group.
         start_new_session=True,
     )
     code = _wait_process_group(process, deadline, phase="dependency_sync")
