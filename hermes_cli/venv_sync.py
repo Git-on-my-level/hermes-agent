@@ -446,11 +446,11 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             f"({_attempts} attempts); run `hermes update` from a shell to finish it",
             file=sys.stderr, flush=True,
         )
-        return None
+        # Skip the tail only. The launch still resolves the store python.
     elif not _may_retry:
         # Backoff window not yet elapsed: skip this launch's retry without
         # noise (the record's age tracks the wait), leaving the marker armed.
-        return None
+        pass
     elif owner is not None:
         return _prepare_borrowed_launch(root, owner, current=current)
     elif not owed_to_cli and (not current or pending.is_file()):
