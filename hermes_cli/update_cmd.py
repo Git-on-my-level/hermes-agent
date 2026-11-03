@@ -1868,7 +1868,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
     _hermes_current_updater_frame = True
-    _commit.begin_update_attempt()  # nothing an earlier update in this process armed is ours (O5)
+    _commit.begin_source_update_attempt(_m().PROJECT_ROOT)  # resets attempt custody, then admits the disk floor
     from hermes_cli.update_proxy_env import prefer_dotenv_proxy_env
     prefer_dotenv_proxy_env()  # the .env loaded at import beats a system proxy the Desktop injected
     git_operation = git_operation_in_progress(_m().PROJECT_ROOT)

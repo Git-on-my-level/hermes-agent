@@ -117,6 +117,8 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
             return {"state": "current", "ok": True}
         if check:
             return {"state": "would-sync", "ok": True}
+        from hermes_cli.update_disk_space import require_source_write_space
+        require_source_write_space(root)
         publish_stage("Updating Python dependencies")
         refuse_foreign_owned_venv(root)
         pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
@@ -658,6 +660,8 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     # Those builds need PM's selected interpreter with its dependencies
     # activated, so hand that file THIS interpreter and let it re-exec
     # itself, exactly as the installers do.
+    from hermes_cli.update_disk_space import require_source_write_space
+    require_source_write_space(root)
     desktop_app = root / "apps/desktop"
     desktop = ((desktop_app / "dist/index.html").is_file()
                or any((desktop_app / "release").glob("*")))
@@ -701,6 +705,9 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     from pm.environments import runtime_facts_path
     from pm.extras import legacy_selection
 
+    from hermes_cli.update_disk_space import require_source_write_space
+    from pm.disk_space import DiskFloorError
+    require_source_write_space(root)
     if borrowed_from is not None:
         print(f"hermes: preparing dependencies for this data root (the checkout's updates belong to "
               f"{borrowed_from})...", file=sys.stderr, flush=True)
@@ -716,11 +723,17 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
     # Same order as `hermes update`: an interrupted update or a hand-run
     # `git pull` leaves this tree's lockfile ahead of the installed tools.
-    ensure_tools_for_sync()
-    # The old venv's extras are carried, not asked for: none of them undoes a `--without`, and
-    # one beyond [all] that no longer builds is left out.
-    carried = {"carried": extras[1:]} if extras and len(extras) > 1 else {}
-    pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True, **carried)
+    try:
+        ensure_tools_for_sync()
+        # The old venv's extras are carried, not asked for: none of them undoes a `--without`, and
+        # one beyond [all] that no longer builds is left out.
+        carried = {"carried": extras[1:]} if extras and len(extras) > 1 else {}
+        pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True, **carried)
+    except DiskFloorError:
+        # Space can fall below the floor after admission, while a worker runs.
+        # A lockfile or uv failure is not a disk refusal and must not start the backoff.
+        _record_completion_attempt(root, failed=True)
+        raise
     collect_superseded_generations(root)
     if borrowed_from is not None:
         return  # The checkout's markers describe the owner's environment, not this one.

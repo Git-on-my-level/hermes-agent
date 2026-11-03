@@ -525,6 +525,8 @@ class Venv(StatePackage):
 
         project = self.project_root()
         generation = install_state_dir(project) / "environments" / uuid.uuid4().hex
+        from pm.disk_space import require_generation_space
+        require_generation_space(generation)
         candidate = generation / "venv"
         environment = managed_environment(candidate, env=source_build_environment(project),
                                           explicit=explicit or repair, output=sys.stderr)
