@@ -1859,7 +1859,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
     _hermes_current_updater_frame = True
-    _commit.begin_update_attempt()  # nothing an earlier update in this process armed is ours (O5)
+    _commit.begin_source_update_attempt(_m().PROJECT_ROOT)
     git_operation = git_operation_in_progress(_m().PROJECT_ROOT)
     if git_operation:
         root = _m().PROJECT_ROOT

@@ -437,6 +437,8 @@ def _install(
                 f"no artifact for {target} in the lockfile",
                 "run `hermes pm lock --bump` for this package",
             )
+        from pm.disk_space import require_generation_space
+        require_generation_space(entry, paths.partials_root())
         with store.scratch() as scratch:
             staged = scratch / "tree"
             try:

@@ -565,6 +565,14 @@ def checkout_untouched(git_cmd, root: Path, start: tuple[str, str] | None) -> bo
     return head_and_branch(git_cmd, root) == start
 
 
+def begin_source_update_attempt(root: Path) -> None:
+    """Reset attempt custody, then admit source/dependency writes before any backup or fetch."""
+    from hermes_cli.update_disk_space import require_source_write_space
+
+    begin_update_attempt()
+    require_source_write_space(root)
+
+
 def begin_update_attempt() -> None:
     """A new ``hermes update`` attempt owns nothing yet: no snapshot, no stake, no run start.
 

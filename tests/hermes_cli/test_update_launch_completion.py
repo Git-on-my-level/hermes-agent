@@ -87,6 +87,27 @@ def _committed_checkout(tmp_path, monkeypatch):
     return root
 
 
+@pytest.mark.platforms("posix")
+def test_disk_refusals_consume_six_attempt_budget(tmp_path, monkeypatch, completion_tail):
+    import pm
+    from types import SimpleNamespace
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kwargs: False)
+    monkeypatch.setattr(os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=4096, f_blocks=1024**3, f_bavail=1))
+    for attempt in range(1, 7):
+        with pytest.raises(RuntimeError, match="disk floor"):
+            venv_sync.prepare_launch(root, [])
+        record = venv_sync._completion_attempts_path(root)
+        assert int(record.read_text()) == attempt
+        os.utime(record, (1, 1))  # Advance past the existing retry backoff.
+    with pytest.raises(RuntimeError, match="no managed Python"):
+        venv_sync.prepare_launch(root, [])
+    assert int(record.read_text()) == 6
+    assert not completion_tail
+
+
 @pytest.mark.parametrize("marker_age, owed", [(-60, False), (60, True)])
 def test_completed_tree_discharges_only_a_marker_older_than_its_stamp(
         tmp_path, monkeypatch, completion_tail, marker_age, owed):

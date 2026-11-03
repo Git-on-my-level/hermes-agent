@@ -292,6 +292,8 @@ def _ensure_generation(
         return existing
     if not explicit and not lazy_installs_allowed():
         raise _refuse_lazy(name, "isolated Python environment is missing or outdated")
+    from pm.disk_space import require_generation_space
+    require_generation_space(root)
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".install.lock").open("a+b") as mutex:
         lock_fd(mutex.fileno(), wait=True)

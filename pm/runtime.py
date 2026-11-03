@@ -159,6 +159,8 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
         if not bootstrap:
             raise InstallError("pm-runtime", "not installed or outdated and lazy installs are disabled",
                                "run `hermes pm install` to prepare the independent PM runtime")
+        from pm.disk_space import require_generation_space
+        require_generation_space(root)
         generation = Path("generations") / uuid.uuid4().hex
         environment = root / generation
         try:
