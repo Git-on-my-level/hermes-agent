@@ -100,11 +100,11 @@ def test_disk_refusals_consume_six_attempt_budget(tmp_path, monkeypatch, complet
         with pytest.raises(RuntimeError, match="disk floor"):
             venv_sync.prepare_launch(root, [])
         record = venv_sync._completion_attempts_path(root)
-        assert int(record.read_text()) == attempt
+        assert venv_sync._read_completion_attempts(record)[0] == attempt
         os.utime(record, (1, 1))  # Advance past the existing retry backoff.
     with pytest.raises(RuntimeError, match="no managed Python"):
         venv_sync.prepare_launch(root, [])
-    assert int(record.read_text()) == 6
+    assert venv_sync._read_completion_attempts(record)[0] == 6
     assert not completion_tail
 
 
