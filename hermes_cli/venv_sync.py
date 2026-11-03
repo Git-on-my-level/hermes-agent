@@ -117,6 +117,8 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
             return {"state": "current", "ok": True}
         if check:
             return {"state": "would-sync", "ok": True}
+        from hermes_cli.update_disk_space import require_source_write_space
+        require_source_write_space(root)
         publish_stage("Updating Python dependencies")
         refuse_foreign_owned_venv(root)
         pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
@@ -432,8 +434,6 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     from pm.environments import owning_home_root
 
     owner = owning_home_root(root)
-    if owner is not None:
-        return _prepare_borrowed_launch(root, owner, current=current)
     pending = completion_pending_path(root)
     owed_to_cli = current and pending.is_file() and _supervised_child()
     _may_retry, _attempts, _backoff = completion_retry_state(root)
@@ -446,10 +446,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             f"({_attempts} attempts); run `hermes update` from a shell to finish it",
             file=sys.stderr, flush=True,
         )
+        return None
     elif not _may_retry:
         # Backoff window not yet elapsed: skip this launch's retry without
         # noise (the record's age tracks the wait), leaving the marker armed.
-        pass
+        return None
+    elif owner is not None:
+        return _prepare_borrowed_launch(root, owner, current=current)
     elif not owed_to_cli and (not current or pending.is_file()):
         # The marker alone first (a process the live update spawned runs under its claim and
         # inherits no checkout lock); install_root still names the checkout whose held lock
@@ -575,6 +578,8 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     # Those builds need PM's selected interpreter with its dependencies
     # activated, so hand that file THIS interpreter and let it re-exec
     # itself, exactly as the installers do.
+    from hermes_cli.update_disk_space import require_source_write_space
+    require_source_write_space(root)
     desktop_app = root / "apps/desktop"
     desktop = ((desktop_app / "dist/index.html").is_file()
                or any((desktop_app / "release").glob("*")))
@@ -618,6 +623,8 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     from pm.environments import runtime_facts_path
     from pm.extras import legacy_selection
 
+    from hermes_cli.update_disk_space import require_source_write_space
+    require_source_write_space(root)
     if borrowed_from is not None:
         print(f"hermes: preparing dependencies for this data root (the checkout's updates belong to "
               f"{borrowed_from})...", file=sys.stderr, flush=True)
@@ -633,8 +640,13 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
     # Same order as `hermes update`: an interrupted update or a hand-run
     # `git pull` leaves this tree's lockfile ahead of the installed tools.
-    ensure_tools_for_sync()
-    pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
+    try:
+        ensure_tools_for_sync()
+        pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
+    except (RuntimeError, OSError):
+        # Space can fall below the floor after admission, while a worker runs.
+        _record_completion_attempt(root, failed=True)
+        raise
     collect_superseded_generations(root)
     if borrowed_from is not None:
         return  # The checkout's markers describe the owner's environment, not this one.

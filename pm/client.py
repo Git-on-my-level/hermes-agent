@@ -227,7 +227,10 @@ def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, p
 
 def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None, repair=False,
               project_root: Path | None = None, evict_incompatible_plugins: bool = False) -> None:
-    from pm.environments import running_from_selected_environment
+    from pm.disk_space import require_generation_space
+    from pm.environments import install_state_dir, running_from_selected_environment
+
+    require_generation_space(install_state_dir(paths.repo_root() if project_root is None else project_root))
 
     if extras and not explicit and not repair and not running_from_selected_environment(
             paths.repo_root() if project_root is None else Path(project_root)):

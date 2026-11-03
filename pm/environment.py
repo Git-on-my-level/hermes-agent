@@ -369,6 +369,8 @@ class PythonEnvironment:
 
     def create(self) -> None:
         """Create at the final destination; callers must not move a live venv."""
+        from pm.disk_space import require_generation_space
+        require_generation_space(self.destination, self.cache)
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         result = self._run(
             ["venv", "--relocatable", "--no-project", "--no-config",
@@ -401,6 +403,8 @@ class PythonEnvironment:
         ``frozen=False`` is reserved for the caller-owned generated workspace,
         never the original project's lock. Seed/replay policy belongs to PM.
         """
+        from pm.disk_space import require_generation_space
+        require_generation_space(self.destination, self.cache)
         if not frozen:
             self.lock(source, timeout=timeout)
         # Locking members alone is insufficient: plain sync only installs root deps.
