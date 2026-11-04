@@ -102,8 +102,9 @@ def test_disk_refusals_consume_six_attempt_budget(tmp_path, monkeypatch, complet
         record = venv_sync._completion_attempts_path(root)
         assert venv_sync._read_completion_attempts(record)[0] == attempt
         os.utime(record, (1, 1))  # Advance past the existing retry backoff.
-    with pytest.raises(RuntimeError, match="no managed Python"):
-        venv_sync.prepare_launch(root, [])
+    # The budget is spent. This tip stops and boots the previous dependencies
+    # instead of entering the repair again and failing to find a store Python.
+    assert venv_sync.prepare_launch(root, []) is None
     assert venv_sync._read_completion_attempts(record)[0] == 6
     assert not completion_tail
 
