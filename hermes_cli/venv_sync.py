@@ -635,12 +635,14 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         # by its own entry point (the TUI/web freshness gates), not here.
         try:
             _sync_source_dependencies(root, arm=not completed)
-        except Exception:
+        except Exception as exc:
             # The pending marker is armed before this sync. A sync failure is
             # therefore an automatic completion failure too: without recording
             # it, every Desktop relaunch bypasses the retry backoff and starts
-            # the same expensive repair again.
-            if not completed:
+            # the same expensive repair again. A disk-floor refusal already
+            # consumed one attempt inside require_source_write_space.
+            from pm.disk_space import DiskFloorError
+            if not completed and not isinstance(exc, DiskFloorError):
                 _record_completion_attempt(root, failed=True, inputs=_sync_inputs_digest(root))
             raise
         if completed:
