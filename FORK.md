@@ -269,8 +269,9 @@ The converge unit prefers the PM-published `<checkout>/.hermes/bin/hermes`
 launcher over a generation venv whose removal would otherwise leave launchd
 reporting a missing executable. A healthy host must have a loaded converge
 unit, a successful recent tick, and a freshly fetched remote tip; seeing
-`already_current` does not waive fetch or staleness verification. Use
-`hermes converge status --assert-current` after the ref has refreshed.
+`already_current` does not waive fetch or staleness verification.
+`hermes converge status --assert-current` fetches the channel itself and fails
+with `channel_fetch_failed` instead of accepting a stale tracking ref.
 
 ## Documentation verification
 

@@ -31,6 +31,7 @@ MANUAL_FLIP_NOTICE = (
     "the one-time manual flip path is required."
 )
 FOCUSED_TESTS = (
+    "tests/hermes_cli/test_converge_release_status.py",
     "tests/hermes_cli/test_fork_autoupdate_invariants.py",
     "tests/hermes_cli/test_update_converge.py",
 )

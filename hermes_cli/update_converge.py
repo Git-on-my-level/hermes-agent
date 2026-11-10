@@ -736,11 +736,15 @@ def cmd_converge(args: Any) -> None:
         settings = load_converge_settings()
         from hermes_cli.main import PROJECT_ROOT
 
+        channel_fetch_ok = True
+        if settings.enabled and not settings.pin:
+            channel_fetch_ok = fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
         checkout = checkout_sha(PROJECT_ROOT)
         live = live_code_sha()
         target = settings.pin or channel_tip_sha(PROJECT_ROOT, settings.remote, settings.branch)
-        matches = prefixes_match(checkout, target) and prefixes_match(live, target)
-        d = decide_from_live(PROJECT_ROOT, settings)
+        matches = (channel_fetch_ok and prefixes_match(checkout, target)
+                   and prefixes_match(live, target))
+        d = decide_from_live(PROJECT_ROOT, settings, channel_fetch_ok=channel_fetch_ok)
         print(f"checkout_sha={checkout or 'unknown'} live_sha={live or 'unknown'} target_sha={target or 'unknown'}")
         print(f"match={'YES' if matches else 'NO'}")
         print(f"enabled={settings.enabled} pin={settings.pin or '-'} skip_restart={settings.skip_gateway_restart}")
