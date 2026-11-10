@@ -485,13 +485,23 @@ def converge_plist_path() -> Path:
 
 
 def _service_venv_dir() -> str:
-    """Venv that owns the ``hermes`` launcher for the converge unit."""
+    """Venv for legacy source checkouts without a PM-published launcher."""
     from hermes_cli.gateway import PROJECT_ROOT, _pm_runtime_venv_dir
 
     venv = _pm_runtime_venv_dir(PROJECT_ROOT)
     if venv is not None:
         return str(venv)
     return str(Path(PROJECT_ROOT) / ".venv")
+
+
+def _service_hermes_bin() -> str:
+    """PM launcher survives runtime moves; never strand the out-of-tree tick on an old venv."""
+    from hermes_cli.gateway import PROJECT_ROOT
+
+    published = Path(PROJECT_ROOT) / ".hermes" / "bin" / "hermes"
+    if published.is_file():
+        return str(published)
+    return str(Path(_service_venv_dir()) / "bin" / "hermes")
 
 
 def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[ConvergeSettings, str, str, str, Path]:
@@ -502,7 +512,7 @@ def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[Con
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     venv_dir = _service_venv_dir()
-    hermes_bin = str(Path(venv_dir) / "bin" / "hermes")
+    hermes_bin = _service_hermes_bin()
     return settings, hermes_home, venv_dir, hermes_bin, log_dir
 
 

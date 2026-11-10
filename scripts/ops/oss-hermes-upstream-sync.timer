@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly NousResearch to fork synchronization
+
+[Timer]
+OnCalendar=Tue *-*-* 02:00:00 UTC
+Persistent=true
+Unit=oss-hermes-upstream-sync.service
+
+[Install]
+WantedBy=timers.target

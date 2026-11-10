@@ -358,6 +358,31 @@ KEEP_LIST: list[tuple[str, str, str]] = [
         "idle converge tick",
     ),
     (
+        "hermes_cli/update_converge.py",
+        'Path(PROJECT_ROOT) / ".hermes" / "bin" / "hermes"',
+        "converge uses the runtime-move-safe PM launcher",
+    ),
+    (
+        "scripts/ops/oss-hermes-upstream-sync.timer",
+        "OnCalendar=Tue *-*-* 02:00:00 UTC",
+        "weekly upstream sync is a persistent calendar, not a one-shot",
+    ),
+    (
+        "scripts/ops/oss-hermes-upstream-sync.timer",
+        "Persistent=true",
+        "weekly timer catches up after a reboot",
+    ),
+    (
+        "scripts/ops/oss_hermes_upstream_sync.py",
+        '"push", "--atomic"',
+        "sync lands both channels atomically only after matching CI",
+    ),
+    (
+        "scripts/ops/oss_hermes_upstream_sync.py",
+        "def check_install",
+        "installed timer health check",
+    ),
+    (
         "hermes_cli/config_defaults.py",
         '"skip_gateway_restart"',
         "updates.skip_gateway_restart converge default",
@@ -446,6 +471,8 @@ TEST_FILES = [
     "tests/agent/test_reset_ui_delivery_after_compaction.py",
     "tests/gateway/test_rearm_typing_after_compaction.py",
     "tests/hermes_cli/test_update_converge.py",
+    "tests/hermes_cli/test_fork_autoupdate_invariants.py",
+    "tests/scripts/test_oss_hermes_upstream_sync.py",
     "tests/hermes_cli/test_gateway_service_path_determinism.py",
     "tests/agent/test_xai_oauth_stale_403_recovery.py",
     "tests/agent/test_codex_same_account_adoption.py",
