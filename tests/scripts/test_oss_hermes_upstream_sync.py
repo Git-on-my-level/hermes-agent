@@ -7,6 +7,7 @@ from typing import Callable
 import pytest
 
 from scripts.ops import oss_hermes_upstream_sync as sync_module
+from scripts.prune_fork_branches import PRE_SYNC_RE
 
 PROD_BASELINE = "1" * 40
 MAIN_BASELINE = "2" * 40
@@ -50,8 +51,13 @@ def ci_run(sha=CANDIDATE, status="completed", conclusion="success", branch=None)
     }
 
 
-def green_handler(runner: FakeRunner, changed_paths=""):
+def green_handler(runner: FakeRunner, changed_paths="", *, same_tree=False):
     def handle(args, cwd):
+        if len(args) >= 3 and args[1] == "rev-parse" and str(args[2]).endswith("^{tree}"):
+            spec = args[2].removesuffix("^{tree}")
+            baseline = spec in {PROD_BASELINE, MAIN_BASELINE}
+            tree = "b" * 40 if same_tree or baseline else "a" * 40
+            return sync_module.Result(0, tree + "\n")
         if args[:3] == ["git", "rev-parse", "HEAD"]:
             return sync_module.Result(0, CANDIDATE + "\n")
         if args[:3] == ["git", "status", "--porcelain"]:
@@ -220,14 +226,46 @@ def test_both_archives_precede_atomic_exact_sha_dual_lease_landing(tmp_path):
                       if call[:3] == ["git", "push", "--atomic"])
     assert archive_index < land_index
     archive = runner.calls[archive_index]
-    assert f"{PROD_BASELINE}:refs/heads/archive/prod-pre-sync-20261110-020000" in archive
-    assert f"{MAIN_BASELINE}:refs/heads/archive/main-pre-sync-20261110-020000" in archive
+    prod_archive = "archive/prod-pre-sync-2026-11-10"
+    main_archive = "archive/main-pre-sync-2026-11-10"
+    assert f"{PROD_BASELINE}:refs/heads/{prod_archive}" in archive
+    assert f"{MAIN_BASELINE}:refs/heads/{main_archive}" in archive
+    assert PRE_SYNC_RE.match(prod_archive)
+    assert PRE_SYNC_RE.match(main_archive)
+    assert PRE_SYNC_RE.match("archive/prod-pre-sync-20261110-020000") is None
     assert runner.calls[land_index] == [
         "git", "push", "--atomic",
         f"--force-with-lease=refs/heads/prod:{PROD_BASELINE}",
         f"--force-with-lease=refs/heads/main:{MAIN_BASELINE}",
         "fork", f"{CANDIDATE}:refs/heads/prod", f"{CANDIDATE}:refs/heads/main",
     ]
+
+
+def test_same_day_archive_is_replaced_under_lease(tmp_path):
+    previous = "6" * 40
+    archive_pushes = {"n": 0}
+
+    def handle(args, cwd):
+        if args[:2] == ["git", "push"] and any("pre-sync" in arg for arg in args):
+            archive_pushes["n"] += 1
+            if archive_pushes["n"] == 1:
+                return sync_module.Result(1, "", "non-fast-forward")
+            assert f"--force-with-lease=refs/heads/archive/prod-pre-sync-2026-11-10:{previous}" in args
+            assert f"--force-with-lease=refs/heads/archive/main-pre-sync-2026-11-10:{previous}" in args
+            return sync_module.Result(0)
+        if args[:3] == ["git", "rev-parse", "--verify"] and any("pre-sync" in arg for arg in args):
+            return sync_module.Result(0, previous + "\n")
+        return base(args, cwd)
+
+    runner = FakeRunner()
+    base = green_handler(runner)
+    runner.handler = handle
+    engine = make_sync(tmp_path, runner)
+
+    engine.qualify_and_land()
+
+    assert archive_pushes["n"] == 2
+    assert engine.receipt.tip_verification == {"prod": CANDIDATE, "main": CANDIDATE}
 
 
 def test_actuator_delta_emits_prominent_manual_flip_receipt(tmp_path):
@@ -278,3 +316,202 @@ def test_candidate_changed_by_ci_reruns_local_and_exact_sha_ci_gates(tmp_path):
     assert gate_shas == [CANDIDATE, OTHER_SHA]
     assert engine.receipt.candidate_sha == OTHER_SHA
     assert len([call for call in runner.calls if call[:2] == ["gh", "run"]]) == 2
+
+
+def _prepare_result(args, *, ancestor):
+    """SHA and ancestry answers for ``UpstreamSync.prepare`` plus the no-op check."""
+    if args[:3] == ["git", "rev-parse", "refs/remotes/nous/main"]:
+        return sync_module.Result(0, NOUS_SHA + "\n")
+    if args[:3] == ["git", "rev-parse", "refs/remotes/fork/prod"]:
+        return sync_module.Result(0, PROD_BASELINE + "\n")
+    if args[:3] == ["git", "rev-parse", "refs/remotes/fork/main"]:
+        return sync_module.Result(0, MAIN_BASELINE + "\n")
+    if args[:3] == ["git", "rev-parse", "HEAD"]:
+        return sync_module.Result(0, NOUS_SHA + "\n")
+    if args[:4] == ["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"]:
+        return sync_module.Result(1)
+    if (len(args) >= 5 and args[:3] == ["git", "merge-base", "--is-ancestor"]
+            and args[4] == PROD_BASELINE):
+        return sync_module.Result(0 if ancestor else 1)
+    if len(args) >= 3 and args[1] == "rev-parse" and str(args[2]).endswith("^{tree}"):
+        return sync_module.Result(0, "c" * 40 + "\n")
+    return None
+
+
+def test_unchanged_upstream_does_not_rewrite_tips(tmp_path):
+    def handle(args, cwd):
+        prepared = _prepare_result(args, ancestor=True)
+        if prepared is not None:
+            return prepared
+        if args[:3] == ["git", "rev-list", "--reverse"]:
+            raise AssertionError("re-port started for an unchanged upstream")
+        return sync_module.Result(0)
+
+    runner = FakeRunner(handle)
+    engine = make_sync(tmp_path, runner)
+    engine.run()
+
+    assert engine.receipt.status == "unchanged"
+    assert engine.receipt.tip_verification == {"prod": PROD_BASELINE, "main": MAIN_BASELINE}
+    assert not any(call[:2] == ["git", "push"] for call in runner.calls)
+    assert not any(call[:2] == ["git", "cherry-pick"] for call in runner.calls)
+    sync_module.write_report(engine.config.state_root, engine.receipt)
+    report = engine.config.state_root / "reports" / "latest.md"
+    text = report.read_text(encoding="utf-8")
+    assert "tips were not rewritten" in text
+    assert "Landing is not verified" not in text
+
+
+def test_moved_upstream_still_re_ports(tmp_path):
+    def handle(args, cwd):
+        prepared = _prepare_result(args, ancestor=False)
+        if prepared is not None:
+            return prepared
+        if args[:3] == ["git", "rev-list", "--reverse"]:
+            return sync_module.Result(0, f"{'e' * 40}\n")
+        if args[:3] == ["git", "cherry", "HEAD"]:
+            return sync_module.Result(0, f"+ {args[3]}\n")
+        if args[:2] == ["git", "cherry-pick"]:
+            return sync_module.Result(1, "", "conflict")
+        if args[0] == "env":
+            return sync_module.Result(1, "", "delegate stopped")
+        return sync_module.Result(0)
+
+    runner = FakeRunner(handle)
+    engine = make_sync(tmp_path, runner)
+    with pytest.raises(sync_module.SyncError, match="delegation failed"):
+        engine.run()
+    assert any(call[:2] == ["git", "cherry-pick"] for call in runner.calls)
+
+
+def test_identical_candidate_tree_does_not_force_lease(tmp_path):
+    runner = FakeRunner()
+    runner.handler = green_handler(runner, same_tree=True)
+    engine = make_sync(tmp_path, runner)
+
+    engine.qualify_and_land()
+
+    assert engine.receipt.status == "unchanged"
+    assert engine.receipt.tip_verification == {"prod": PROD_BASELINE, "main": MAIN_BASELINE}
+    assert engine.receipt.archive_refs == {}
+    assert not any(call[:3] == ["git", "push", "--atomic"] for call in runner.calls)
+    assert not any("pre-sync" in arg for call in runner.calls for arg in call)
+
+
+def test_health_check_accepts_an_unchanged_receipt(tmp_path):
+    report = tmp_path / "reports" / "latest.json"
+    report.parent.mkdir()
+    report.write_text(json.dumps({"status": "unchanged"}), encoding="utf-8")
+    runner = FakeRunner(lambda args, cwd: sync_module.Result(
+        0, "active\n" if args[1] == "is-active" else "enabled\n" if args[1] == "is-enabled" else "[Unit]\n"))
+
+    failures = sync_module.check_install(
+        runner, state_root=tmp_path, now=report.stat().st_mtime + 13 * 60 * 60)
+    assert failures == []
+
+
+def _budget_engine(tmp_path, runner, clock):
+    engine = make_sync(tmp_path, runner)
+    engine.monotonic = lambda: clock["now"]
+    clock["deadline"] = engine.deadline
+    return engine
+
+
+def test_re_port_stops_before_the_next_keep_once_the_budget_is_spent(tmp_path):
+    clock = {"now": 0.0, "deadline": 0.0}
+    seen = []
+
+    def handle(args, cwd):
+        if args[:3] == ["git", "rev-list", "--reverse"]:
+            return sync_module.Result(0, f"{'a' * 40}\n{'b' * 40}\n")
+        if args[:3] == ["git", "cherry", "HEAD"]:
+            return sync_module.Result(0, f"+ {args[3]}\n")
+        if args[:2] == ["git", "cherry-pick"]:
+            seen.append(args[2])
+            clock["now"] = clock["deadline"]
+            return sync_module.Result(0)
+        if args[:3] == ["git", "status", "--porcelain"]:
+            return sync_module.Result(0)
+        if args[:4] == ["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"]:
+            return sync_module.Result(1)
+        raise AssertionError(args)
+
+    runner = FakeRunner(handle)
+    engine = _budget_engine(tmp_path, runner, clock)
+    with pytest.raises(sync_module.SyncError, match="10-hour budget"):
+        engine.port_kept_commits()
+    assert seen == ["a" * 40]
+
+
+def test_re_port_does_not_delegate_after_the_budget_is_spent(tmp_path):
+    clock = {"now": 0.0, "deadline": 0.0}
+
+    def handle(args, cwd):
+        if args[:3] == ["git", "rev-list", "--reverse"]:
+            return sync_module.Result(0, f"{'c' * 40}\n")
+        if args[:3] == ["git", "cherry", "HEAD"]:
+            return sync_module.Result(0, f"+ {args[3]}\n")
+        if args[:2] == ["git", "cherry-pick"]:
+            clock["now"] = clock["deadline"]
+            return sync_module.Result(1, "", "conflict")
+        raise AssertionError(args)
+
+    runner = FakeRunner(handle)
+    engine = _budget_engine(tmp_path, runner, clock)
+    with pytest.raises(sync_module.SyncError, match="10-hour budget"):
+        engine.port_kept_commits()
+    assert not any(call[0] == "env" for call in runner.calls)
+
+
+def test_yolo_retry_stops_at_the_run_budget(tmp_path):
+    clock = {"now": 0.0, "deadline": 0.0}
+    hermes_calls = {"n": 0}
+
+    def handle(args, cwd):
+        if args[:3] == ["git", "rev-list", "--reverse"]:
+            return sync_module.Result(0, f"{'d' * 40}\n")
+        if args[:3] == ["git", "cherry", "HEAD"]:
+            return sync_module.Result(0, "- equivalent\n")
+        if args[0] == "env":
+            hermes_calls["n"] += 1
+            clock["now"] = clock["deadline"]
+            return sync_module.Result(1, "", "unrecognized argument: --yolo")
+        raise AssertionError(args)
+
+    runner = FakeRunner(handle)
+    engine = _budget_engine(tmp_path, runner, clock)
+    with pytest.raises(sync_module.SyncError, match="10-hour budget"):
+        engine.port_kept_commits()
+    assert hermes_calls["n"] == 1
+
+
+def test_command_runner_inherits_and_enforces_the_sync_budget(tmp_path, monkeypatch):
+    runner = sync_module.CommandRunner()
+    sync_module.UpstreamSync(
+        sync_module.Config(source=tmp_path / "live", state_root=tmp_path / "state"),
+        sync_module.Receipt("20261110-020000", "sync/upstream-20261110-020000"),
+        runner=runner,
+        monotonic=lambda: 5.0,
+    )
+    assert runner.deadline == 5.0 + sync_module.Config().max_run_seconds
+    assert runner.monotonic() == 5.0
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return sync_module.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+    runner.deadline = 1_000.0
+    runner.monotonic = lambda: 700.0
+    runner([sync_module.HERMES, "chat", "-q", "port"], None, True)
+    assert captured["timeout"] == 300.0
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("started after the budget")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", refuse)
+    runner.monotonic = lambda: 1_000.0
+    with pytest.raises(sync_module.SyncError, match="10-hour budget"):
+        runner(["git", "status"], None, True)

@@ -50,17 +50,44 @@ class Result:
 class CommandRunner:
     """Captured subprocess execution without ever invoking a shell."""
 
+    def __init__(self) -> None:
+        self.deadline: float | None = None
+        self.monotonic: Callable[[], float] = time.monotonic
+
     def __call__(self, args: Sequence[str], cwd: Path | None = None, check: bool = True) -> Result:
         long_operation = HERMES in args or "scripts/run_tests.sh" in args
-        completed = subprocess.run(
-            list(args), cwd=cwd, check=False, capture_output=True,
-            timeout=(2 if long_operation else 0.5) * 60 * 60,
-            text=True, encoding="utf-8", errors="replace",
-        )
+        cap = (2 if long_operation else 0.5) * 60 * 60
+        timeout, budget_bound = self._timeout(cap)
+        try:
+            completed = subprocess.run(
+                list(args), cwd=cwd, check=False, capture_output=True,
+                timeout=timeout,
+                text=True, encoding="utf-8", errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            if budget_bound:
+                raise SyncError("Upstream sync exceeded its overall 10-hour budget") from exc
+            raise
         result = Result(completed.returncode, completed.stdout, completed.stderr)
         if check and result.returncode:
             raise SyncError(f"{args[0]} command exited {result.returncode}")
         return result
+
+    def _timeout(self, cap: float) -> tuple[float, bool]:
+        """Keep one command inside the run budget.
+
+        Hermes re-ports are allowed two hours each. Without this cap a call
+        started just before the deadline still runs until systemd kills the
+        unit, which skips the failed receipt.
+        """
+        if self.deadline is None:
+            return cap, False
+        remaining = self.deadline - self.monotonic()
+        if remaining <= 0:
+            raise SyncError("Upstream sync exceeded its overall 10-hour budget")
+        if remaining < cap:
+            return remaining, True
+        return cap, False
 
 
 Runner = Callable[[Sequence[str], Path | None, bool], Result]
@@ -119,8 +146,13 @@ def _markdown_report(receipt: Receipt) -> str:
     lines = [f"# Upstream sync {receipt.run_id}", "", f"**Status: {receipt.status}**", ""]
     if receipt.manual_flip_required:
         lines.extend([f"**{MANUAL_FLIP_NOTICE}**", ""])
-    if receipt.status != "landed":
+    if receipt.status not in {"landed", "unchanged"}:
         lines.extend(["**Landing is not verified; do not treat this receipt as a successful sync.**", ""])
+    if receipt.status == "unchanged":
+        lines.extend([
+            "Fork prod and main already carry this tree; tips were not rewritten.",
+            "",
+        ])
     if receipt.error:
         lines.extend([f"Failure: {receipt.error}", ""])
     lines.extend([
@@ -188,7 +220,7 @@ def check_install(
                 failures.append("last sync failed; see the latest report")
             elif status == "running" and (time.time() if now is None else now) - latest.stat().st_mtime > 12 * 60 * 60:
                 failures.append("last sync receipt is stale")
-            elif status not in {"landed", "running"}:
+            elif status not in {"landed", "running", "unchanged"}:
                 failures.append("last sync receipt has an invalid status")
         except (OSError, ValueError, TypeError):
             failures.append("last sync receipt is unreadable")
@@ -200,6 +232,16 @@ def touches_actuator(paths: Iterable[str]) -> list[str]:
     return sorted({path for path in paths if path == "hermes_cli/update_converge.py"
                    or path == "hermes_cli/update_git_target.py"
                    or path.startswith("hermes_cli/update_cmd")})
+
+
+def pre_sync_archive_ref(channel: str, run_id: str) -> str:
+    """Return ``archive/<channel>-pre-sync-YYYY-MM-DD``.
+
+    Snapshot retention keeps the newest two of those dates. A timestamp
+    suffix does not match that pattern and ages out as an ordinary branch.
+    """
+    day = datetime.strptime(run_id[:8], "%Y%m%d").date().isoformat()
+    return f"archive/{channel}-pre-sync-{day}"
 
 
 def wait_for_ci(
@@ -246,6 +288,9 @@ class UpstreamSync:
         self.control = config.state_root / "control"
         self.candidate = config.state_root / "worktrees" / receipt.run_id
         self.deadline = monotonic() + config.max_run_seconds
+        if isinstance(self.runner, CommandRunner):
+            self.runner.deadline = self.deadline
+            self.runner.monotonic = monotonic
 
     def git(self, *args: str, cwd: Path | None = None, check: bool = True) -> Result:
         return self.runner(["git", *args], cwd=cwd or self.control, check=check)
@@ -255,9 +300,13 @@ class UpstreamSync:
 
     def run(self) -> None:
         self.prepare()
+        if self._tips_already_match_source():
+            self._leave_tips_unchanged()
+            return
         self.port_kept_commits()
         self.qualify_and_land()
-        self.receipt.status = "landed"
+        if self.receipt.status == "running":
+            self.receipt.status = "landed"
 
     def prepare(self) -> None:
         source = self.config.source.resolve()
@@ -299,6 +348,10 @@ class UpstreamSync:
             cwd=self.candidate,
         ).splitlines()
         for commit in commits:
+            # A conflicted keep can run Hermes for two hours. Stop before the
+            # next one so the 10-hour budget is recorded before systemd's
+            # 12-hour TimeoutStartSec leaves a stale running receipt.
+            self.remaining_seconds()
             equivalent = self.git_text("cherry", "HEAD", commit, f"{commit}^", cwd=self.candidate)
             if equivalent.startswith("-"):
                 self.delegate(commit, "The kept delta is patch-equivalent to an upstream change; decide retirement.")
@@ -309,6 +362,7 @@ class UpstreamSync:
             self.assert_clean_candidate()
 
     def delegate(self, commit: str, reason: str) -> None:
+        self.remaining_seconds()
         prompt = f"""{reason}
 Kept fork commit: {commit}.
 Work only in this candidate worktree: {self.candidate}. Do not modify any other checkout or worktree.
@@ -321,6 +375,7 @@ A retirement must leave no active cherry-pick or sequencer state. Do not prepare
         isolated = self.delegation_command(prompt, yolo=True)
         result = self.runner(isolated, self.candidate, False)
         if result.returncode and _unsupported_yolo(result):
+            self.remaining_seconds()
             isolated = self.delegation_command(prompt, yolo=False)
             result = self.runner(isolated, self.candidate, False)
         if result.returncode:
@@ -364,6 +419,37 @@ A retirement must leave no active cherry-pick or sequencer state. Do not prepare
             "merge-base", "--is-ancestor", self.receipt.source_sha, expected_sha,
             cwd=self.candidate,
         )
+
+    def _tips_already_match_source(self) -> bool:
+        """True when replaying would only mint new SHAs for the current trees.
+
+        Cherry-pick keeps the author and stamps a new committer time, so a
+        week whose upstream is already in prod republishes both channels and
+        every exact-SHA converge tick drains the fleet for an empty tree.
+        """
+        source = self.receipt.source_sha
+        prod = self.receipt.target_prod_sha
+        main = self.receipt.target_main_sha
+        assert source and prod and main
+        contained = self.git("merge-base", "--is-ancestor", source, prod, check=False)
+        if contained.returncode:
+            return False
+        return self._tree_oid(prod) == self._tree_oid(main)
+
+    def _candidate_matches_published_trees(
+            self, candidate_sha: str, prod: str, main: str) -> bool:
+        candidate_tree = self._tree_oid(candidate_sha, cwd=self.candidate)
+        return candidate_tree == self._tree_oid(prod) == self._tree_oid(main)
+
+    def _tree_oid(self, rev: str, cwd: Path | None = None) -> str:
+        return self.git_text("rev-parse", f"{rev}^{{tree}}", cwd=cwd)
+
+    def _leave_tips_unchanged(self) -> None:
+        prod = self.receipt.target_prod_sha
+        main = self.receipt.target_main_sha
+        assert prod and main
+        self.receipt.status = "unchanged"
+        self.receipt.tip_verification = {"prod": prod, "main": main}
 
     def remaining_seconds(self) -> int:
         remaining = self.deadline - self.monotonic()
@@ -428,14 +514,16 @@ A retirement must leave no active cherry-pick or sequencer state. Do not prepare
             raise SyncError("fork/prod moved after Fork CI; refusing to archive or land")
         if self.git_text("rev-parse", "refs/remotes/fork/main") != main_baseline:
             raise SyncError("fork/main moved after Fork CI; refusing to archive or land")
+        if self._candidate_matches_published_trees(
+                candidate_sha, prod_baseline, main_baseline):
+            self._leave_tips_unchanged()
+            return
         archives = {
-            "prod": f"archive/prod-pre-sync-{self.receipt.run_id}",
-            "main": f"archive/main-pre-sync-{self.receipt.run_id}",
+            "prod": pre_sync_archive_ref("prod", self.receipt.run_id),
+            "main": pre_sync_archive_ref("main", self.receipt.run_id),
         }
-        self.git(
-            "push", "fork", f"{prod_baseline}:refs/heads/{archives['prod']}",
-            f"{main_baseline}:refs/heads/{archives['main']}", cwd=self.candidate,
-        )
+        baselines = {"prod": prod_baseline, "main": main_baseline}
+        self._push_pre_sync_archives(archives, baselines)
         self.receipt.archive_refs = archives
         self.git(
             "push", "--atomic",
@@ -450,6 +538,38 @@ A retirement must leave no active cherry-pick or sequencer state. Do not prepare
         if prod_tip != candidate_sha or main_tip != candidate_sha:
             raise SyncError("Remote tip verification failed after the atomic landing")
         self.receipt.tip_verification = {"prod": prod_tip, "main": main_tip}
+
+    def _push_pre_sync_archives(self, archives: dict[str, str], baselines: dict[str, str]) -> None:
+        """Publish the date-only snapshot pair, moving that date if it exists.
+
+        A second run on the same day reuses the names prune keeps. The update
+        is leased to the SHA just fetched so a ref that moved is left alone.
+        """
+        specs = [f"{baselines[channel]}:refs/heads/{ref}" for channel, ref in archives.items()]
+        pushed = self.git("push", "fork", *specs, cwd=self.candidate, check=False)
+        if not pushed.returncode:
+            return
+        self.git(
+            "fetch", "--no-tags", "fork",
+            *(f"+refs/heads/{ref}:refs/remotes/fork/{ref}" for ref in archives.values()),
+            cwd=self.candidate,
+        )
+        argv = ["push"]
+        updates: list[str] = []
+        for channel, ref in archives.items():
+            baseline = baselines[channel]
+            remote = self.git(
+                "rev-parse", "--verify", f"refs/remotes/fork/{ref}",
+                cwd=self.candidate, check=False,
+            )
+            current = remote.stdout.strip()
+            if remote.returncode == 0 and current == baseline:
+                continue
+            if remote.returncode == 0 and len(current) == 40:
+                argv.append(f"--force-with-lease=refs/heads/{ref}:{current}")
+            updates.append(f"{baseline}:refs/heads/{ref}")
+        if updates:
+            self.git(*argv, "fork", *updates, cwd=self.candidate)
 
     def _fetch_fork_channels(self) -> None:
         self.git(
@@ -514,6 +634,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Upstream sync failed: {exc}", file=sys.stderr)
         return 1
     write_report(config.state_root, receipt)
+    if receipt.status == "unchanged":
+        print("Fork prod and main already carry this tree; tips were not rewritten")
+        return 0
     print(f"Landed and verified {receipt.candidate_sha} on fork prod and main")
     if receipt.manual_flip_required:
         print(MANUAL_FLIP_NOTICE)
