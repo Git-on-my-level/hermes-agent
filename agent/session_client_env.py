@@ -47,7 +47,7 @@ def configured_names(config, key=CONFIG_KEY) -> frozenset:
     return frozenset(name.strip() for name in raw if isinstance(name, str) and name.strip()) if isinstance(raw, list) else frozenset()
 
 
-def _secret_names(config) -> frozenset:
+def configured_secret_names(config) -> frozenset:
     """Exact operator opt-ins; never control names or Hermes-owned credentials."""
     from tools.env_passthrough import _is_hermes_provider_credential
     return frozenset(name for name in configured_names(config, SECRET_CONFIG_KEY)
@@ -73,7 +73,7 @@ def client_env_rules(config, *, local=True) -> dict:
     return {'behaviour': [n for n in BEHAVIOUR_ENV if local or n not in HOST_BEHAVIOUR],
             'names': sorted(set(TOOL_ENV) | configured_names(config)) if local else [],
             'prefixes': list(TOOL_ENV_PREFIXES) if local else [], 'secret': list(_SECRET_SUBSTRINGS),
-            'secret_names': sorted(_secret_names(config)) if local else []}
+            'secret_names': sorted(configured_secret_names(config)) if local else []}
 
 
 def _kept(name: str, rules: dict) -> bool:

@@ -77,9 +77,9 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     from gateway.session_context import _VAR_MAP  # the launching turn's session identity, too
     from tools.environments.local_env_policy import carry_gateway_profile_pin
     carry_gateway_profile_pin(env)  # the supervisor markers go; the daemon's tools keep their pin
-    from agent.session_client_env import configured_names, SECRET_CONFIG_KEY
+    from agent.session_client_env import configured_secret_names
     from hermes_cli.config_effective import load_user_config_effective
-    client_secret_names = configured_names(load_user_config_effective(home / 'config.yaml'), SECRET_CONFIG_KEY)
+    client_secret_names = configured_secret_names(load_user_config_effective(home / 'config.yaml'))
     for key in (*DAEMON_STRIPPED_ENV, *_VAR_MAP, *client_secret_names):
         env.pop(key, None)
     remaining(deadline)
