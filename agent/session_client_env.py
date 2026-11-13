@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -28,6 +29,7 @@ TOOL_ENV = ('PATH', 'VIRTUAL_ENV', 'GOPATH', 'GOROOT', 'CARGO_HOME', 'RUSTUP_HOM
 TOOL_ENV_PREFIXES = ('CONDA_', 'NODE_', 'NVM_', 'PYENV_')
 # ``terminal.client_env_passthrough`` names more non-secret toolchain variables for a profile.
 CONFIG_KEY = 'client_env_passthrough'
+SECRET_CONFIG_KEY = 'client_env_passthrough_secrets'
 # The session-start notice of a session whose client the gateway could not place on its own host.
 NOT_LOCAL_WARNING = ("this session uses the gateway's own PATH, toolchain and prefill file: the client's environment "
                      'was not applied because the client is not attached to this gateway locally.')
@@ -38,11 +40,20 @@ _MAX_BYTES = 256 * 1024
 _BOUND: ContextVar = ContextVar('session_client_env', default=None)
 
 
-def configured_names(config) -> frozenset:
+def configured_names(config, key=CONFIG_KEY) -> frozenset:
     """The profile's extra tool names (``terminal.client_env_passthrough``)."""
     terminal = config.get('terminal') if isinstance(config, dict) else None
-    raw = terminal.get(CONFIG_KEY) if isinstance(terminal, dict) else None
+    raw = terminal.get(key) if isinstance(terminal, dict) else None
     return frozenset(name.strip() for name in raw if isinstance(name, str) and name.strip()) if isinstance(raw, list) else frozenset()
+
+
+def _secret_names(config) -> frozenset:
+    """Exact operator opt-ins; never control names or Hermes-owned credentials."""
+    from tools.env_passthrough import _is_hermes_provider_credential
+    return frozenset(name for name in configured_names(config, SECRET_CONFIG_KEY)
+                     if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name)
+                     and not name.upper().startswith(('HERMES_', '_HERMES_'))
+                     and not _is_hermes_provider_credential(name))
 
 
 def _travels(name: str, secret=None) -> bool:
@@ -61,11 +72,12 @@ def client_env_rules(config, *, local=True) -> dict:
     from tools.code_execution_env import _SECRET_SUBSTRINGS
     return {'behaviour': [n for n in BEHAVIOUR_ENV if local or n not in HOST_BEHAVIOUR],
             'names': sorted(set(TOOL_ENV) | configured_names(config)) if local else [],
-            'prefixes': list(TOOL_ENV_PREFIXES) if local else [], 'secret': list(_SECRET_SUBSTRINGS)}
+            'prefixes': list(TOOL_ENV_PREFIXES) if local else [], 'secret': list(_SECRET_SUBSTRINGS),
+            'secret_names': sorted(_secret_names(config)) if local else []}
 
 
 def _kept(name: str, rules: dict) -> bool:
-    return name in rules['behaviour'] or (_travels(name, rules['secret']) and (
+    return name in rules['behaviour'] or name in rules.get('secret_names', ()) or (_travels(name, rules['secret']) and (
         name in rules['names'] or name.startswith(tuple(rules['prefixes']))))
 
 
@@ -141,7 +153,36 @@ def tool_env() -> dict[str, str]:
     bound = _BOUND.get()
     if bound is None or not bound[1]:
         return {}
-    return {name: value for name, value in bound[0].items() if name not in BEHAVIOUR_ENV and _travels(name)}
+    secret_names = (bound[2] or {}).get('secret_names', ())
+    return {name: value for name, value in bound[0].items()
+            if name not in BEHAVIOUR_ENV and name not in secret_names and _travels(name)} | session_secret_env()
+
+
+def session_secret_env() -> dict[str, str]:
+    """Only this local session's explicitly admitted values, never a profile/env fallback.
+
+    Recheck credential ownership at use time, just as terminal.env_passthrough does.
+    Old frozen rules carry no opt-in. No values or names are registered globally.
+    """
+    from tools.env_passthrough import _is_hermes_provider_credential
+    bound = _BOUND.get()
+    if bound is None or not bound[1] or bound[2] is None:
+        return {}
+    return {name: bound[0][name] for name in bound[2].get('secret_names', ())
+            if name in bound[0] and not _is_hermes_provider_credential(name)}
+
+
+def apply_session_secrets(env, *, excluded=()):
+    """Replace every declared name, including absent values, after profile passthrough.
+
+    A profile-level opt-in must never resurrect the gateway's credential for an
+    empty client session or replace a client's credential with the profile's.
+    """
+    bound = _BOUND.get()
+    if bound is not None and bound[1] and bound[2] is not None:
+        for name in bound[2].get('secret_names', ()):
+            env.pop(name, None)
+        env.update((k, v) for k, v in session_secret_env().items() if k not in excluded)
 
 
 def toolchain_environ(base=None) -> dict[str, str]:
@@ -165,6 +206,7 @@ def toolchain_environ(base=None) -> dict[str, str]:
         return env
     rules = bound[2] or {'names': TOOL_ENV, 'prefixes': TOOL_ENV_PREFIXES, 'secret': None}
     names = {name for name in rules['names'] if _travels(name, rules['secret'])}
+    names.update(rules.get('secret_names', ()))
     prefixes = tuple(rules['prefixes'])
     kept = {k: v for k, v in env.items() if k == 'PATH' or not (k in names or k.startswith(prefixes))}
     return kept | tool_env()
