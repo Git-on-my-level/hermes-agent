@@ -6,6 +6,7 @@ thread (an undrained pipe would block the child), redacts every line before it t
 and keeps ``<home>/logs/managed-worker.log`` private (0600) and capped at
 ``MAX_LOG_BYTES`` plus one rotated copy.
 """
+import json
 import logging
 import os
 from pathlib import Path
@@ -20,6 +21,16 @@ MAX_LINE_BYTES = 64 * 1024
 KEPT_LINE_CHARS = 4096
 _locks = {}
 _locks_guard = threading.Lock()
+
+
+def bootstrap_log_secrets(frame):
+    """Exact values the child is about to receive, installed before bootstrap send."""
+    policy = frame['policy']
+    env = json.loads(policy.get('client_env_json') or '{}')
+    rules = json.loads(policy.get('client_env_rules_json') or '{}')
+    values = [frame['api_key'], frame['scope']['secret']]
+    values.extend(env[name] for name in rules.get('secret_names', ()) if name in env)
+    return [value for value in values if isinstance(value, str) and value]
 
 
 def worker_log_path(profile_id):
@@ -63,7 +74,7 @@ def _redact(line, scrub):
 
 def drain_worker_stderr(stream, path, pid, scrub):
     """Thread body: read ``stream`` to EOF; ``scrub()`` returns this worker's exact secrets
-    (launch key, assignment secret) known so far. Never stops reading on a write failure."""
+    (launch key, assignment secret, client secrets) known so far. Never stops reading on a write failure."""
     skipping = False
     warned = False
     try:

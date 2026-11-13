@@ -2,6 +2,7 @@
 private, redacted, size-capped ``logs/managed-worker.log`` instead of being discarded."""
 import asyncio
 import io
+import json
 import stat
 import subprocess
 import sys
@@ -52,3 +53,19 @@ def test_worker_log_is_bounded_and_scrubs_the_workers_exact_secrets(tmp_path):
     assert not list(path.parent.glob(LOG_NAME + '.2'))
     text = ''.join(f.read_text() for f in files)
     assert assignment not in text and '[truncated]' in text and text.endswith('[pid 7] last\n')
+
+
+def test_bootstrap_client_secrets_are_redacted_from_worker_log(tmp_path):
+    from gateway.session_managed_worker_log import bootstrap_log_secrets, drain_worker_stderr
+    client = {'MULTICA_TOKEN': 'opaque-client-value', 'MULTICA_TASK_CONFIG_ROOT': '/private/task-config-location'}
+    frame = {'api_key': 'opaque-model-key', 'scope': {'secret': 'opaque-assignment'}, 'policy': {
+        'client_env_json': json.dumps(client), 'client_env_rules_json': json.dumps({'secret_names': list(client)})}}
+    secrets = bootstrap_log_secrets(frame)
+    assert set(secrets) == {*client.values(), frame['api_key'], frame['scope']['secret']}
+    path = tmp_path / 'logs' / 'managed-worker.log'
+    drain_worker_stderr(io.BytesIO(('RuntimeError: ' + ' '.join(secrets) + '\n').encode()), path, 7, lambda: secrets)
+    text = path.read_text()
+    assert 'RuntimeError:' in text
+    assert all(value not in text for value in secrets)
+    # Legacy and empty-client bootstrap frames still redact the worker's own keys.
+    assert bootstrap_log_secrets({**frame, 'policy': {}}) == [frame['api_key'], frame['scope']['secret']]

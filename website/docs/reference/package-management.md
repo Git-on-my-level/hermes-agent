@@ -33,6 +33,14 @@ loading application dependencies. Failed syncs keep the previous selection and
 retry on the next launch; no pending-update marker is required. Developer checkouts
 and packaged installations retain their existing owner.
 
+A task-specific `HERMES_HOME` may borrow a shared source checkout. Its dependency
+state remains scoped to that task, while the checkout's published `hermes` and
+`hermes-acp` launchers use the recorded installation owner's tools. This also
+repairs wrappers previously bound to a task interpreter. A missing owner Python
+must be repaired in the owning install; publication does not substitute a task's
+runtime store. Cleaning up the task home therefore leaves the shared commands
+usable. Unowned fresh checkouts retain their existing runtime-store fallback.
+
 Historical updaters can still execute old Python code after replacing the source
 tree. Compatibility entry points start a fresh child, wait for completion, and
 return its exit status. The child bootstrap asks PM to provision required tools

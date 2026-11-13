@@ -251,11 +251,25 @@ terminal:
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
+  client_env_passthrough_secrets: []  # Exact names from a local CLI/TUI/ACP client; session-only credential opt-in
   client_env_passthrough: []  # Extra non-secret toolchain names (e.g. GEM_HOME) a local CLI/TUI session's tools take from its launching shell
   sync_back_max_bytes: 2147483648  # Remote backends: refuse to extract a state archive larger than this (bytes)
   modal_image: "nousresearch/hermes-sandbox:desktop"                 # Container image for Modal backend
   daytona_image: "nousresearch/hermes-sandbox:desktop"               # Container image for Daytona backend
 ```
+
+`terminal.client_env_passthrough_secrets` defaults to an empty list. List exact
+variable names (for example, `MULTICA_TOKEN` and `MULTICA_TASK_CONFIG_ROOT`),
+not wildcard patterns. A local CLI/TUI/ACP client sends these values at session
+creation; the gateway checks its own profile's list and freezes the accepted map
+with that session's private policy. Values are not logged or exposed in public
+session metadata, and never enter the shared gateway's `os.environ`. They remain
+in the existing private session-policy store so the session can resume; protect
+that store as you would other session credentials. Tool children receive only
+that session's values, including when `terminal.env_passthrough` also lists the
+name. An omitted name stays unset. Hermes-owned credentials and control names
+remain blocked, and clients without a gateway-proven local attachment cannot
+forward these values. Start a new session after changing the list.
 
 `terminal.temp_dir` controls where Hermes puts session temp artifacts on the
 local backend — background-process logs/pid/exit files, code-execution

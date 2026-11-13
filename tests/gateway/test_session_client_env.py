@@ -418,12 +418,16 @@ def test_auto_started_gateway_does_not_inherit_client_behaviour_env(tmp_path, mo
     from hermes_cli import gateway_runtime_start
     home = tmp_path / 'home'
     home.mkdir()
+    (home / 'config.yaml').write_text('terminal:\n  client_env_passthrough_secrets: [MULTICA_TOKEN, OPENAI_API_KEY]\n')
+    monkeypatch.setenv('MULTICA_TOKEN', 'from-the-first-client')
+    (home / '.env').write_text('OPENAI_API_KEY=gateway-provider-value\n')
     captured = {}
 
     def popen(command, **kwargs):
         captured.update(kwargs['env'])
         return SimpleNamespace(pid=1)
     monkeypatch.setattr(gateway_runtime_start.subprocess, 'Popen', popen)
+    monkeypatch.setattr(gateway_runtime_start, 'start_gateway_job', lambda *args, **kwargs: None)
     for name in ('HERMES_EPHEMERAL_SYSTEM_PROMPT', 'HERMES_PREFILL_MESSAGES_FILE', 'HERMES_INFERENCE_PROVIDER',
                  'HERMES_ENABLE_PROJECT_PLUGINS', 'HERMES_TUI_CLIENT_ENV'):
         monkeypatch.setenv(name, 'from-the-first-client')
@@ -431,4 +435,5 @@ def test_auto_started_gateway_does_not_inherit_client_behaviour_env(tmp_path, mo
     gateway_runtime_start.spawn_unmanaged_gateway(home, deadline=time.monotonic() + 30)
     leaked = sorted(name for name, value in captured.items() if value == 'from-the-first-client')
     assert leaked == []
+    assert captured['OPENAI_API_KEY'] == 'gateway-provider-value'  # rejected client opt-in cannot disable gateway auth
     assert captured['PATH']  # the daemon still needs a PATH of its own
