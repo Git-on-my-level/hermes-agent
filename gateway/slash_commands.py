@@ -125,7 +125,7 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     return data
 
 
-def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
+def _spawn_detached_update(hermes_cmd, output_path, exit_code_path, *, env=None) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
     setsid is portable (works where ``systemd-run --user`` lacks a D-Bus session); ``--gateway``
     enables file-based IPC so interactive prompts are forwarded; PYTHONUNBUFFERED lets the gateway
@@ -136,11 +136,13 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     import subprocess
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+        command = hermes_cmd if env is not None else [sys.executable, "-m", "hermes_cli.main"]
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
-             sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+             *command, "update", "--gateway"],
             # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs(),
+            **({"env": env} if env is not None else {}))
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
     update_cmd = (
@@ -156,7 +158,8 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
     # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                     **({"env": env} if env is not None else {}))
 
 
 def _home_thread_from_source(source) -> Optional[str]:
@@ -1358,9 +1361,18 @@ class GatewaySlashCommandsMixin(
 
         git_dir = project_root / '.git'
 
-        if not git_dir.exists():
-            return t("gateway.update.not_git_repo")
-        hermes_cmd = _resolve_hermes_bin()
+        update_env = None
+        if git_dir.exists():
+            hermes_cmd = _resolve_hermes_bin()
+        else:
+            from gateway.update_source import snapshot_update_command
+            hermes_cmd = snapshot_update_command(project_root)
+            if not hermes_cmd:
+                return t("gateway.update.not_git_repo")
+            # The serving launcher pins this to the snapshot. Let the checkout's
+            # updater resolve its own install stamp and bootstrap root instead.
+            update_env = dict(os.environ)
+            update_env.pop("HERMES_INSTALL_ROOT", None)
         if not hermes_cmd:
             return t("gateway.update.hermes_cmd_not_found")
         pending_path = _hermes_home / ".update_pending.json"
@@ -1379,7 +1391,8 @@ class GatewaySlashCommandsMixin(
         _tmp_pending.replace(pending_path)
         exit_code_path.unlink(missing_ok=True)
         try:
-            _spawn_detached_update(hermes_cmd, output_path, exit_code_path)
+            _spawn_detached_update(hermes_cmd, output_path, exit_code_path,
+                                   **({"env": update_env} if update_env is not None else {}))
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
