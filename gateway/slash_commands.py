@@ -71,11 +71,6 @@ _WINDOWS_UPDATE_HELPER = """
 import os, subprocess, sys
 output_path, exit_code_path, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
 env = dict(os.environ, PYTHONUNBUFFERED="1")
-if cmd and os.path.splitext(cmd[0])[1].lower() in (".cmd", ".bat"):
-    # CreateProcessW cannot start a batch file (WinError 193). A checkout whose
-    # launcher was published as hermes.cmd (distlib unavailable) must run through
-    # cmd.exe /c. Only Windows publishes .cmd launchers, so this is inert elsewhere.
-    cmd = [os.environ.get("COMSPEC") or "cmd.exe", "/c", *cmd]
 with open(output_path, "wb") as f:
     rc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env).wait(timeout=3600)
 # Temp + replace: the gateway watcher polls the exit code and reads an empty file as failure.
