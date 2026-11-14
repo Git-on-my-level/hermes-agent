@@ -32,7 +32,7 @@ def _snapshot(tmp_path, checkout):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("proof", ["pointer", "legacy", "legacy_launcher", "wrong_key", "no_git", "no_launcher", "not_snapshot", "stock"])
 async def test_update_uses_only_proven_checkout(tmp_path, monkeypatch, proof):
-    import gateway.run as run
+    from gateway import run
     import gateway.slash_commands as slash
     from gateway.slash_commands import t
 
@@ -62,7 +62,7 @@ async def test_update_uses_only_proven_checkout(tmp_path, monkeypatch, proof):
         path_command = str(wrapper)
     else:
         path_command = None
-    monkeypatch.setattr("shutil.which", lambda name: path_command if name == "hermes" else None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: path_command if name == "hermes" else None)
     monkeypatch.setattr(slash, "__file__", str(source / "gateway" / "slash_commands.py"))
     monkeypatch.setattr(run, "_hermes_home", tmp_path)
     monkeypatch.setenv("HERMES_INSTALL_ROOT", str(source))

@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
-import shutil
+
+from hermes_platform.resolver import locate_command
 
 
 def snapshot_update_command(source: Path) -> list[str] | None:
@@ -33,9 +34,9 @@ def snapshot_update_command(source: Path) -> list[str] | None:
         # Compatibility with installs published before the checkout pointer.
         candidates.extend(state.parent.parent.iterdir())
         try:
-            command = shutil.which("hermes")
-            if command:
-                launcher = Path(command).resolve()
+            resolved = locate_command("hermes")
+            if resolved.found:
+                launcher = Path(resolved.command[0]).resolve()
                 if launcher.suffix.lower() not in {".exe", ".cmd"}:
                     # POSIX convenience wrappers are: #!/bin/sh; exec <launcher> "$@".
                     words = shlex.split(launcher.read_text(encoding="utf-8-sig"), comments=True)
