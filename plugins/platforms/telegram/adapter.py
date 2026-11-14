@@ -2687,7 +2687,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             from hermes_constants import get_hermes_home
             config_path = get_hermes_home() / "config.yaml"
             with _dm_topic_config_lock(config_path):
-                if not config_path.exists():
+                if not config_path.exists():  # config-reader: ok — presence probe before raw config update
                     logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
                     return
                 from hermes_cli.config import atomic_config_write, read_user_config_raw

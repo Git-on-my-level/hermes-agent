@@ -1,8 +1,10 @@
 # Fork maintenance
 
 These rules are mandatory for source, sync, and deployment work. They make the
-Hermes fork reviewable; they do **not** authorize a sync, deployment, or gateway
-restart.
+Hermes fork reviewable. Ad-hoc commands do not authorize a sync, deployment, or
+gateway restart; the separately reviewed weekly timer below is the standing,
+bounded exception for upstream synchronization and tip landing, never gateway
+lifecycle operations.
 
 ## Remote and overlay contract
 
@@ -210,6 +212,67 @@ scripts/fork_ci_apply.sh
 Keep-list files: `fork-ci.yml`, `scripts/fork_ci_apply.sh`. Sync conflict
 surface is zero against `ci.yaml`.
 
+## Automatic weekly sync and fleet pickup
+
+`oss-hermes-upstream-sync.timer` is a persistent system calendar on oss-01, not
+Hermes cron and not a prepare-only job. Every Tuesday at 02:00 UTC (plus a
+missed run after reboot) it creates a scratch worktree, fetches `nous/main` and
+GitHub `fork/{prod,main}` directly, and re-ports the keep-list. A kept delta may
+retire only after its existing contract test passes without that delta. The
+orchestrator never modifies the running gateway checkout and never restarts a
+gateway.
+
+For one exact candidate SHA it requires in order:
+
+1. `scripts/check_fork_features.py` and the auto-update invariants, including
+   failed-fetch-is-not-current and `skip_gateway_restart`;
+2. a successful push-triggered **Fork CI** run whose branch and head SHA both
+   match that candidate;
+3. unchanged prod/main baselines, archival of **both** old tips, then one atomic
+   dual force-with-lease of that candidate to `prod` and `main`, followed by a
+   remote-tip readback. No human landing step and no `gh pr merge`/approve.
+
+The implementation and units are `scripts/ops/oss_hermes_upstream_sync.py`,
+`scripts/ops/oss-hermes-upstream-sync.service`, and
+`scripts/ops/oss-hermes-upstream-sync.timer`. Reports land under
+`/var/lib/oss-hermes-upstream-sync/reports/`. Do not delete or downgrade the
+timer into a proposal job. Its runnable health check is:
+
+```bash
+sudo /usr/bin/python3 /usr/local/lib/oss-hermes-upstream-sync/oss_hermes_upstream_sync.py check-install
+```
+
+After merging and allowing the reviewed `fork/prod` tip to reach oss-01, the
+coordinator installs the current inputs without starting the service, then
+enables only the timer from a root shell on oss-01:
+
+```bash
+sudo /usr/bin/python3 /home/ubuntu/.hermes/hermes-agent/scripts/ops/oss_hermes_upstream_sync.py install
+sudo systemctl daemon-reload
+sudo systemctl enable --now oss-hermes-upstream-sync.timer
+sudo /usr/bin/python3 /usr/local/lib/oss-hermes-upstream-sync/oss_hermes_upstream_sync.py check-install
+```
+
+### Actuator updates require one manual flip
+
+If a sync changes `hermes_cli/update_converge.py`, `update_git_target.py`, or an
+`update_cmd*` actuator, its report says `MANUAL_FLIP_REQUIRED`. The tip still
+lands automatically, but old fleet ticks are not trusted to apply a changed
+actuator. For that one land, run the coordinator's established manual flip to
+reinstall each follower's converge ticker and set missing `updates.remote:
+fork`, `updates.branch: prod`, and `updates.converge: true`; preserve named
+opt-outs only after revalidating their current policy. Verify Air explicitly
+retains `updates.skip_gateway_restart: true` before moving a tip. Subsequent
+updates return to the automatic 30-minute tick.
+
+The converge unit prefers the PM-published `<checkout>/.hermes/bin/hermes`
+launcher over a generation venv whose removal would otherwise leave launchd
+reporting a missing executable. A healthy host must have a loaded converge
+unit, a successful recent tick, and a freshly fetched remote tip; seeing
+`already_current` does not waive fetch or staleness verification.
+`hermes converge status --assert-current` fetches the channel itself and fails
+with `channel_fetch_failed` instead of accepting a stale tracking ref.
+
 ## Documentation verification
 
 ```bash
@@ -231,9 +294,11 @@ onto the sync branch when clean; an already represented patch is a no-op.
 A conflict is aborted without changing the sync tip. Multiple commits or a
 rebased prod tip stop for review of the new delta, not another full re-port.
 After absorption, rerun focused tests and record the new prod SHA. Repeat the
-check immediately before the coordinator lands the PR if prod moved again.
-The script never pushes; it does not eliminate the final fetch-to-merge race,
-so the coordinator must recheck at merge time too. Never force-push prod.
+check immediately before a manual handoff if prod moved again. The automatic
+weekly orchestrator performs its own baseline recheck after CI. This script
+never pushes and does not eliminate the final fetch-to-land race; the atomic
+leases in the orchestrator are the last guard. Ad-hoc sync work must never
+force-push prod.
 
 ## Assert the running release
 

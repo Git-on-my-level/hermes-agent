@@ -43,3 +43,39 @@ def test_status_reports_checkout_and_running_code(update_tree, tmp_path, monkeyp
     # Busy or restart opt-out still cannot pass the independent release assertion.
     args.assert_current = False
     converge.cmd_converge(args)
+
+
+def test_channel_status_fetches_and_failed_fetch_is_not_current(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    settings = converge.ConvergeSettings(
+        enabled=True, pin="", interval=1800, busy_sla=21600,
+        skip_gateway_restart=False, remote="fork", branch="prod",
+    )
+    monkeypatch.setattr(converge, "load_converge_settings", lambda: settings)
+    monkeypatch.setattr(converge, "checkout_sha", lambda root: "a" * 40)
+    monkeypatch.setattr(converge, "live_code_sha", lambda: "a" * 40)
+    monkeypatch.setattr(converge, "channel_tip_sha", lambda *args: "a" * 40)
+    monkeypatch.setattr(converge, "checkout_is_dirty", lambda root: False)
+    monkeypatch.setattr(converge, "gateway_is_busy", lambda: False)
+    monkeypatch.setattr(converge, "pin_age_seconds", lambda *args: 0.0)
+    fetches = []
+
+    def failed_fetch(root, remote, branch):
+        fetches.append((root, remote, branch))
+        return False
+
+    monkeypatch.setattr(converge, "fetch_channel_tip", failed_fetch)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    args = SimpleNamespace(converge_action="status", assert_current=True)
+
+    with pytest.raises(SystemExit) as exc:
+        converge.cmd_converge(args)
+
+    assert exc.value.code == 1
+    assert fetches == [(tmp_path, "fork", "prod")]
+    out = capsys.readouterr().out
+    assert "match=NO" in out
+    assert "reason=channel_fetch_failed" in out
+    assert "already_current" not in out

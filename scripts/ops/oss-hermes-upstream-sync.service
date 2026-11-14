@@ -1,0 +1,24 @@
+[Unit]
+Description=Synchronize NousResearch main into the reviewed fork
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/lib/oss-hermes-upstream-sync
+ExecStart=/usr/bin/python3 /usr/local/lib/oss-hermes-upstream-sync/oss_hermes_upstream_sync.py run
+StateDirectory=oss-hermes-upstream-sync
+StateDirectoryMode=0700
+TimeoutStartSec=12h
+TimeoutStopSec=5min
+UMask=0077
+NoNewPrivileges=true
+ReadOnlyPaths=/home/ubuntu/.hermes/hermes-agent
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

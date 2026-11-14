@@ -485,13 +485,23 @@ def converge_plist_path() -> Path:
 
 
 def _service_venv_dir() -> str:
-    """Venv that owns the ``hermes`` launcher for the converge unit."""
+    """Venv for legacy source checkouts without a PM-published launcher."""
     from hermes_cli.gateway import PROJECT_ROOT, _pm_runtime_venv_dir
 
     venv = _pm_runtime_venv_dir(PROJECT_ROOT)
     if venv is not None:
         return str(venv)
     return str(Path(PROJECT_ROOT) / ".venv")
+
+
+def _service_hermes_bin() -> str:
+    """PM launcher survives runtime moves; never strand the out-of-tree tick on an old venv."""
+    from hermes_cli.gateway import PROJECT_ROOT
+
+    published = Path(PROJECT_ROOT) / ".hermes" / "bin" / "hermes"
+    if published.is_file():
+        return str(published)
+    return str(Path(_service_venv_dir()) / "bin" / "hermes")
 
 
 def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[ConvergeSettings, str, str, str, Path]:
@@ -502,7 +512,7 @@ def _converge_exec_env(settings: Optional[ConvergeSettings] = None) -> tuple[Con
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     venv_dir = _service_venv_dir()
-    hermes_bin = str(Path(venv_dir) / "bin" / "hermes")
+    hermes_bin = _service_hermes_bin()
     return settings, hermes_home, venv_dir, hermes_bin, log_dir
 
 
@@ -726,11 +736,15 @@ def cmd_converge(args: Any) -> None:
         settings = load_converge_settings()
         from hermes_cli.main import PROJECT_ROOT
 
+        channel_fetch_ok = True
+        if settings.enabled and not settings.pin:
+            channel_fetch_ok = fetch_channel_tip(PROJECT_ROOT, settings.remote, settings.branch)
         checkout = checkout_sha(PROJECT_ROOT)
         live = live_code_sha()
         target = settings.pin or channel_tip_sha(PROJECT_ROOT, settings.remote, settings.branch)
-        matches = prefixes_match(checkout, target) and prefixes_match(live, target)
-        d = decide_from_live(PROJECT_ROOT, settings)
+        matches = (channel_fetch_ok and prefixes_match(checkout, target)
+                   and prefixes_match(live, target))
+        d = decide_from_live(PROJECT_ROOT, settings, channel_fetch_ok=channel_fetch_ok)
         print(f"checkout_sha={checkout or 'unknown'} live_sha={live or 'unknown'} target_sha={target or 'unknown'}")
         print(f"match={'YES' if matches else 'NO'}")
         print(f"enabled={settings.enabled} pin={settings.pin or '-'} skip_restart={settings.skip_gateway_restart}")

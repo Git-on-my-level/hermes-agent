@@ -213,6 +213,34 @@ def test_linux_service_runs_converge_flag(tmp_path, monkeypatch):
     assert f"HERMES_HOME={tmp_path}" in text
 
 
+def test_service_prefers_published_launcher_over_a_generation_venv(tmp_path, monkeypatch):
+    from hermes_cli import update_converge as uc
+
+    root = tmp_path / "checkout"
+    published = root / ".hermes" / "bin" / "hermes"
+    published.parent.mkdir(parents=True)
+    published.touch()
+    monkeypatch.setattr("hermes_cli.gateway.PROJECT_ROOT", root)
+    monkeypatch.setattr(uc, "_service_venv_dir", lambda: str(root / "retired-venv"))
+
+    assert uc._service_hermes_bin() == str(published)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("hermes_cli.gateway._stable_service_working_dir", lambda: str(root))
+    assert f"<string>{published}</string>" in uc.generate_converge_plist(_s())
+
+
+def test_legacy_source_checkout_retains_venv_launcher(tmp_path, monkeypatch):
+    from hermes_cli import update_converge as uc
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    legacy = root / ".venv"
+    monkeypatch.setattr("hermes_cli.gateway.PROJECT_ROOT", root)
+    monkeypatch.setattr(uc, "_service_venv_dir", lambda: str(legacy))
+
+    assert uc._service_hermes_bin() == str(legacy / "bin" / "hermes")
+
+
 def test_failed_converge_is_alerted_even_when_busy(monkeypatch, caplog, capsys):
     from types import SimpleNamespace
     from hermes_cli import update_converge as uc, update_receipt
