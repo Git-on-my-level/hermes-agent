@@ -309,11 +309,12 @@ and session platform in its key, so new builds reflect configuration changes.
 Existing conversations retain their frozen system prompt as described above.
 
 The profile's `.skills_prompt_snapshot.json` is a metadata cache, not a saved
-system prompt. It retains installed skill metadata and category descriptions for
-name resolution and later re-enabling; its manifest also tracks disabled files.
-Its byte size and skill count therefore do not measure model input. Measure the
-rendered skills index or the actual session prompt instead. A category blurb is
-rendered only when the category has visible skills.
+system prompt. It retains per-skill metadata, disabled skills included, for name
+resolution and later re-enabling. Its manifest records file signatures of every
+`SKILL.md` and category `DESCRIPTION.md`, so editing either invalidates it; the
+`DESCRIPTION.md` text itself is neither stored nor rendered. Its byte size and
+skill count therefore do not measure model input. Measure the rendered skills
+index or the actual session prompt instead.
 
 Disabled skills are omitted from `skills_list` and rejected by `skill_view`;
 disabling does not mean discoverable on demand. The management catalog can still
