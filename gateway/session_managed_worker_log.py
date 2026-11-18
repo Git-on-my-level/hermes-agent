@@ -6,6 +6,7 @@ thread (an undrained pipe would block the child), redacts every line before it t
 and keeps ``<home>/logs/managed-worker.log`` private (0600) and capped at
 ``MAX_LOG_BYTES`` plus one rotated copy.
 """
+import json
 import logging
 import os
 from pathlib import Path
@@ -20,6 +21,16 @@ MAX_LINE_BYTES = 64 * 1024
 KEPT_LINE_CHARS = 4096
 _locks = {}
 _locks_guard = threading.Lock()
+
+
+def bootstrap_log_secrets(frame):
+    """Exact values the child is about to receive, installed before bootstrap send."""
+    policy = frame['policy']
+    env = json.loads(policy.get('client_env_json') or '{}')
+    rules = json.loads(policy.get('client_env_rules_json') or '{}')
+    values = [frame['api_key'], frame['scope']['secret']]
+    values.extend(env[name] for name in rules.get('secret_names', ()) if name in env)
+    return [value for value in values if isinstance(value, str) and value]
 
 
 def worker_log_path(profile_id):
@@ -54,16 +65,45 @@ def _append(path, text):
             os.close(fd)
 
 
-def _redact(line, scrub):
+# A secret line shorter than this is too generic to scrub everywhere (``}``, ``-----END``).
+_MIN_FRAGMENT_CHARS = 8
+
+
+def _scrub_values(values):
+    """Exact values plus each line of a multi-line one: the drain redacts one line at a time,
+    so a PEM key or JSON credential echoed to stderr never arrives whole."""
+    out = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        out.add(value)
+        if '\n' in value or '\r' in value:
+            out.update(part.strip() for part in value.splitlines()
+                       if len(part.strip()) >= _MIN_FRAGMENT_CHARS)
+    return sorted(out, key=len, reverse=True)
+
+
+def _redact(line, scrub, cut=False):
+    """``cut``: the line was split at ``MAX_LINE_BYTES``, so it may end in a secret's prefix."""
     from agent.redact import redact_sensitive_text
-    for value in sorted((v for v in scrub() if isinstance(v, str) and v), key=len, reverse=True):
+    values = _scrub_values(scrub())
+    for value in values:
         line = line.replace(value, '***')
+    if cut:
+        line = line.rstrip('\ufffd')  # a multi-byte character split at the chunk boundary
+        for value in values:
+            start = line.rfind(value[:4], max(0, len(line) - len(value)))
+            while start >= 0:
+                if value.startswith(line[start:]):
+                    line = line[:start] + '***'
+                    break
+                start = line.rfind(value[:4], max(0, len(line) - len(value)), start)
     return redact_sensitive_text(line, force=True)
 
 
 def drain_worker_stderr(stream, path, pid, scrub):
     """Thread body: read ``stream`` to EOF; ``scrub()`` returns this worker's exact secrets
-    (launch key, assignment secret) known so far. Never stops reading on a write failure."""
+    (launch key, assignment secret, client secrets) known so far. Never stops reading on a write failure."""
     skipping = False
     warned = False
     try:
@@ -77,7 +117,7 @@ def drain_worker_stderr(stream, path, pid, scrub):
                 continue
             skipping = not whole
             try:
-                line = _redact(chunk.decode('utf-8', 'replace'), scrub)
+                line = _redact(chunk.decode('utf-8', 'replace'), scrub, cut=not whole)
                 _append(path, f'[pid {pid}] ' + (line if whole else line[:KEPT_LINE_CHARS] + ' [truncated]\n'))
             except (OSError, ValueError) as exc:
                 # Keep draining regardless: a child blocked on a full stderr pipe would wedge.

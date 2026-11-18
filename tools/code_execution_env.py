@@ -74,11 +74,16 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
         is_passthrough = is_env_passthrough
     if is_windows is None:
         is_windows = _IS_WINDOWS
+    from agent.session_client_env import apply_session_secrets, session_secret_env
+    session_secrets = session_secret_env()
     scrubbed = {}
     # Non-secret HERMES_* vars no allowlist admits are dropped on purpose; a script importing a
     # repo module that reads one would see it silently unset — log the drop, point at the opt-in.
     _dropped_hermes = []
     for k, v in source_env.items():
+        if k in session_secrets:
+            scrubbed[k] = session_secrets[k]
+            continue
         if is_passthrough(k):
             resolved = resolve_passthrough_value(k, v)
             if resolved is not None:
@@ -95,6 +100,7 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
     # Declared names only the bound profile scope holds (a routed profile's own .env / sources
     # never enter the process env) — the loop above sees only names ``source_env`` carries.
     scrubbed.update((k, v) for k, v in scoped_passthrough_additions(scrubbed).items() if is_passthrough(k))
+    apply_session_secrets(scrubbed)
     if _dropped_hermes:
         logger.debug(
             "execute_code: dropped %d non-allowlisted HERMES_* var(s) from the "

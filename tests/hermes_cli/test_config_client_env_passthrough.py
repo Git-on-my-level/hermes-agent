@@ -19,3 +19,14 @@ def test_default_and_user_list_round_trip(tmp_path):
         assert configured_names(config) == set(names)
         save_config(config)
         assert load_config()["terminal"]["client_env_passthrough"] == names
+
+
+def test_client_secret_names_default_empty_and_round_trip(tmp_path, monkeypatch):
+    from hermes_cli.config import _validate_config_key
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert DEFAULT_CONFIG["terminal"]["client_env_passthrough_secrets"] == []
+    assert _validate_config_key("terminal.client_env_passthrough_secrets") == (True, None)
+    config = load_config()
+    config["terminal"]["client_env_passthrough_secrets"] = ["MULTICA_TOKEN"]
+    save_config(config)
+    assert load_config()["terminal"]["client_env_passthrough_secrets"] == ["MULTICA_TOKEN"]

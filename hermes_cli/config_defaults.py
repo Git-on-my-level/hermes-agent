@@ -310,8 +310,8 @@ DEFAULT_CONFIG = {
         # disables.
         "oneshot_completion_wait_seconds": 600.0,
         "process_wait_auto_notify": True,  # 2 unchanged wait/poll -> notify_on_complete + stop; False = old polling
-        # Env vars passed into sandboxed terminal/execute_code (plus skill-declared required_environment_variables).
-        "env_passthrough": [],
+        "env_passthrough": [],  # Sandbox env names (plus skill-declared required_environment_variables)
+        "client_env_passthrough_secrets": [],  # Exact session-only client names; credentials require explicit opt-in
         "client_env_passthrough": [],  # Extra non-secret toolchain names a CLI/TUI client sends for its tools
         # Remote-backend sync-back refuses to extract a downloaded state archive larger than this
         # (bytes); raise it for a ~/.hermes tree that legitimately exceeds 2 GiB.

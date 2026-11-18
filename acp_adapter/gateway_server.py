@@ -274,7 +274,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if ("acp" not in descriptor.get("session_create", {}).get("sources", [])
                 or "acp-editor-policy-v1" not in descriptor.get("capabilities", [])):
             raise GatewayClientError("acp_policy_unavailable")
-        from hermes_cli.gateway_chat import env_launch_flags
+        from hermes_cli.gateway_chat import client_env_policy, env_launch_flags
         # `hermes acp --yolo` / `--safe-mode` / ... reach this process as their env equivalents; the
         # owner does not inherit them, so they freeze into this session's policy or not at all.
         flags = env_launch_flags()
@@ -283,7 +283,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
             editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
-                    "edit_approval_policy": "ask"}, **flags)
+                    "edit_approval_policy": "ask"}, **flags,
+            **client_env_policy(descriptor.get("session_create", {}).get("parameters", [])))
         session_id = snapshot["session_id"]
         await self._adopt(session_id, snapshot)
         if mcp_servers:

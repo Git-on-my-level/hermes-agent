@@ -669,7 +669,8 @@ async def execute_managed(authority, ref, row, policy):
         worker.worker = (scope['pid'], scope['birth'])
         # The child reads nothing else until the exact reservation has committed.
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
-        worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
+        from gateway.session_managed_worker_log import bootstrap_log_secrets
+        worker.secrets.extend(bootstrap_log_secrets(frame))
         await asyncio.to_thread(worker.send, frame)
         worker.writer.start()
         while True:

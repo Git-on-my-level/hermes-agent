@@ -122,11 +122,12 @@ def resolve_store_python(repo_root: Path, *, publication: bool = False) -> Path 
     wins over an inherited ``HERMES_RUNTIME_DIR``. The override names a store
     for the running process (an e2e fixture, a desktop toolchain) that a later
     scratch cleanup may delete, leaving the launcher to exit 127 forever
-    (#131745). It still supplies the store when the tree records none.
+    (#131745). A known borrower must also refuse a missing owner interpreter;
+    only an unowned tree may fall back to the runtime store.
     """
     if publication:
         own = _store_python(store_root(repo_root, honor_runtime_override=False))
-        if own is not None:
+        if own is not None or owning_home_root(repo_root) is not None:
             return own
     return _store_python(store_root(repo_root))
 
@@ -837,15 +838,14 @@ def ensure_install_launchers(repo_root: Path, out_dir: Path) -> list[str]:
     local = root / ".hermes" / "bin"
     local.mkdir(parents=True, exist_ok=True)
     store = store_root(root)
-    own = resolve_store_python(root)
-    # The checkout this data root was installed with always republishes, which
-    # also heals an install that an earlier foreign launch already rebound.
-    owner = _is_home_checkout(root, store)
+    own = resolve_store_python(root, publication=True)
+    # A recorded owner lets even a borrowing task repair wrappers that an
+    # earlier task rebound, including when that task's interpreter is gone.
+    owner = _is_home_checkout(root, store) or owning_home_root(root) is not None
     written = []
     for name in WINDOWS_BIN_LAUNCHERS:
-        # ponytail: one guard here covers every caller (launch, sync, repair,
-        # install); per-home outputs below stay unguarded. Upgrade to a stamped
-        # owning store if shared checkouts ever need cross-home repins.
+        # Unknown shared checkouts keep their live external interpreter; known
+        # installs always republish against their recorded owner's store.
         kept = None if owner else _kept_shared_launcher(name, local, store, own)
         if kept is not None:
             written.append(str(kept))
