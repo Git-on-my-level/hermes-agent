@@ -619,6 +619,16 @@ def generate_launchd_plist() -> str:
 
     <key>ExitTimeOut</key>
     <integer>60</integer>
+
+    <!-- A LaunchAgent without ProcessType is launchd's "Standard" class
+         (spawn type daemon): light CPU and I/O throttling and base priority
+         20, below the 31 every terminal/agent process runs at. On a loaded
+         Mac the event loop, cron ticker and fire-claim heartbeats then sit
+         runnable but unscheduled for minutes, the liveness watchdog exits 75,
+         and cron fires tens of minutes late. Interactive is the app class:
+         no throttling, priority 31 — level with user work, never above it. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
 {nofile_block}
     <key>StandardOutPath</key>
     <string>{stdout_log}</string>

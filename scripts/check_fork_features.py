@@ -409,6 +409,11 @@ KEEP_LIST: list[tuple[str, str, str]] = [
     ),
     (
         "hermes_cli/gateway_launchd.py",
+        "<key>ProcessType</key>\n    <string>Interactive</string>",
+        "launchd gateway runs in the app scheduling class (not throttled Standard)",
+    ),
+    (
+        "hermes_cli/gateway_launchd.py",
         "def _launchctl_domain_supervising_process",
         "domain-scoped launchd supervision probe",
     ),
@@ -474,6 +479,7 @@ TEST_FILES = [
     "tests/hermes_cli/test_fork_autoupdate_invariants.py",
     "tests/scripts/test_oss_hermes_upstream_sync.py",
     "tests/hermes_cli/test_gateway_service_path_determinism.py",
+    "tests/hermes_cli/test_gateway_launchd_process_type.py",
     "tests/agent/test_xai_oauth_stale_403_recovery.py",
     "tests/agent/test_codex_same_account_adoption.py",
     "tests/hermes_cli/test_xai_oauth_root_pool_writeback.py",
