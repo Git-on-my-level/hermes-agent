@@ -65,10 +65,39 @@ def _append(path, text):
             os.close(fd)
 
 
-def _redact(line, scrub):
+# A secret line shorter than this is too generic to scrub everywhere (``}``, ``-----END``).
+_MIN_FRAGMENT_CHARS = 8
+
+
+def _scrub_values(values):
+    """Exact values plus each line of a multi-line one: the drain redacts one line at a time,
+    so a PEM key or JSON credential echoed to stderr never arrives whole."""
+    out = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        out.add(value)
+        if '\n' in value or '\r' in value:
+            out.update(part.strip() for part in value.splitlines()
+                       if len(part.strip()) >= _MIN_FRAGMENT_CHARS)
+    return sorted(out, key=len, reverse=True)
+
+
+def _redact(line, scrub, cut=False):
+    """``cut``: the line was split at ``MAX_LINE_BYTES``, so it may end in a secret's prefix."""
     from agent.redact import redact_sensitive_text
-    for value in sorted((v for v in scrub() if isinstance(v, str) and v), key=len, reverse=True):
+    values = _scrub_values(scrub())
+    for value in values:
         line = line.replace(value, '***')
+    if cut:
+        line = line.rstrip('\ufffd')  # a multi-byte character split at the chunk boundary
+        for value in values:
+            start = line.rfind(value[:4], max(0, len(line) - len(value)))
+            while start >= 0:
+                if value.startswith(line[start:]):
+                    line = line[:start] + '***'
+                    break
+                start = line.rfind(value[:4], max(0, len(line) - len(value)), start)
     return redact_sensitive_text(line, force=True)
 
 
@@ -88,7 +117,7 @@ def drain_worker_stderr(stream, path, pid, scrub):
                 continue
             skipping = not whole
             try:
-                line = _redact(chunk.decode('utf-8', 'replace'), scrub)
+                line = _redact(chunk.decode('utf-8', 'replace'), scrub, cut=not whole)
                 _append(path, f'[pid {pid}] ' + (line if whole else line[:KEPT_LINE_CHARS] + ' [truncated]\n'))
             except (OSError, ValueError) as exc:
                 # Keep draining regardless: a child blocked on a full stderr pipe would wedge.

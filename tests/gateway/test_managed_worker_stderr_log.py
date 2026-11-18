@@ -69,3 +69,18 @@ def test_bootstrap_client_secrets_are_redacted_from_worker_log(tmp_path):
     assert all(value not in text for value in secrets)
     # Legacy and empty-client bootstrap frames still redact the worker's own keys.
     assert bootstrap_log_secrets({**frame, 'policy': {}}) == [frame['api_key'], frame['scope']['secret']]
+
+
+def test_multiline_and_chunk_split_secrets_never_reach_the_worker_log(tmp_path):
+    from gateway.session_managed_worker_log import KEPT_LINE_CHARS, MAX_LINE_BYTES, drain_worker_stderr
+    pem = '-----BEGIN PRIVATE KEY-----\n' + '\n'.join(f'MIIEv{i:02d}' + 'A' * 59 for i in range(6)) + '\n-----END PRIVATE KEY-----\n'
+    long_token = 'tok-' + 'Z' * (MAX_LINE_BYTES * 2)  # straddles the readline chunk boundary
+    secrets = [pem, long_token]
+    path = tmp_path / 'logs' / 'managed-worker.log'
+    stream = ('Traceback: credential follows\n' + pem + 'prefix ' + long_token + ' suffix\nlast\n').encode()
+    drain_worker_stderr(io.BytesIO(stream), path, 7, lambda: secrets)
+    text = path.read_text()
+    assert 'Traceback: credential follows' in text and text.endswith('[pid 7] last\n')
+    assert 'AAAAAAAAAA' not in text and 'MIIEv' not in text
+    assert 'ZZZZ' not in text and '[truncated]' in text and 'prefix ***' in text
+    assert all(len(line) <= KEPT_LINE_CHARS + 40 for line in text.splitlines())
