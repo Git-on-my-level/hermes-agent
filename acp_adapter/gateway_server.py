@@ -740,6 +740,10 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     if _prompt_disconnected(retry_error):
                         raise self._disconnect_unknown(session_id, input_id, admission_id) from None
                     raise
+        except asyncio.CancelledError:
+            if recovered:
+                raise self._disconnect_unknown(session_id, input_id, admission_id) from None
+            raise
         finally:
             # Do not let one prompt tear down a newer mapping if the session has
             # already advanced while this coroutine unwinds.
@@ -795,8 +799,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     raise GatewayClientError("not_found")
                 lookup = {"admission_id": admission_id} if admission_id else {"input_id": input_id}
                 receipt = await client.rpc("prompt.receipt", session_id=session_id, include_result=True, **lookup)
-        except Exception:
-            # The original turn stays ambiguous if reconnect, attach, or the receipt read fails.
+        except (asyncio.CancelledError, Exception):
+            # Even if the observer is cancelled, the gateway may still own this input.
+            # Return its identity without teaching a later request to reuse it by content.
             raise self._disconnect_unknown(session_id, input_id, admission_id) from None
 
         found = receipt.get("admission_id") if isinstance(receipt, dict) else None

@@ -22,6 +22,7 @@ class Owner:
         self.prior, self.receipt_status = prior, receipt_status
         self.calls, self.configs, self.inputs, self.lookups = [], [], [], []
         self.server = None
+        self.lookup_started, self.release_receipt = asyncio.Event(), asyncio.Event()
 
     async def complete(self, ws, session_id, admission_id, seq, text, *, outcome="completed"):
         await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
@@ -56,6 +57,9 @@ class Owner:
                 result = {"admission_id": f"{self.epoch}-{input_id}"}
             if method == "prompt.receipt":
                 self.lookups.append(params)
+                if self.receipt_status == "cancelled_lookup":
+                    self.lookup_started.set()
+                    await self.release_receipt.wait()
                 if self.receipt_status == "receipt_disconnect":
                     await ws.close()
                     return
@@ -107,6 +111,7 @@ class Owner:
     ("missing_admission", None),
     ("expired_session", None),
     ("receipt_disconnect", None),
+    ("cancelled_lookup", None),
     ("started_then_disconnect", None),
     ("completed_without_result", None),
 ])
@@ -134,8 +139,15 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         agent._conn.session_update.reset_mock()
         prompt = [acp.text_block("synthetic prompt")]
         if stop_reason is None:
-            with pytest.raises(GatewayClientError, match=r"unknown_execution: .* outcome is unknown.* Session s,"):
-                await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
+            with pytest.raises(GatewayClientError, match=r"unknown_execution: .* outcome is unknown.* Session s,") as unknown:
+                if receipt_status == "cancelled_lookup":
+                    original = asyncio.create_task(agent.prompt(prompt, "s"))
+                    await asyncio.wait_for(second.lookup_started.wait(), 5)
+                    original.cancel()
+                    await asyncio.wait_for(original, 5)
+                else:
+                    await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
+            assert first.inputs[0][1] in str(unknown.value)
         else:
             response = await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
             assert response.stop_reason == stop_reason
@@ -143,6 +155,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         assert second.calls.count("prompt.submit") == third.calls.count("prompt.submit") == 0
         assert second.calls.count("prompt.receipt") == (0 if receipt_status == "expired_session" else 1)
         assert not agent._unacked
+        second.release_receipt.set()
 
         # A newly requested prompt with identical content gets a fresh identity and runs once.
         if receipt_status == "expired_session":
@@ -160,6 +173,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         if receipt_status in {"completed", "started"}:
             assert "".join(text for text in texts if text not in {"NEWER", "INDEPENDENT"}) == "ORIGINAL"
     finally:
+        second.release_receipt.set()
         await agent.aclose()
         for owner in owners:
             owner.server.close()
