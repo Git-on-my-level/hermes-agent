@@ -32062,8 +32062,28 @@
             "type": "string"
           },
           "admission_id": {
-            "title": "Admission Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Admission Id"
+          },
+          "input_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Id"
           },
           "include_result": {
             "anyOf": [
@@ -32079,8 +32099,7 @@
           }
         },
         "required": [
-          "session_id",
-          "admission_id"
+          "session_id"
         ],
         "title": "PromptReceiptParams",
         "type": "object"
@@ -48284,7 +48303,7 @@
     },
     {
       "name": "prompt.receipt",
-      "summary": "Current receipt of one admission the caller submitted (or controls).",
+      "summary": "Current receipt by admission_id, or by the caller's own input_id if the submission acknowledgement was lost. Supply exactly one.",
       "params": [
         {
           "name": "params",

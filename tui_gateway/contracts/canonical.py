@@ -40,7 +40,8 @@ class AdmissionStatus(Result):
 
 class PromptReceiptParams(Params):
     session_id: str
-    admission_id: str
+    admission_id: str | None = None
+    input_id: str | None = None
     include_result: bool | None = None
 
 
@@ -53,7 +54,8 @@ class PromptReceiptResult(AdmissionStatus):
 
 
 canonical_method("prompt.receipt", params=PromptReceiptParams, result=PromptReceiptResult,
-                 doc="Current receipt of one admission the caller submitted (or controls).")
+                 doc="Current receipt by admission_id, or by the caller's own input_id if the "
+                     "submission acknowledgement was lost. Supply exactly one.")
 
 
 class PromptCancelParams(Params):

@@ -11,16 +11,27 @@ from websockets.asyncio.server import serve
 
 import acp_adapter.gateway_server as server
 from acp_adapter.gateway_server import GatewayACPAgent
-from hermes_cli.gateway_client import GatewayClient
+from hermes_cli.gateway_client import DISCONNECTED, NOT_SENT, GatewayClient, GatewayClientError
 
 
 class Owner:
     """One gateway instance: answers the canonical RPCs ACP uses and records them."""
 
-    def __init__(self, profile_id, epoch, *, die_on_submit=None):
+    def __init__(self, profile_id, epoch, *, die_on_submit=None, prior=None, receipt_status=None):
         self.profile_id, self.epoch, self.die_on_submit = profile_id, epoch, die_on_submit
-        self.calls, self.configs = [], []
+        self.prior, self.receipt_status = prior, receipt_status
+        self.calls, self.configs, self.inputs, self.lookups = [], [], [], []
         self.server = None
+
+    async def complete(self, ws, session_id, admission_id, seq, text, *, outcome="completed"):
+        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
+            "session_id": session_id, "type": "message.complete", "replay_epoch": self.epoch,
+            "seq": seq, "admission_id": admission_id,
+            "payload": {"outcome": outcome, "text": text}}}))
+
+    async def refuse(self, ws, frame, reason):
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "error": {
+            "code": -32603, "message": "Internal error", "data": {"reason": reason}}}))
 
     async def handler(self, ws):
         async for raw in ws:
@@ -29,24 +40,58 @@ class Owner:
             self.calls.append(method)
             if method == "config.set":
                 self.configs.append(params)
-            if method == "prompt.submit" and self.die_on_submit == "before_ack":
-                await ws.close()  # the owner dies with the submit in flight
-                return
             result = {"profile_id": self.profile_id} if method == "runtime.describe" else {}
             if method == "session.resume":
+                if self.receipt_status == "expired_session" and params["session_id"] == "s":
+                    await self.refuse(ws, frame, "not_found")
+                    continue
                 result = {"session_id": params["session_id"], "messages": [], "pending": [], "prompts": [],
                           "replay_epoch": self.epoch, "last_sequence": 0}
             if method == "prompt.submit":
-                result = {"admission_id": f"{self.epoch}-{params['input_id']}"}
+                input_id = params["input_id"]
+                self.inputs.append((params["session_id"], input_id))
+                if self.die_on_submit == "before_ack":
+                    await ws.close()  # the owner accepted the input and lost the ack
+                    return
+                result = {"admission_id": f"{self.epoch}-{input_id}"}
+            if method == "prompt.receipt":
+                self.lookups.append(params)
+                if self.receipt_status == "receipt_disconnect":
+                    await ws.close()
+                    return
+                if self.receipt_status == "missing_admission":
+                    await self.refuse(ws, frame, "not_found")
+                    continue
+                original_session, original_input = self.prior.inputs[0]
+                original_admission = f"{self.prior.epoch}-{original_input}"
+                assert params["session_id"] == original_session
+                assert params["include_result"] is True
+                if self.prior.die_on_submit == "before_ack":
+                    assert params["input_id"] == original_input and "admission_id" not in params
+                else:
+                    assert params["admission_id"] == original_admission and "input_id" not in params
+                result = {
+                    "admission_id": original_admission,
+                    "status": "started" if self.receipt_status in {"started", "started_then_disconnect"} else "terminal",
+                    "outcome": "completed" if self.receipt_status == "completed_without_result" else self.receipt_status,
+                }
+                if self.receipt_status == "completed":
+                    result["result"] = {"final_response": "ORIGINAL"}
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "result": result}))
+            if method == "prompt.receipt" and self.receipt_status == "started_then_disconnect":
+                await ws.close()
+                return
+            if method == "prompt.receipt" and self.receipt_status == "started":
+                await self.complete(ws, params["session_id"], "newer-admission", 1, "NEWER", outcome="interrupted")
+                await self.complete(ws, params["session_id"], result["admission_id"], 2, "ORIGINAL")
             if method == "prompt.submit" and self.die_on_submit == "after_ack":
+                await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
+                    "session_id": params["session_id"], "type": "message.delta", "replay_epoch": self.epoch,
+                    "seq": 1, "admission_id": result["admission_id"], "payload": {"text": "ORI"}}}))
                 await ws.close()
                 return
             if method == "prompt.submit":
-                await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
-                    "session_id": params["session_id"], "type": "message.complete", "replay_epoch": self.epoch,
-                    "seq": 1, "admission_id": result["admission_id"],
-                    "payload": {"outcome": "completed", "text": "AFTER-RESTART"}}}))
+                await self.complete(ws, params["session_id"], result["admission_id"], 3, "INDEPENDENT")
 
     @property
     def url(self):
@@ -55,11 +100,24 @@ class Owner:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("die", ["before_ack", "after_ack"])
-async def test_editor_reconnects_to_a_restarted_gateway_without_resending(monkeypatch, die):
+@pytest.mark.parametrize(("receipt_status", "stop_reason"), [
+    ("completed", "end_turn"),
+    ("interrupted", "cancelled"),
+    ("started", "end_turn"),
+    ("missing_admission", None),
+    ("expired_session", None),
+    ("receipt_disconnect", None),
+    ("started_then_disconnect", None),
+    ("completed_without_result", None),
+])
+async def test_reconcile_original_turn_without_resending(monkeypatch, die, receipt_status, stop_reason):
     agent = GatewayACPAgent()
     agent._conn = AsyncMock()
     home = str(agent._home)
-    owners = [Owner(home, "first", die_on_submit=die), Owner(home, "second")]
+    first = Owner(home, "first", die_on_submit=die)
+    second = Owner(home, "second", prior=first, receipt_status=receipt_status)
+    third = Owner(home, "third")
+    owners = [first, second, third]
     for owner in owners:
         owner.server = await serve(owner.handler, "127.0.0.1", 0)
     order = iter(owners)
@@ -73,26 +131,57 @@ async def test_editor_reconnects_to_a_restarted_gateway_without_resending(monkey
     monkeypatch.setattr(server, "connect_gateway", connect_gateway)
     try:
         await agent.load_session(cwd="/", session_id="s")
-        # The in-flight turn's outcome is unknown: reported, never silently resubmitted.
-        with pytest.raises(Exception, match="outcome is unknown"):
-            await asyncio.wait_for(agent.prompt([acp.text_block("in flight")], "s"), 5)
-        response = await asyncio.wait_for(agent.prompt([acp.text_block("after restart")], "s"), 5)
+        agent._conn.session_update.reset_mock()
+        prompt = [acp.text_block("synthetic prompt")]
+        if stop_reason is None:
+            with pytest.raises(GatewayClientError, match=r"unknown_execution: .* outcome is unknown.* Session s,"):
+                await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
+        else:
+            response = await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
+            assert response.stop_reason == stop_reason
+        assert first.calls.count("prompt.submit") == 1
+        assert second.calls.count("prompt.submit") == third.calls.count("prompt.submit") == 0
+        assert second.calls.count("prompt.receipt") == (0 if receipt_status == "expired_session" else 1)
+        assert not agent._unacked
+
+        # A newly requested prompt with identical content gets a fresh identity and runs once.
+        if receipt_status == "expired_session":
+            await agent.load_session(cwd="/", session_id="other-session")
+            session_id = "other-session"
+        else:
+            session_id = "s"
+        response = await asyncio.wait_for(agent.prompt(prompt, session_id), 5)
         assert response.stop_reason == "end_turn"
-        assert agent._failure is None
-        # The replacement was re-verified and re-subscribed before the new submit, and asked again
-        # for the session's live reasoning: a restarted owner's live session starts without that
-        # flag (ACP-4). The lost input was submitted to the first owner only.
-        assert owners[1].calls == ["runtime.describe", "session.resume", "config.set", "prompt.submit"]
-        assert owners[1].configs == [{"session_id": "s", "key": "show_reasoning", "value": "1"}]
-        assert owners[0].calls.count("prompt.submit") == 1
-        assert agent._snapshots["s"]["replay_epoch"] == "second"
+        [independent] = second.inputs + third.inputs
+        assert independent[1] != first.inputs[0][1]
         texts = [call.kwargs["update"].content.text for call in agent._conn.session_update.await_args_list
                  if call.kwargs["update"].session_update == "agent_message_chunk"]
-        assert texts.count("AFTER-RESTART") == 1
+        assert texts.count("INDEPENDENT") == 1
+        if receipt_status in {"completed", "started"}:
+            assert "".join(text for text in texts if text not in {"NEWER", "INDEPENDENT"}) == "ORIGINAL"
     finally:
         await agent.aclose()
         for owner in owners:
             owner.server.close()
+            await owner.server.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["attach", "submit"])
+async def test_disconnect_before_socket_write_does_not_reconcile_or_retry(monkeypatch, stage):
+    agent = GatewayACPAgent()
+    agent._snapshots["s"] = {"pending": []}
+    agent._gateway = AsyncMock()
+    agent._gateway.rpc.side_effect = GatewayClientError(NOT_SENT)
+    if stage == "attach":
+        monkeypatch.setattr(agent, "_client", AsyncMock(side_effect=GatewayClientError(DISCONNECTED)))
+
+    with pytest.raises(GatewayClientError, match="nothing was sent"):
+        await agent.prompt([acp.text_block("synthetic prompt")], "s")
+
+    assert [call.args[0] for call in agent._gateway.rpc.await_args_list] == (
+        ["prompt.submit"] if stage == "submit" else [])
+    assert not agent._unacked
 
 
 @pytest.mark.asyncio
