@@ -200,6 +200,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 self._snapshots.pop(session_id, None)
                 continue
             await self._adopt(session_id, snapshot)
+            # The replacement subscription can start mid-reply even when ACP saw no prefix.
+            # Fence its deltas before the event pump starts, then project the terminal reply.
+            for row in snapshot.get("pending", []):
+                if row.get("status") == "started":
+                    self._cut.setdefault(row["admission_id"], "")
             # Before this session's cards are offered again: until ``_client`` returns, ``self._gateway`` is
             # not this connection, so a card answered while the request is out would lose its answer.
             await self._request_live_reasoning(gateway, session_id)

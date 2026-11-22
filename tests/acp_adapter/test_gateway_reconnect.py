@@ -17,9 +17,9 @@ from hermes_cli.gateway_client import DISCONNECTED, NOT_SENT, GatewayClient, Gat
 class Owner:
     """One gateway instance: answers the canonical RPCs ACP uses and records them."""
 
-    def __init__(self, profile_id, epoch, *, die_on_submit=None, prior=None, receipt_status=None):
+    def __init__(self, profile_id, epoch, *, die_on_submit=None, prior=None, receipt_status=None, emit_prefix=True):
         self.profile_id, self.epoch, self.die_on_submit = profile_id, epoch, die_on_submit
-        self.prior, self.receipt_status = prior, receipt_status
+        self.prior, self.receipt_status, self.emit_prefix = prior, receipt_status, emit_prefix
         self.calls, self.configs, self.inputs, self.lookups = [], [], [], []
         self.server = None
         self.lookup_started, self.release_receipt = asyncio.Event(), asyncio.Event()
@@ -29,6 +29,11 @@ class Owner:
             "session_id": session_id, "type": "message.complete", "replay_epoch": self.epoch,
             "seq": seq, "admission_id": admission_id,
             "payload": {"outcome": outcome, "text": text}}}))
+
+    async def delta(self, ws, session_id, admission_id, seq, text):
+        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
+            "session_id": session_id, "type": "message.delta", "replay_epoch": self.epoch,
+            "seq": seq, "admission_id": admission_id, "payload": {"text": text}}}))
 
     async def refuse(self, ws, frame, reason):
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "error": {
@@ -48,6 +53,9 @@ class Owner:
                     continue
                 result = {"session_id": params["session_id"], "messages": [], "pending": [], "prompts": [],
                           "replay_epoch": self.epoch, "last_sequence": 0}
+                if self.receipt_status == "missed_prefix":
+                    original_admission = f"{self.prior.epoch}-{self.prior.inputs[0][1]}"
+                    result["pending"] = [{"status": "started", "admission_id": original_admission}]
             if method == "prompt.submit":
                 input_id = params["input_id"]
                 self.inputs.append((params["session_id"], input_id))
@@ -76,22 +84,25 @@ class Owner:
                     assert params["admission_id"] == original_admission and "input_id" not in params
                 result = {
                     "admission_id": original_admission,
-                    "status": "started" if self.receipt_status in {"started", "started_then_disconnect"} else "terminal",
+                    "status": "started" if self.receipt_status in {
+                        "started", "started_then_disconnect", "missed_prefix"} else "terminal",
                     "outcome": "completed" if self.receipt_status == "completed_without_result" else self.receipt_status,
                 }
                 if self.receipt_status == "completed":
                     result["result"] = {"final_response": "ORIGINAL"}
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "result": result}))
+            if method == "session.resume" and self.receipt_status == "missed_prefix":
+                await self.delta(ws, params["session_id"], original_admission, 1, "GINAL")
             if method == "prompt.receipt" and self.receipt_status == "started_then_disconnect":
                 await ws.close()
                 return
             if method == "prompt.receipt" and self.receipt_status == "started":
                 await self.complete(ws, params["session_id"], "newer-admission", 1, "NEWER", outcome="interrupted")
+            if method == "prompt.receipt" and self.receipt_status in {"started", "missed_prefix"}:
                 await self.complete(ws, params["session_id"], result["admission_id"], 2, "ORIGINAL")
             if method == "prompt.submit" and self.die_on_submit == "after_ack":
-                await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
-                    "session_id": params["session_id"], "type": "message.delta", "replay_epoch": self.epoch,
-                    "seq": 1, "admission_id": result["admission_id"], "payload": {"text": "ORI"}}}))
+                if self.emit_prefix:
+                    await self.delta(ws, params["session_id"], result["admission_id"], 1, "ORI")
                 await ws.close()
                 return
             if method == "prompt.submit":
@@ -108,6 +119,7 @@ class Owner:
     ("completed", "end_turn"),
     ("interrupted", "cancelled"),
     ("started", "end_turn"),
+    ("missed_prefix", "end_turn"),
     ("missing_admission", None),
     ("expired_session", None),
     ("receipt_disconnect", None),
@@ -119,7 +131,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
     agent = GatewayACPAgent()
     agent._conn = AsyncMock()
     home = str(agent._home)
-    first = Owner(home, "first", die_on_submit=die)
+    first = Owner(home, "first", die_on_submit=die, emit_prefix=receipt_status != "missed_prefix")
     second = Owner(home, "second", prior=first, receipt_status=receipt_status)
     third = Owner(home, "third")
     owners = [first, second, third]
@@ -170,7 +182,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         texts = [call.kwargs["update"].content.text for call in agent._conn.session_update.await_args_list
                  if call.kwargs["update"].session_update == "agent_message_chunk"]
         assert texts.count("INDEPENDENT") == 1
-        if receipt_status in {"completed", "started"}:
+        if receipt_status in {"completed", "started", "missed_prefix"}:
             assert "".join(text for text in texts if text not in {"NEWER", "INDEPENDENT"}) == "ORIGINAL"
     finally:
         second.release_receipt.set()
