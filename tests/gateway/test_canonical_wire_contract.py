@@ -7,7 +7,7 @@ from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
 from gateway.session_group_controls import GROUP_METHODS
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch
+from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input, settle_session_input
 from tui_gateway.contracts.registry import CANONICAL_METHODS, METHODS
 
 
@@ -75,9 +75,21 @@ async def test_receipt_by_input_id_uses_exact_principal_and_session(owner):
         assert (await lookup(other, session_id='s', input_id='input-1'))['error']['data']['reason'] == 'not_found'
         wrong_session = await lookup(connection, session_id='other-session', input_id='input-1')
         assert wrong_session['error']['data']['reason'] == 'not_found'
-        for identity in ({}, {'input_id': 'input-1', 'admission_id': original['admission_id']}):
+        for identity in ({}, {'input_id': []}, {'admission_id': 42},
+                         {'input_id': 'input-1', 'admission_id': original['admission_id']}):
             error = (await lookup(connection, session_id='s', **identity))['error']
             assert error['data']['reason'] == 'invalid_params'
+
+        claim = claim_session_input(db, epoch=authority.epoch, session_id='s')
+        live = authority.sessions['s']
+        live.settling[original['admission_id']] = claim
+        settle_session_input(db, epoch=authority.epoch, admission_id=original['admission_id'],
+                             generation=claim['generation'], outcome='interrupted')
+        receipt = await lookup(connection, session_id='s', input_id='input-1')
+        assert receipt['result']['status'] == 'started'
+        del live.settling[original['admission_id']]
+        receipt = await lookup(connection, session_id='s', input_id='input-1')
+        assert (receipt['result']['status'], receipt['result']['outcome']) == ('terminal', 'interrupted')
     finally:
         await other.close()
         await connection.close()

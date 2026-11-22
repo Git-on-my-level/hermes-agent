@@ -795,7 +795,7 @@ class SessionAuthority:
         with live.event_stream.lock:
             # Read after the row: a terminal row whose completion is not yet published reads as
             # its claim, so a receipt poller never replays events that lack the completion frame.
-            row = live.settling.get(admission_id, row)
+            row = live.settling.get(row['admission_id'], row)
         return self._receipt(row)
 
     async def cancel_queued(self, actor, ref, admission_id):
