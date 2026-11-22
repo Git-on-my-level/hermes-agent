@@ -39,74 +39,101 @@ class Owner:
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "error": {
             "code": -32603, "message": "Internal error", "data": {"reason": reason}}}))
 
+    async def reply(self, ws, frame, result):
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "result": result}))
+
+    async def resume(self, ws, frame):
+        session_id = frame["params"]["session_id"]
+        if self.receipt_status == "expired_session" and session_id == "s":
+            await self.refuse(ws, frame, "not_found")
+            return
+        snapshot = {"session_id": session_id, "messages": [], "pending": [], "prompts": [],
+                    "replay_epoch": self.epoch, "last_sequence": 0}
+        if self.receipt_status not in {"missed_prefix", "queued_then_started"}:
+            await self.reply(ws, frame, snapshot)
+            return
+        original_admission = f"{self.prior.epoch}-{self.prior.inputs[0][1]}"
+        status = "started" if self.receipt_status == "missed_prefix" else "queued"
+        snapshot["pending"] = [{"status": status, "admission_id": original_admission}]
+        await self.reply(ws, frame, snapshot)
+        if status == "queued":
+            # The authority subscribes before this claim, so the replacement sees its first chunk.
+            await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
+                "session_id": session_id, "type": "session.info", "replay_epoch": self.epoch,
+                "seq": 1, "admission_id": original_admission, "payload": {"pending": [
+                    {"status": "started", "admission_id": original_admission}]}}}))
+            await self.delta(ws, session_id, original_admission, 2, "ORI")
+            await self.delta(ws, session_id, original_admission, 3, "GINAL")
+        else:
+            await self.delta(ws, session_id, original_admission, 1, "GINAL")
+
+    async def submit(self, ws, frame):
+        params = frame["params"]
+        session_id, input_id = params["session_id"], params["input_id"]
+        self.inputs.append((session_id, input_id))
+        if self.die_on_submit == "before_ack":
+            await ws.close()  # the owner accepted the input and lost the ack
+            return
+        admission_id = f"{self.epoch}-{input_id}"
+        await self.reply(ws, frame, {"admission_id": admission_id})
+        if self.die_on_submit == "after_ack":
+            if self.emit_prefix:
+                await self.delta(ws, session_id, admission_id, 1, "ORI")
+            await ws.close()
+            return
+        await self.complete(ws, session_id, admission_id, 5, "INDEPENDENT")
+
+    async def receipt(self, ws, frame):
+        params = frame["params"]
+        self.lookups.append(params)
+        if self.receipt_status == "cancelled_lookup":
+            self.lookup_started.set()
+            await self.release_receipt.wait()
+        if self.receipt_status == "receipt_disconnect":
+            await ws.close()
+            return
+        if self.receipt_status == "missing_admission":
+            await self.refuse(ws, frame, "not_found")
+            return
+        original_session, original_input = self.prior.inputs[0]
+        original_admission = f"{self.prior.epoch}-{original_input}"
+        assert params["session_id"] == original_session
+        assert params["include_result"] is True
+        if self.prior.die_on_submit == "before_ack":
+            assert params["input_id"] == original_input and "admission_id" not in params
+        else:
+            assert params["admission_id"] == original_admission and "input_id" not in params
+        started = self.receipt_status in {"started", "started_then_disconnect", "missed_prefix", "queued_then_started"}
+        result = {
+            "admission_id": original_admission,
+            "status": "started" if started else "terminal",
+            "outcome": "completed" if self.receipt_status == "completed_without_result" else self.receipt_status,
+        }
+        if self.receipt_status == "completed":
+            result["result"] = {"final_response": "ORIGINAL"}
+        await self.reply(ws, frame, result)
+        if self.receipt_status == "started_then_disconnect":
+            await ws.close()
+            return
+        if self.receipt_status == "started":
+            await self.complete(ws, original_session, "newer-admission", 1, "NEWER", outcome="interrupted")
+        if started:
+            sequence = 4 if self.receipt_status == "queued_then_started" else 2
+            await self.complete(ws, original_session, original_admission, sequence, "ORIGINAL")
+
     async def handler(self, ws):
+        handlers = {"session.resume": self.resume, "prompt.submit": self.submit, "prompt.receipt": self.receipt}
         async for raw in ws:
             frame = json.loads(raw)
-            method, params = frame["method"], frame["params"]
+            method = frame["method"]
             self.calls.append(method)
-            if method == "config.set":
-                self.configs.append(params)
-            result = {"profile_id": self.profile_id} if method == "runtime.describe" else {}
-            if method == "session.resume":
-                if self.receipt_status == "expired_session" and params["session_id"] == "s":
-                    await self.refuse(ws, frame, "not_found")
-                    continue
-                result = {"session_id": params["session_id"], "messages": [], "pending": [], "prompts": [],
-                          "replay_epoch": self.epoch, "last_sequence": 0}
-                if self.receipt_status == "missed_prefix":
-                    original_admission = f"{self.prior.epoch}-{self.prior.inputs[0][1]}"
-                    result["pending"] = [{"status": "started", "admission_id": original_admission}]
-            if method == "prompt.submit":
-                input_id = params["input_id"]
-                self.inputs.append((params["session_id"], input_id))
-                if self.die_on_submit == "before_ack":
-                    await ws.close()  # the owner accepted the input and lost the ack
-                    return
-                result = {"admission_id": f"{self.epoch}-{input_id}"}
-            if method == "prompt.receipt":
-                self.lookups.append(params)
-                if self.receipt_status == "cancelled_lookup":
-                    self.lookup_started.set()
-                    await self.release_receipt.wait()
-                if self.receipt_status == "receipt_disconnect":
-                    await ws.close()
-                    return
-                if self.receipt_status == "missing_admission":
-                    await self.refuse(ws, frame, "not_found")
-                    continue
-                original_session, original_input = self.prior.inputs[0]
-                original_admission = f"{self.prior.epoch}-{original_input}"
-                assert params["session_id"] == original_session
-                assert params["include_result"] is True
-                if self.prior.die_on_submit == "before_ack":
-                    assert params["input_id"] == original_input and "admission_id" not in params
-                else:
-                    assert params["admission_id"] == original_admission and "input_id" not in params
-                result = {
-                    "admission_id": original_admission,
-                    "status": "started" if self.receipt_status in {
-                        "started", "started_then_disconnect", "missed_prefix"} else "terminal",
-                    "outcome": "completed" if self.receipt_status == "completed_without_result" else self.receipt_status,
-                }
-                if self.receipt_status == "completed":
-                    result["result"] = {"final_response": "ORIGINAL"}
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"], "result": result}))
-            if method == "session.resume" and self.receipt_status == "missed_prefix":
-                await self.delta(ws, params["session_id"], original_admission, 1, "GINAL")
-            if method == "prompt.receipt" and self.receipt_status == "started_then_disconnect":
-                await ws.close()
-                return
-            if method == "prompt.receipt" and self.receipt_status == "started":
-                await self.complete(ws, params["session_id"], "newer-admission", 1, "NEWER", outcome="interrupted")
-            if method == "prompt.receipt" and self.receipt_status in {"started", "missed_prefix"}:
-                await self.complete(ws, params["session_id"], result["admission_id"], 2, "ORIGINAL")
-            if method == "prompt.submit" and self.die_on_submit == "after_ack":
-                if self.emit_prefix:
-                    await self.delta(ws, params["session_id"], result["admission_id"], 1, "ORI")
-                await ws.close()
-                return
-            if method == "prompt.submit":
-                await self.complete(ws, params["session_id"], result["admission_id"], 3, "INDEPENDENT")
+            if method in handlers:
+                await handlers[method](ws, frame)
+            else:
+                if method == "config.set":
+                    self.configs.append(frame["params"])
+                result = {"profile_id": self.profile_id} if method == "runtime.describe" else {}
+                await self.reply(ws, frame, result)
 
     @property
     def url(self):
@@ -120,6 +147,7 @@ class Owner:
     ("interrupted", "cancelled"),
     ("started", "end_turn"),
     ("missed_prefix", "end_turn"),
+    ("queued_then_started", "end_turn"),
     ("missing_admission", None),
     ("expired_session", None),
     ("receipt_disconnect", None),
@@ -131,7 +159,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
     agent = GatewayACPAgent()
     agent._conn = AsyncMock()
     home = str(agent._home)
-    first = Owner(home, "first", die_on_submit=die, emit_prefix=receipt_status != "missed_prefix")
+    first = Owner(home, "first", die_on_submit=die, emit_prefix=receipt_status not in {"missed_prefix", "queued_then_started"})
     second = Owner(home, "second", prior=first, receipt_status=receipt_status)
     third = Owner(home, "third")
     owners = [first, second, third]
@@ -182,7 +210,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         texts = [call.kwargs["update"].content.text for call in agent._conn.session_update.await_args_list
                  if call.kwargs["update"].session_update == "agent_message_chunk"]
         assert texts.count("INDEPENDENT") == 1
-        if receipt_status in {"completed", "started", "missed_prefix"}:
+        if receipt_status in {"completed", "started", "missed_prefix", "queued_then_started"}:
             assert "".join(text for text in texts if text not in {"NEWER", "INDEPENDENT"}) == "ORIGINAL"
     finally:
         second.release_receipt.set()
