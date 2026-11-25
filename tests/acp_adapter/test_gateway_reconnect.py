@@ -11,6 +11,7 @@ from websockets.asyncio.server import serve
 
 import acp_adapter.gateway_server as server
 from acp_adapter.gateway_server import GatewayACPAgent
+import hermes_cli.gateway_client as gateway_client
 from hermes_cli.gateway_client import DISCONNECTED, NOT_SENT, GatewayClient, GatewayClientError
 
 
@@ -86,7 +87,7 @@ class Owner:
     async def receipt(self, ws, frame):
         params = frame["params"]
         self.lookups.append(params)
-        if self.receipt_status == "cancelled_lookup":
+        if self.receipt_status in {"cancelled_lookup", "receipt_timeout"}:
             self.lookup_started.set()
             await self.release_receipt.wait()
         if self.receipt_status == "receipt_disconnect":
@@ -152,10 +153,13 @@ class Owner:
     ("expired_session", None),
     ("receipt_disconnect", None),
     ("cancelled_lookup", None),
+    ("receipt_timeout", None),
     ("started_then_disconnect", None),
     ("completed_without_result", None),
 ])
 async def test_reconcile_original_turn_without_resending(monkeypatch, die, receipt_status, stop_reason):
+    if receipt_status == "receipt_timeout":
+        monkeypatch.setattr(gateway_client, "DEFAULT_RPC_TIMEOUT", 2.0)
     agent = GatewayACPAgent()
     agent._conn = AsyncMock()
     home = str(agent._home)
@@ -180,10 +184,11 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         prompt = [acp.text_block("synthetic prompt")]
         if stop_reason is None:
             with pytest.raises(GatewayClientError, match=r"unknown_execution: .* outcome is unknown.* Session s,") as unknown:
-                if receipt_status == "cancelled_lookup":
+                if receipt_status in {"cancelled_lookup", "receipt_timeout"}:
                     original = asyncio.create_task(agent.prompt(prompt, "s"))
                     await asyncio.wait_for(second.lookup_started.wait(), 5)
-                    original.cancel()
+                    if receipt_status == "cancelled_lookup":
+                        original.cancel()
                     await asyncio.wait_for(original, 5)
                 else:
                     await asyncio.wait_for(agent.prompt(prompt, "s"), 5)

@@ -819,7 +819,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     raise GatewayClientError("not_found")
                 lookup = {"admission_id": admission_id} if admission_id else {"input_id": input_id}
                 receipt = await client.rpc("prompt.receipt", session_id=session_id, include_result=True, **lookup)
-        except (asyncio.CancelledError, GatewayClientError, OSError, WebSocketException):
+        except (asyncio.CancelledError, GatewayClientError, OSError, TimeoutError, WebSocketException):
             # Even if the observer is cancelled, the gateway may still own this input.
             # Return its identity without teaching a later request to reuse it by content.
             raise self._disconnect_unknown(session_id, input_id, admission_id) from None
