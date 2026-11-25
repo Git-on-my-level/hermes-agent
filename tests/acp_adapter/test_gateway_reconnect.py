@@ -11,7 +11,7 @@ from websockets.asyncio.server import serve
 
 import acp_adapter.gateway_server as server
 from acp_adapter.gateway_server import GatewayACPAgent
-import hermes_cli.gateway_client as gateway_client
+from hermes_cli import gateway_client
 from hermes_cli.gateway_client import DISCONNECTED, NOT_SENT, GatewayClient, GatewayClientError
 
 
