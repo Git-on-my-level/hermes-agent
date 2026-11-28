@@ -4635,7 +4635,8 @@ export interface CanonicalShellExecParams {
 }
 export interface PromptReceiptParams {
   session_id: string
-  admission_id: string
+  admission_id?: string | null
+  input_id?: string | null
   include_result?: boolean | null
 }
 /** ``result`` / ``usage``: the structured turn result committed at settlement, only with ``include_result`` on a terminal admission that saved one. */
@@ -6870,7 +6871,7 @@ export interface CanonicalRpcMethods {
   'profiles.list': { params: CanonicalProfilesParams; result: CanonicalProfilesResult }
   /** Retire a queued admission; a started one is interrupted in the same call. */
   'prompt.cancel': { params: PromptCancelParams; result: AdmissionStatus }
-  /** Current receipt of one admission the caller submitted (or controls). */
+  /** Current receipt by admission_id, or by the caller's own input_id if the submission acknowledgement was lost. Supply exactly one. */
   'prompt.receipt': { params: PromptReceiptParams; result: PromptReceiptResult }
   /** Cancel a still-queued admission and admit the edited prompt as a new admission at the back of the FIFO, in one write bound to the replaced admission. Refusals: admission_started, admission_conflict (the submission_id replaced another admission), queue_full, unsupported_control, not_found. */
   'prompt.replace_queued': { params: CanonicalReplaceQueuedParams; result: AdmissionStatus }

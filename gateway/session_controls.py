@@ -856,7 +856,15 @@ class AuthorityConnection:
         return result
 
     async def receipt(self, ref, params):
-        receipt = await self.authority.receipt(self.actor, ref, params.get('admission_id'))
+        admission_id, input_id = params.get('admission_id'), params.get('input_id')
+        if input_id is not None:
+            if admission_id is not None or not isinstance(input_id, str) or not input_id:
+                raise RuntimeStoreError('invalid_params', field='input_id')
+            receipt = await self.authority.receipt(self.actor, ref, None, input_id=input_id)
+        else:
+            if not isinstance(admission_id, str) or not admission_id:
+                raise RuntimeStoreError('invalid_params', field='admission_id')
+            receipt = await self.authority.receipt(self.actor, ref, admission_id)
         out = asdict(receipt)
         if params.get('include_result') is True and receipt.status == 'terminal':
             # The exact structured result the turn committed with settlement (`finish_result`):

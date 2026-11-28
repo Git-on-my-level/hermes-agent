@@ -14,12 +14,18 @@ from acp.schema import (
     SessionCapabilities, SessionForkCapabilities, SessionListCapabilities, SessionResumeCapabilities,
 )
 
-from hermes_cli.gateway_client import GatewayClientError, connect_gateway
+from hermes_cli.gateway_client import (
+    DISCONNECTED, NOT_SENT, GatewayClientError, GatewayRPCError, connect_gateway,
+)
 from hermes_constants import get_hermes_home
 from acp_adapter.gateway_reply import GatewayReplyMixin, _text
 from acp_adapter.session import _translate_acp_cwd, _normalize_cwd_for_compare
 
 logger = logging.getLogger(__name__)
+
+
+def _prompt_disconnected(error):
+    return isinstance(error, GatewayClientError) and not isinstance(error, GatewayRPCError) and str(error) == DISCONNECTED
 
 
 def _slash_command(text):
@@ -194,6 +200,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 self._snapshots.pop(session_id, None)
                 continue
             await self._adopt(session_id, snapshot)
+            # The replacement subscription can start mid-reply even when ACP saw no prefix.
+            # Fence its deltas before the event pump starts, then project the terminal reply.
+            for row in snapshot.get("pending", []):
+                if row.get("status") == "started":
+                    self._cut.setdefault(row["admission_id"], "")
             # Before this session's cards are offered again: until ``_client`` returns, ``self._gateway`` is
             # not this connection, so a card answered while the request is out would lose its answer.
             await self._request_live_reasoning(gateway, session_id)
@@ -243,6 +254,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         return isinstance(reader, asyncio.Future) and reader.done()
 
     async def _teardown(self):
+        recovering = (_prompt_disconnected(self._failure) or self._transport_closed()) and (
+            self._submitting or self._inflight)
         task, connection = self._event_task, self._connection
         self._event_task = self._connection = self._gateway = None
         if task is not None:
@@ -251,20 +264,24 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 await task
         if connection is not None:
             await connection.__aexit__(None, None, None)
-        # Partial reply segments belonged to admissions whose waiters already failed. A reply cut off here
-        # never gets its ``message.complete`` (re-attach starts at the owner's current sequence), so its
-        # ``messageId`` closes too: the next reply must not reuse it.
+        # A replacement subscription starts at the owner's current sequence. Close the old
+        # message ids, but keep the already shown prefix for receipt or live settlement.
+        if recovering:
+            for admission_id, text in self._streamed.items():
+                self._cut.setdefault(admission_id, text)
+            for retained in (self._cut, self._segments):
+                while len(retained) > 256:
+                    retained.pop(next(iter(retained)))
+        else:
+            self._cut.clear()
+            self._segments.clear()
         self._streamed.clear()
-        self._segments.clear()
         self._message_ids.clear()
-        self._cut.clear()
         async with self._changed:
             # Every waiter on the old transport wakes to its ambiguous failure, even one that had
             # not yet observed ``_failure`` before it is cleared here.
             self._link += 1
-            self._lost_failure = self._failure or GatewayClientError(
-                "Gateway disconnected; turn outcome is unknown. Resume the session to check whether "
-                "it completed or was interrupted; do not resend the work.")
+            self._lost_failure = self._failure or GatewayClientError(DISCONNECTED)
             self._failure = None
             self._changed.notify_all()
 
@@ -415,8 +432,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     async def resume_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         return ResumeSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
 
-    async def _cancel_admission(self, session_id, admission_id):
-        client = await self._client()
+    async def _cancel_admission(self, session_id, admission_id, *, client=None):
+        if client is None:
+            client = await self._client()
         # Cancel our own admission; another surface's running turn is not ours to
         # interrupt. Only when our admission is the one executing do we interrupt.
         try:
@@ -655,79 +673,178 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             content = _content_blocks_to_openai_user_content(prompt)
             if not isinstance(content, str) or _slash_command(content) != 'discard':
                 raise GatewayClientError(self._unknown_recovery(session_id, submitted=False))
+        retained = self._unacked.get(session_id)
         prepared = await self._prepare_submit(session_id, prompt)
+        was_retained = prepared is retained and retained is not None
         if prepared is None:
             return PromptResponse(stop_reason='cancelled')
-        retry_key, input_id, staged = prepared
-        text, attachments = staged
+        _, input_id, (text, attachments) = prepared
         answered, text = await self._run_slash(held_id, session_id, text) if not attachments else (False, text)
         if answered:
             return PromptResponse(stop_reason='end_turn')
         # ... and every prepared control's (a slash keeps its own key: apply retires the rest).
         self._mutations.retire(session_id)
+        client, link, resumes, receipt, recovered = await self._submit_prompt(
+            session_id, prepared, text, attachments, was_retained=was_retained)
+        admission_id = await self._admission_from_receipt(held_id, session_id, receipt, recovered=recovered)
+        if admission_id is None:
+            return PromptResponse(stop_reason='end_turn')
+        terminal, recovered = await self._observe_admitted_prompt(
+            client, held_id, session_id, input_id, admission_id, link, resumes, receipt, recovered=recovered)
+        outcome = terminal.get("outcome")
+        if outcome == "unknown":
+            # Our own lost turn: the same refusal whether session.info or this completion woke us.
+            raise GatewayClientError(self._unknown_recovery(session_id, admission_id))
+        if outcome == "failed" or (recovered and outcome == "rejected"):
+            raise GatewayClientError("admitted_turn_failed")
+        if recovered and outcome not in {"completed", "cancelled", "interrupted", "steered"}:
+            raise self._disconnect_unknown(session_id, input_id, admission_id)
+        from acp_adapter.gateway_session_meta import turn_usage
+        # The turn's last ``session.usage`` precedes its ``message.complete`` on the stream.
+        cancelled = outcome == "cancelled" or (recovered and outcome == "interrupted")
+        usage = terminal.get("receipt_usage", self._usage.get(session_id))
+        return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn", usage=turn_usage(usage))
+
+    async def _submit_prompt(self, session_id, prepared, text, attachments, *, was_retained):
+        """Send the input once. A lost acknowledgement takes the receipt-only path."""
+        _, input_id, _ = prepared
         submit = {'text': text}
         if attachments:
             submit['attachments'] = attachments
         self._submitting.add(session_id)
+        recovered = attempted = False
         try:
-            # Inside the try: a failed reconnect is as ambiguous for a retained identity as a lost ack.
             client = await self._client()
             link, resumes = self._link, self._resumes.get(session_id, 0)
-            receipt = await client.rpc("prompt.submit", session_id=session_id, input_id=input_id, **submit)
+            attempted = True
+            try:
+                receipt = await client.rpc("prompt.submit", session_id=session_id, input_id=input_id, **submit)
+            except GatewayClientError as exc:
+                if not _prompt_disconnected(exc):
+                    raise
+                recovered = True
+                client, link, receipt = await self._reconcile_disconnect(session_id, input_id, link)
+                resumes = self._resumes.get(session_id, 0)
         except BaseException as exc:
-            from hermes_cli.gateway_client import GatewayRPCError
-            if not isinstance(exc, GatewayRPCError):
-                # Transport loss, timeout or cancel before the ack: the owner may hold this admission.
-                # Keep its identity for the editor's retry of the same prompt (latest 64 sessions).
-                self._unacked[session_id] = (retry_key, input_id, staged)
+            if not recovered and not isinstance(exc, GatewayRPCError) and (
+                    was_retained or (attempted and str(exc) != NOT_SENT)):
+                # Keep the existing staged-input retry for other ambiguous failures, such as
+                # a timeout on a live connection. A socket disconnect uses a read-only lookup.
+                self._unacked[session_id] = prepared
                 while len(self._unacked) > 64:
                     self._unacked.pop(next(iter(self._unacked)))
             self._pending_cancels.discard(session_id)
+            if not attempted and not was_retained and _prompt_disconnected(exc):
+                # The failed RPC was part of attaching, before this input reached prompt.submit.
+                raise GatewayClientError(NOT_SENT) from None
             raise
         finally:
             self._submitting.discard(session_id)
-        admission_id = await self._admission_from_receipt(client, held_id, session_id, receipt)
-        if admission_id is None:
-            return PromptResponse(stop_reason='end_turn')
+        return client, link, resumes, receipt, recovered
+
+    async def _observe_admitted_prompt(
+            self, client, held_id, session_id, input_id, admission_id, link, resumes, receipt, *, recovered):
+        """Keep this ACP request attached to the exact admission until it settles."""
         self._inflight[(session_id, admission_id)] = None
+        cancel_pending = session_id in self._pending_cancels
+        self._pending_cancels.discard(session_id)
         try:
-            await self._after_ack(session_id, admission_id, link, resumes)
-            if session_id in self._pending_cancels:
-                self._pending_cancels.discard(session_id)
-                await self._cancel_admission(session_id, admission_id)
-            async with self._changed:
-                await self._changed.wait_for(lambda: admission_id in self._terminals or self._failure is not None
-                                            or self._link != link or admission_id in self._lost
-                                            or self._blocked_admission(session_id, admission_id))
-                # A successor's unknown state cannot replace our committed terminal result.
-                if admission_id not in self._terminals:
-                    if self._link != link:
-                        # Our transport died before this turn's outcome reached us: ambiguous,
-                        # never retried on the replacement connection.
-                        raise self._lost_failure
-                    if self._failure:
-                        raise self._failure
-                    raise self._lost.pop(admission_id, None) or GatewayClientError(
-                        self._unknown_recovery(session_id, admission_id))
-                terminal = self._terminals.pop(admission_id)
+            try:
+                if receipt.get("status") == "terminal":
+                    await self._settled_receipt(client, held_id, session_id, receipt, receipt if recovered else None)
+                await self._after_ack(session_id, admission_id, link, resumes)
+                if cancel_pending and receipt.get("status") != "terminal":
+                    await self._cancel_admission(session_id, admission_id, client=client)
+                    cancel_pending = False
+                terminal = await self._wait_for_terminal(session_id, admission_id, link)
+            except GatewayClientError as exc:
+                if not (_prompt_disconnected(exc) or (cancel_pending and str(exc) == NOT_SENT)):
+                    raise
+                if recovered:
+                    raise self._disconnect_unknown(session_id, input_id, admission_id) from None
+                client, link, receipt = await self._reconcile_disconnect(
+                    session_id, input_id, link, admission_id=admission_id)
+                recovered = True
+                try:
+                    if receipt.get("status") == "terminal":
+                        await self._settled_receipt(client, held_id, session_id, receipt, receipt)
+                    elif cancel_pending:
+                        await self._cancel_admission(session_id, admission_id, client=client)
+                    terminal = await self._wait_for_terminal(session_id, admission_id, link)
+                except GatewayClientError as retry_error:
+                    if _prompt_disconnected(retry_error) or (cancel_pending and str(retry_error) == NOT_SENT):
+                        raise self._disconnect_unknown(session_id, input_id, admission_id) from None
+                    raise
+        except asyncio.CancelledError:
+            if recovered:
+                raise self._disconnect_unknown(session_id, input_id, admission_id) from None
+            raise
         finally:
             # Do not let one prompt tear down a newer mapping if the session has
             # already advanced while this coroutine unwinds.
             if self._admissions.get(session_id) == admission_id:
                 self._admissions.pop(session_id, None)
             self._inflight.pop((session_id, admission_id), None)
-        outcome = terminal.get("outcome")
-        if outcome == "unknown":
-            # Our own lost turn: the same refusal whether session.info or this completion woke us.
-            raise GatewayClientError(self._unknown_recovery(session_id, admission_id))
-        if outcome == "failed":
-            raise GatewayClientError("admitted_turn_failed")
-        from acp_adapter.gateway_session_meta import turn_usage
-        # The turn's last ``session.usage`` precedes its ``message.complete`` on the stream.
-        return PromptResponse(stop_reason="cancelled" if outcome == "cancelled" else "end_turn",
-                              usage=turn_usage(self._usage.get(session_id)))
+        return terminal, recovered
 
-    async def _admission_from_receipt(self, client, held_id, session_id, receipt):
+    async def _wait_for_terminal(self, session_id, admission_id, link):
+        async with self._changed:
+            await self._changed.wait_for(lambda: admission_id in self._terminals or self._failure is not None
+                                        or self._link != link or admission_id in self._lost
+                                        or self._blocked_admission(session_id, admission_id))
+            if admission_id in self._terminals:
+                return self._terminals.pop(admission_id)
+            if self._link != link:
+                raise self._lost_failure
+            if self._failure:
+                raise self._failure
+            raise self._lost.pop(admission_id, None) or GatewayClientError(
+                self._unknown_recovery(session_id, admission_id))
+
+    @staticmethod
+    def _disconnect_unknown(session_id, input_id, admission_id=None):
+        identity = f"admission {admission_id}" if admission_id else f"input {input_id}"
+        return GatewayClientError(f"unknown_execution: {DISCONNECTED} Session {session_id}, {identity}.")
+
+    async def _reconcile_disconnect(self, session_id, input_id, link, *, admission_id=None):
+        """Read the original admission once on the replacement transport. Never send its input again."""
+        from websockets.exceptions import WebSocketException
+
+        try:
+            async with asyncio.timeout(30):
+                # A concurrent request may already have replaced this connection.
+                if self._link == link and self._failure is None and not self._transport_closed():
+                    async with self._changed:
+                        if self._link == link and self._failure is None:
+                            self._failure = GatewayClientError(DISCONNECTED)
+                            self._changed.notify_all()
+                client = await self._client()
+                replacement_link = self._link
+                if session_id not in self._snapshots:
+                    raise GatewayClientError("not_found")
+                lookup = {"admission_id": admission_id} if admission_id else {"input_id": input_id}
+                receipt = await client.rpc("prompt.receipt", session_id=session_id, include_result=True, **lookup)
+        except (asyncio.CancelledError, GatewayClientError, OSError, TimeoutError, WebSocketException):
+            # Even if the observer is cancelled, the gateway may still own this input.
+            # Return its identity without teaching a later request to reuse it by content.
+            raise self._disconnect_unknown(session_id, input_id, admission_id) from None
+
+        found = receipt.get("admission_id") if isinstance(receipt, dict) else None
+        if not found or (admission_id is not None and found != admission_id):
+            raise self._disconnect_unknown(session_id, input_id, admission_id)
+        status, outcome = receipt.get("status"), receipt.get("outcome")
+        if status == "unknown":
+            raise GatewayClientError(self._unknown_recovery(session_id, found))
+        if status == "terminal" and outcome == "rejected":
+            raise GatewayClientError("admitted_turn_failed")
+        if status == "terminal" and outcome not in {"completed", "interrupted", "cancelled", "failed", "steered"}:
+            raise self._disconnect_unknown(session_id, input_id, found)
+        if status not in {"queued", "started", "terminal"} or (
+                outcome == "completed" and not isinstance(receipt.get("result"), dict)):
+            raise self._disconnect_unknown(session_id, input_id, found)
+        return client, replacement_link, receipt
+
+    async def _admission_from_receipt(self, held_id, session_id, receipt, *, recovered=False):
         """The admission a ``prompt.submit`` receipt names, or None when the owner admitted nothing."""
         if receipt.get("voice_stopped") is True:
             # TUI-26: a bare stop phrase typed into this LOCAL session's voice chat ended the chat on
@@ -739,11 +856,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     t('cli.voice.stop_phrase_typed') + '\n'))
             return None
         admission_id = receipt["admission_id"]
-        self._admissions[session_id] = admission_id
-        if receipt.get("status") == "terminal":
-            # A retry of an un-acked submit whose turn already settled: report that turn once.
-            await self._settled_receipt(client, held_id, session_id, receipt)
-        elif receipt.get("status") == "unknown":
+        if recovered:
+            self._admissions.setdefault(session_id, admission_id)
+        else:
+            self._admissions[session_id] = admission_id
+        if receipt.get("status") == "unknown":
             # A retry of an un-acked submit the owner lost in a restart: never a second turn.
             self._admissions.pop(session_id, None)
             raise GatewayClientError(self._unknown_recovery(session_id, admission_id))
@@ -852,6 +969,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 "response_reused": result.get("response_reused"), "receipt": True})
             async with self._changed:
                 self._terminals[admission_id] = {"outcome": outcome}
+                if saved.get("usage"):
+                    self._terminals[admission_id]["receipt_usage"] = saved["usage"]
                 self._changed.notify_all()
         finally:
             self._settling.discard(admission_id)
@@ -875,7 +994,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
 
     def _has_unknown(self, session_id):
         return any(row.get("status") == "unknown"
-                   for row in self._snapshots[session_id].get("pending", []))
+                   for row in self._snapshots.get(session_id, {}).get("pending", []))
 
     async def _refresh_unknown_for_prompt(self, session_id):
         # Stop during the owner's read must cancel the still-unsent editor input.
