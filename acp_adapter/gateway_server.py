@@ -432,8 +432,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     async def resume_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         return ResumeSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
 
-    async def _cancel_admission(self, session_id, admission_id):
-        client = await self._client()
+    async def _cancel_admission(self, session_id, admission_id, *, client=None):
+        if client is None:
+            client = await self._client()
         # Cancel our own admission; another surface's running turn is not ours to
         # interrupt. Only when our admission is the one executing do we interrupt.
         try:
@@ -696,7 +697,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             raise GatewayClientError(self._unknown_recovery(session_id, admission_id))
         if outcome == "failed" or (recovered and outcome == "rejected"):
             raise GatewayClientError("admitted_turn_failed")
-        if recovered and outcome not in {"completed", "cancelled", "interrupted"}:
+        if recovered and outcome not in {"completed", "cancelled", "interrupted", "steered"}:
             raise self._disconnect_unknown(session_id, input_id, admission_id)
         from acp_adapter.gateway_session_meta import turn_usage
         # The turn's last ``session.usage`` precedes its ``message.complete`` on the stream.
@@ -745,17 +746,19 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             self, client, held_id, session_id, input_id, admission_id, link, resumes, receipt, *, recovered):
         """Keep this ACP request attached to the exact admission until it settles."""
         self._inflight[(session_id, admission_id)] = None
+        cancel_pending = session_id in self._pending_cancels
+        self._pending_cancels.discard(session_id)
         try:
             try:
                 if receipt.get("status") == "terminal":
                     await self._settled_receipt(client, held_id, session_id, receipt, receipt if recovered else None)
                 await self._after_ack(session_id, admission_id, link, resumes)
-                if session_id in self._pending_cancels:
-                    self._pending_cancels.discard(session_id)
-                    await self._cancel_admission(session_id, admission_id)
+                if cancel_pending and receipt.get("status") != "terminal":
+                    await self._cancel_admission(session_id, admission_id, client=client)
+                    cancel_pending = False
                 terminal = await self._wait_for_terminal(session_id, admission_id, link)
             except GatewayClientError as exc:
-                if not _prompt_disconnected(exc):
+                if not (_prompt_disconnected(exc) or (cancel_pending and str(exc) == NOT_SENT)):
                     raise
                 if recovered:
                     raise self._disconnect_unknown(session_id, input_id, admission_id) from None
@@ -765,9 +768,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 try:
                     if receipt.get("status") == "terminal":
                         await self._settled_receipt(client, held_id, session_id, receipt, receipt)
+                    elif cancel_pending:
+                        await self._cancel_admission(session_id, admission_id, client=client)
                     terminal = await self._wait_for_terminal(session_id, admission_id, link)
                 except GatewayClientError as retry_error:
-                    if _prompt_disconnected(retry_error):
+                    if _prompt_disconnected(retry_error) or (cancel_pending and str(retry_error) == NOT_SENT):
                         raise self._disconnect_unknown(session_id, input_id, admission_id) from None
                     raise
         except asyncio.CancelledError:
@@ -832,7 +837,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             raise GatewayClientError(self._unknown_recovery(session_id, found))
         if status == "terminal" and outcome == "rejected":
             raise GatewayClientError("admitted_turn_failed")
-        if status == "terminal" and outcome not in {"completed", "interrupted", "cancelled", "failed"}:
+        if status == "terminal" and outcome not in {"completed", "interrupted", "cancelled", "failed", "steered"}:
             raise self._disconnect_unknown(session_id, input_id, found)
         if status not in {"queued", "started", "terminal"} or (
                 outcome == "completed" and not isinstance(receipt.get("result"), dict)):
@@ -964,7 +969,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 "response_reused": result.get("response_reused"), "receipt": True})
             async with self._changed:
                 self._terminals[admission_id] = {"outcome": outcome}
-                if "usage" in saved:
+                if saved.get("usage"):
                     self._terminals[admission_id]["receipt_usage"] = saved["usage"]
                 self._changed.notify_all()
         finally:

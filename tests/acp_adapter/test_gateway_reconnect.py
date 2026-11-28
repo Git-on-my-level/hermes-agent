@@ -104,20 +104,26 @@ class Owner:
             assert params["input_id"] == original_input and "admission_id" not in params
         else:
             assert params["admission_id"] == original_admission and "input_id" not in params
-        started = self.receipt_status in {"started", "started_then_disconnect", "missed_prefix", "queued_then_started"}
+        started = self.receipt_status in {
+            "started", "started_then_disconnect", "started_then_steered", "missed_prefix", "queued_then_started",
+        }
         result = {
             "admission_id": original_admission,
             "status": "started" if started else "terminal",
-            "outcome": "completed" if self.receipt_status == "completed_without_result" else self.receipt_status,
+            "outcome": "completed" if self.receipt_status.startswith("completed") else self.receipt_status,
         }
-        if self.receipt_status == "completed":
+        if self.receipt_status in {"completed", "completed_with_usage"}:
             result["result"] = {"final_response": "ORIGINAL"}
+            result["usage"] = {"total_tokens": 11} if self.receipt_status == "completed_with_usage" else {}
         await self.reply(ws, frame, result)
         if self.receipt_status == "started_then_disconnect":
             await ws.close()
             return
         if self.receipt_status == "started":
             await self.complete(ws, original_session, "newer-admission", 1, "NEWER", outcome="interrupted")
+        if self.receipt_status == "started_then_steered":
+            await self.complete(ws, original_session, original_admission, 2, "", outcome="steered")
+            return
         if started:
             sequence = 4 if self.receipt_status == "queued_then_started" else 2
             await self.complete(ws, original_session, original_admission, sequence, "ORIGINAL")
@@ -145,7 +151,12 @@ class Owner:
 @pytest.mark.parametrize("die", ["before_ack", "after_ack"])
 @pytest.mark.parametrize(("receipt_status", "stop_reason"), [
     ("completed", "end_turn"),
+    ("completed_with_usage", "end_turn"),
     ("interrupted", "cancelled"),
+    ("steered", "end_turn"),
+    ("started_then_steered", "end_turn"),
+    ("failed", "admitted_turn_failed"),
+    ("rejected", "admitted_turn_failed"),
     ("started", "end_turn"),
     ("missed_prefix", "end_turn"),
     ("queued_then_started", "end_turn"),
@@ -163,7 +174,9 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
     agent = GatewayACPAgent()
     agent._conn = AsyncMock()
     home = str(agent._home)
-    first = Owner(home, "first", die_on_submit=die, emit_prefix=receipt_status not in {"missed_prefix", "queued_then_started"})
+    first = Owner(home, "first", die_on_submit=die, emit_prefix=receipt_status not in {
+        "missed_prefix", "queued_then_started", "steered", "started_then_steered",
+    })
     second = Owner(home, "second", prior=first, receipt_status=receipt_status)
     third = Owner(home, "third")
     owners = [first, second, third]
@@ -180,6 +193,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
     monkeypatch.setattr(server, "connect_gateway", connect_gateway)
     try:
         await agent.load_session(cwd="/", session_id="s")
+        agent._usage["s"] = {"total_tokens": 7}
         agent._conn.session_update.reset_mock()
         prompt = [acp.text_block("synthetic prompt")]
         if stop_reason is None:
@@ -193,9 +207,15 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
                 else:
                     await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
             assert first.inputs[0][1] in str(unknown.value)
+        elif stop_reason == "admitted_turn_failed":
+            with pytest.raises(GatewayClientError, match="^admitted_turn_failed$"):
+                await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
         else:
             response = await asyncio.wait_for(agent.prompt(prompt, "s"), 5)
             assert response.stop_reason == stop_reason
+            expected_usage = {"completed": 7, "completed_with_usage": 11}.get(receipt_status)
+            if expected_usage is not None:
+                assert response.usage.total_tokens == expected_usage
         assert first.calls.count("prompt.submit") == 1
         assert second.calls.count("prompt.submit") == third.calls.count("prompt.submit") == 0
         assert second.calls.count("prompt.receipt") == (0 if receipt_status == "expired_session" else 1)
@@ -215,7 +235,7 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         texts = [call.kwargs["update"].content.text for call in agent._conn.session_update.await_args_list
                  if call.kwargs["update"].session_update == "agent_message_chunk"]
         assert texts.count("INDEPENDENT") == 1
-        if receipt_status in {"completed", "started", "missed_prefix", "queued_then_started"}:
+        if receipt_status in {"completed", "completed_with_usage", "started", "missed_prefix", "queued_then_started"}:
             assert "".join(text for text in texts if text not in {"NEWER", "INDEPENDENT"}) == "ORIGINAL"
     finally:
         second.release_receipt.set()
@@ -223,6 +243,30 @@ async def test_reconcile_original_turn_without_resending(monkeypatch, die, recei
         for owner in owners:
             owner.server.close()
             await owner.server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_ack_is_delivered_to_the_original_admission_after_disconnect(monkeypatch):
+    agent = GatewayACPAgent()
+    agent._pending_cancels.add("s")
+    agent._admissions["s"] = "original"
+    first, replacement = AsyncMock(), AsyncMock()
+    first.rpc.side_effect = GatewayClientError(DISCONNECTED)
+    receipt = {"admission_id": "original", "status": "started"}
+    monkeypatch.setattr(agent, "_reconcile_disconnect", AsyncMock(return_value=(replacement, 1, receipt)))
+
+    async def terminal(*_):
+        return {"outcome": "cancelled" if replacement.rpc.await_count else "completed"}
+
+    monkeypatch.setattr(agent, "_wait_for_terminal", terminal)
+
+    result, recovered = await agent._observe_admitted_prompt(
+        first, "s", "s", "input", "original", 0, 0, receipt, recovered=False)
+
+    for client in (first, replacement):
+        client.rpc.assert_awaited_once_with("prompt.cancel", session_id="s", admission_id="original")
+    assert recovered and result["outcome"] == "cancelled"
+    assert not agent._pending_cancels
 
 
 @pytest.mark.asyncio
